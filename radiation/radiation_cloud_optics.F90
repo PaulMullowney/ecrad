@@ -17,13 +17,14 @@
 
 module radiation_cloud_optics
 
+  ! Provides elemental function "delta_eddington_scat_od"
   implicit none
 
   public
 
 contains
 
-  ! Provides elemental function "delta_eddington_scat_od"
+! Provides elemental function "delta_eddington_scat_od"
 #include "radiation_delta_eddington.h"
 
   !---------------------------------------------------------------------
@@ -213,16 +214,16 @@ contains
     use radiation_thermodynamics, only    : thermodynamics_type
     use radiation_cloud, only             : cloud_type
     use radiation_constants, only         : AccelDueToGravity
-    use radiation_ice_optics_fu, only     : calc_ice_optics_fu_sw, &
-         &                                  calc_ice_optics_fu_lw
+    use radiation_ice_optics_fu, only     : calc_ice_optics_fu_sw, calc_ice_optics_fu_sw_single_band, &
+         &                                  calc_ice_optics_fu_lw, calc_ice_optics_fu_lw_single_band
     use radiation_ice_optics_baran, only  : calc_ice_optics_baran, &
          &                                  calc_ice_optics_baran2016
     use radiation_ice_optics_baran2017, only  : calc_ice_optics_baran2017
     use radiation_ice_optics_yi, only     : calc_ice_optics_yi_sw, &
          &                                  calc_ice_optics_yi_lw
-    use radiation_liquid_optics_socrates, only:calc_liq_optics_socrates
-    use radiation_liquid_optics_slingo, only:calc_liq_optics_slingo, &
-         &                                   calc_liq_optics_lindner_li
+    use radiation_liquid_optics_socrates, only:calc_liq_optics_socrates, calc_liq_optics_socrates_single_band
+    use radiation_liquid_optics_slingo, only:calc_liq_optics_slingo, calc_liq_optics_slingo_single_band, &
+         &                                   calc_liq_optics_lindner_li, calc_liq_optics_lindner_li_single_band
 
     integer, intent(in) :: nlev               ! number of model levels
     integer, intent(in) :: istartcol, iendcol ! range of columns to process
@@ -247,13 +248,17 @@ contains
     ! Longwave and shortwave optical depth, scattering optical depth
     ! and asymmetry factor, for liquid and ice in all bands but a
     ! single cloud layer
+#if defined(OMPGPU)
+    real(jprb) :: od_lw_liq, scat_od_lw_liq, g_lw_liq, od_lw_ice, scat_od_lw_ice, g_lw_ice
+    real(jprb) :: od_sw_liq, scat_od_sw_liq, g_sw_liq, od_sw_ice, scat_od_sw_ice, g_sw_ice
+#else
     real(jprb), dimension(config%n_bands_lw) :: &
          &  od_lw_liq, scat_od_lw_liq, g_lw_liq, &
          &  od_lw_ice, scat_od_lw_ice, g_lw_ice
     real(jprb), dimension(config%n_bands_sw) :: &
          &  od_sw_liq, scat_od_sw_liq, g_sw_liq, &
          &  od_sw_ice, scat_od_sw_ice, g_sw_ice
-
+#endif
     ! In-cloud water path of cloud liquid or ice (i.e. liquid or ice
     ! gridbox-mean water path divided by cloud fraction); kg m-2
     real(jprb) :: lwp_in_cloud, iwp_in_cloud
@@ -269,14 +274,229 @@ contains
 
     real(jphook) :: hook_handle
 
+#ifdef DEBUG_CORRECTNESS_RADIATION
+    integer :: s1, s2, s3
+#endif
+
     if (lhook) call dr_hook('radiation_cloud_optics:cloud_optics',0,hook_handle)
 
     if (config%iverbose >= 2) then
-      write(nulout,'(a)') 'Computing cloud absorption/scattering properties'
+
+       write(nulout,'(a)') 'Computing cloud absorption/scattering properties'
     end if
 
     associate(ho => config%cloud_optics)
+    
+#if defined(OMPGPU)
+      ! Array-wise assignment
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do jcol=istartcol, iendcol
+        do jlev=1, nlev
+          do jb=1, config%n_bands_sw
+            od_sw_cloud(jb,jlev,jcol) = 0.0_jprb
+            ssa_sw_cloud(jb,jlev,jcol) = 0.0_jprb
+            g_sw_cloud(jb,jlev,jcol) = 0.0_jprb
+          end do
+        end do
+      end do
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+      
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do jcol=istartcol, iendcol
+        do jlev=1, nlev
+          do jb=1, config%n_bands_lw
+            od_lw_cloud(jb,jlev,jcol) = 0.0_jprb
+          end do
+        end do
+      end do
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do jcol=istartcol, iendcol
+        do jlev=1, nlev
+          do jb=1, config%n_bands_lw_if_scattering
+            ssa_lw_cloud(jb,jlev,jcol) = 0.0_jprb
+            g_lw_cloud(jb,jlev,jcol) = 0.0_jprb
+          end do
+        end do
+      end do
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+      !
+      ! LONGWAVE
+      ! 
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do jlev = 1,nlev
+         do jcol = istartcol,iendcol
+            do jb = 1, config%n_bands_lw
+               ! Only do anything if cloud is present (assume that
+               ! cloud%crop_cloud_fraction has already been called)
+               if (cloud%fraction(jcol,jlev) > 0.0_jprb) then
+               
+                  ! Compute in-cloud liquid and ice water path
+                  if (config%is_homogeneous) then
+                     ! Homogeneous solvers assume cloud fills the box
+                     ! horizontally, so we don't divide by cloud fraction
+                     factor = ( thermodynamics%pressure_hl(jcol,jlev+1)    &
+                          &  -thermodynamics%pressure_hl(jcol,jlev  )  ) &
+                          &  / AccelDueToGravity
+                  else
+                     factor = ( thermodynamics%pressure_hl(jcol,jlev+1)    &
+                          &  -thermodynamics%pressure_hl(jcol,jlev  )  ) &
+                          &  / (AccelDueToGravity * cloud%fraction(jcol,jlev))
+                  end if
+                  lwp_in_cloud = factor * cloud%q_liq(jcol,jlev)
+                  iwp_in_cloud = factor * cloud%q_ice(jcol,jlev)
+
+                  ! init to 0
+                  od_lw_liq = 0.0_jprb
+                  scat_od_lw_liq = 0.0_jprb
+                  g_lw_liq = 0.0_jprb
+                  
+                  od_lw_ice = 0.0_jprb
+                  scat_od_lw_ice = 0.0_jprb
+                  g_lw_ice = 0.0_jprb
+
+                  ! Only compute liquid properties if liquid cloud is present
+                  if (lwp_in_cloud > 0.0_jprb) then
+                     if (config%i_liq_model == ILiquidModelSOCRATES) then
+                        call calc_liq_optics_socrates_single_band(jb, &
+                             &  config%cloud_optics%liq_coeff_lw, &
+                             &  lwp_in_cloud, cloud%re_liq(jcol,jlev), &
+                             &  od_lw_liq, scat_od_lw_liq, g_lw_liq)
+                     else if (config%i_liq_model == ILiquidModelSlingo) then
+                        call calc_liq_optics_lindner_li_single_band(jb, &
+                             &  config%cloud_optics%liq_coeff_lw, &
+                             &  lwp_in_cloud, cloud%re_liq(jcol,jlev), &
+                             &  od_lw_liq, scat_od_lw_liq, g_lw_liq)
+                     end if
+                     ! Originally delta-Eddington has been off in ecRad for
+                     ! liquid clouds in the longwave, but it should be on
+                     !call delta_eddington_scat_od(od_lw_liq, scat_od_lw_liq, g_lw_liq)
+                  endif
+                  ! Only compute ice properties if ice cloud is present
+                  if (iwp_in_cloud > 0.0_jprb) then
+                     call calc_ice_optics_fu_lw_single_band(jb, &
+                          &  config%cloud_optics%ice_coeff_lw, &
+                          &  iwp_in_cloud, cloud%re_ice(jcol,jlev), &
+                          &  od_lw_ice, scat_od_lw_ice, g_lw_ice)
+                     if (config%do_fu_lw_ice_optics_bug) then
+                        ! Reproduce bug in old IFS scheme
+                        scat_od_lw_ice = od_lw_ice - scat_od_lw_ice
+                     end if
+                     call delta_eddington_scat_od(od_lw_ice, scat_od_lw_ice, g_lw_ice)
+                  end if ! Ice present
+               
+                  ! Combine liquid and ice
+                  if (config%do_lw_cloud_scattering) then
+                     od_lw_cloud(jb,jlev,jcol) = od_lw_liq + od_lw_ice
+                     if (scat_od_lw_liq+scat_od_lw_ice > 0.0_jprb) then
+                        g_lw_cloud(jb,jlev,jcol) = (g_lw_liq * scat_od_lw_liq  + g_lw_ice * scat_od_lw_ice) &
+                             &  / (scat_od_lw_liq+scat_od_lw_ice)
+                     else
+                        g_lw_cloud(jb,jlev,jcol) = 0.0_jprb
+                     end if
+                     ssa_lw_cloud(jb,jlev,jcol) = (scat_od_lw_liq + scat_od_lw_ice) &
+                          &                     / (od_lw_liq + od_lw_ice)
+                  else
+                     ! If longwave scattering is to be neglected then the
+                     ! best approximation is to set the optical depth equal
+                     ! to the absorption optical depth
+                     ! Added for DWD (2020)
+                     !NEC$ shortloop
+                     od_lw_cloud(jb,jlev,jcol) = od_lw_liq - scat_od_lw_liq &
+                          &                    + od_lw_ice - scat_od_lw_ice
+                   end if
+               end if
+            enddo
+         enddo
+      enddo
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+      !
+      ! SHORTWAVE
+      ! 
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do jlev = 1,nlev
+         do jcol = istartcol,iendcol
+            do jb = 1, config%n_bands_sw
+               ! Only do anything if cloud is present (assume that
+               ! cloud%crop_cloud_fraction has already been called)
+               if (cloud%fraction(jcol,jlev) > 0.0_jprb) then
+               
+                  ! Compute in-cloud liquid and ice water path
+                  if (config%is_homogeneous) then
+                     ! Homogeneous solvers assume cloud fills the box
+                     ! horizontally, so we don't divide by cloud fraction
+                     factor = ( thermodynamics%pressure_hl(jcol,jlev+1)    &
+                          &  -thermodynamics%pressure_hl(jcol,jlev  )  ) &
+                          &  / AccelDueToGravity
+                  else
+                     factor = ( thermodynamics%pressure_hl(jcol,jlev+1)    &
+                          &  -thermodynamics%pressure_hl(jcol,jlev  )  ) &
+                          &  / (AccelDueToGravity * cloud%fraction(jcol,jlev))
+                  end if
+                  lwp_in_cloud = factor * cloud%q_liq(jcol,jlev)
+                  iwp_in_cloud = factor * cloud%q_ice(jcol,jlev)
+
+                  ! init to 0
+                  od_sw_liq = 0.0_jprb
+                  scat_od_sw_liq = 0.0_jprb
+                  g_sw_liq = 0.0_jprb
+                  
+                  od_sw_ice = 0.0_jprb
+                  scat_od_sw_ice = 0.0_jprb
+                  g_sw_ice = 0.0_jprb
+
+                  ! Only compute liquid properties if liquid cloud is present
+                  if (lwp_in_cloud > 0.0_jprb) then
+                     if (config%i_liq_model == ILiquidModelSOCRATES) then
+                        call calc_liq_optics_socrates_single_band(jb, &
+                             &  config%cloud_optics%liq_coeff_sw, &
+                             &  lwp_in_cloud, cloud%re_liq(jcol,jlev), &
+                             &  od_sw_liq, scat_od_sw_liq, g_sw_liq)
+                     else if (config%i_liq_model == ILiquidModelSlingo) then
+                        call calc_liq_optics_slingo_single_band(jb, &
+                             &  config%cloud_optics%liq_coeff_sw, &
+                             &  lwp_in_cloud, cloud%re_liq(jcol,jlev), &
+                             &  od_sw_liq, scat_od_sw_liq, g_sw_liq)
+                     end if
+                     ! Delta-Eddington scaling in the shortwave only
+                     if (.not. config%do_sw_delta_scaling_with_gases) then
+                        call delta_eddington_scat_od(od_sw_liq, scat_od_sw_liq, g_sw_liq)
+                     end if
+
+                     ! Originally delta-Eddington has been off in ecRad for
+                     ! liquid clouds in the longwave, but it should be on
+                     !call delta_eddington_scat_od(od_lw_liq, scat_od_lw_liq, g_lw_liq)
+                  endif
+                  ! Only compute ice properties if ice cloud is present
+                  if (iwp_in_cloud > 0.0_jprb) then
+                     ! Compute shortwave properties
+                     call calc_ice_optics_fu_sw_single_band(jb, &
+                          &  config%cloud_optics%ice_coeff_sw, &
+                          &  iwp_in_cloud, cloud%re_ice(jcol,jlev), &
+                          &  od_sw_ice, scat_od_sw_ice, g_sw_ice)
+                     
+                     ! Delta-Eddington scaling in both longwave and shortwave
+                     ! (assume that particles are larger than wavelength even
+                     ! in longwave)
+                     if (.not. config%do_sw_delta_scaling_with_gases) then
+                        call delta_eddington_scat_od(od_sw_ice, scat_od_sw_ice, g_sw_ice)
+                     end if
+                  end if ! Ice present
+                  od_sw_cloud(jb,jlev,jcol) = od_sw_liq + od_sw_ice
+                  g_sw_cloud(jb,jlev,jcol) = (g_sw_liq * scat_od_sw_liq + g_sw_ice * scat_od_sw_ice) &
+                       &  / (scat_od_sw_liq + scat_od_sw_ice)
+                  ssa_sw_cloud(jb,jlev,jcol) = (scat_od_sw_liq + scat_od_sw_ice) / (od_sw_liq + od_sw_ice)
+               end if
+            enddo
+         enddo
+      enddo
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+      
+#else ! OPENACC or other
+      
       ! Array-wise assignment
       !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
       !$ACC LOOP GANG COLLAPSE(2)
@@ -300,7 +520,7 @@ contains
         end do
       end do
       !$ACC END PARALLEL
-
+      
       !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
       !$ACC LOOP SEQ
       do jlev = 1,nlev
@@ -522,12 +742,92 @@ contains
           end if ! Cloud present
         end do ! Loop over column
       end do ! Loop over level
-
-     !$ACC END PARALLEL
-
+      !$ACC END PARALLEL
+#endif
     end associate
 
     if (lhook) call dr_hook('radiation_cloud_optics:cloud_optics',1,hook_handle)
+
+#ifdef DEBUG_CORRECTNESS_RADIATION
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(od_lw_cloud,ssa_lw_cloud, g_lw_cloud,od_sw_cloud, ssa_sw_cloud, g_sw_cloud)
+    !$ACC UPDATE HOST(od_lw_cloud,ssa_lw_cloud, g_lw_cloud,od_sw_cloud, ssa_sw_cloud, g_sw_cloud) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = lbound(od_lw_cloud,1)
+    s2 = lbound(od_lw_cloud,2)
+    s3 = lbound(od_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_lw_cloud=", od_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(od_lw_cloud,1)/2
+    s2 = size(od_lw_cloud,2)/2
+    s3 = size(od_lw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_lw_cloud=", od_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(od_lw_cloud,1)
+    s2 = ubound(od_lw_cloud,2)
+    s3 = ubound(od_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_lw_cloud=", od_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = lbound(ssa_lw_cloud,1)
+    s2 = lbound(ssa_lw_cloud,2)
+    s3 = lbound(ssa_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_lw_cloud=", ssa_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(ssa_lw_cloud,1)/2
+    s2 = size(ssa_lw_cloud,2)/2
+    s3 = size(ssa_lw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_lw_cloud=", ssa_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(ssa_lw_cloud,1)
+    s2 = ubound(ssa_lw_cloud,2)
+    s3 = ubound(ssa_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_lw_cloud=", ssa_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = lbound(g_lw_cloud,1)
+    s2 = lbound(g_lw_cloud,2)
+    s3 = lbound(g_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_lw_cloud=", g_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(g_lw_cloud,1)/2
+    s2 = size(g_lw_cloud,2)/2
+    s3 = size(g_lw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_lw_cloud=", g_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(g_lw_cloud,1)
+    s2 = ubound(g_lw_cloud,2)
+    s3 = ubound(g_lw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_lw_cloud=", g_lw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = lbound(od_sw_cloud,1)
+    s2 = lbound(od_sw_cloud,2)
+    s3 = lbound(od_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_sw_cloud=", od_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(od_sw_cloud,1)/2
+    s2 = size(od_sw_cloud,2)/2
+    s3 = size(od_sw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_sw_cloud=", od_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(od_sw_cloud,1)
+    s2 = ubound(od_sw_cloud,2)
+    s3 = ubound(od_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "od_sw_cloud=", od_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = lbound(ssa_sw_cloud,1)
+    s2 = lbound(ssa_sw_cloud,2)
+    s3 = lbound(ssa_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_sw_cloud=", ssa_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(ssa_sw_cloud,1)/2
+    s2 = size(ssa_sw_cloud,2)/2
+    s3 = size(ssa_sw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_sw_cloud=", ssa_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(ssa_sw_cloud,1)
+    s2 = ubound(ssa_sw_cloud,2)
+    s3 = ubound(ssa_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "ssa_sw_cloud=", ssa_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = lbound(g_sw_cloud,1)
+    s2 = lbound(g_sw_cloud,2)
+    s3 = lbound(g_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_sw_cloud=", g_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(g_sw_cloud,1)/2
+    s2 = size(g_sw_cloud,2)/2
+    s3 = size(g_sw_cloud,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_sw_cloud=", g_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = ubound(g_sw_cloud,1)
+    s2 = ubound(g_sw_cloud,2)
+    s3 = ubound(g_sw_cloud,3)
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "g_sw_cloud=", g_sw_cloud(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
   end subroutine cloud_optics
 

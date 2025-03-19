@@ -56,6 +56,7 @@ program ecrad_ifs_driver
   use radiation_io,             only : nulout
   use radiation_single_level,   only : single_level_type
   use radiation_thermodynamics, only : thermodynamics_type
+
   use radiation_gas,            only : gas_type, IMassMixingRatio, &
        &   IH2O, ICO2, IO3, IN2O, INO2, ICO, ICH4, IO2, ICFC11, ICFC12, &
        &   IHCFC22, ICCl4
@@ -71,6 +72,10 @@ program ecrad_ifs_driver
   use ifs_blocking
 #ifdef HAVE_NVTX
   use nvtx
+#endif
+#ifdef HAVE_ROCTX
+  use roctx_profiling, only: roctxmarka, roctxrangepusha, roctxrangepop
+  use iso_c_binding, only: c_null_char
 #endif
 
   implicit none
@@ -153,6 +158,10 @@ program ecrad_ifs_driver
 
   ! Are any variables out of bounds?
   logical :: is_out_of_bounds
+
+#ifdef HAVE_ROCTX
+  integer(4) :: roctx_ret
+#endif
 
 !  integer    :: iband(20), nweights
 !  real(jprb) :: weight(20)
@@ -292,7 +301,7 @@ program ecrad_ifs_driver
   call file%close()
 
   ! Convert gas units to mass-mixing ratio
-  call gas%set_units(IMassMixingRatio, lacc=.false.)
+  call gas%set_units(gas, IMassMixingRatio, lacc=.false.)
 
   ! Compute seed from skin temperature residual
   !  single_level%iseed = int(1.0e9*(single_level%skin_temperature &
@@ -317,7 +326,7 @@ program ecrad_ifs_driver
 
   ! Compute saturation with respect to liquid (needed for aerosol
   ! hydration) call
-  call thermodynamics%calc_saturation_wrt_liquid(driver_config%istartcol,driver_config%iendcol)
+  call thermodynamics%calc_saturation_wrt_liquid(thermodynamics, driver_config%istartcol,driver_config%iendcol)
 
   ! Check inputs are within physical bounds, printing message if not
   is_out_of_bounds =     gas%out_of_physical_bounds(driver_config%istartcol, driver_config%iendcol, &
@@ -389,7 +398,6 @@ program ecrad_ifs_driver
   ! --------------------------------------------------------
   ! Section 4b: Call radiation_scheme with blocked memory data
   ! --------------------------------------------------------
-
   if (driver_config%iverbose >= 2) then
     write(nulout,'(a)')  'Performing radiative transfer calculations'
   end if
@@ -398,20 +406,27 @@ program ecrad_ifs_driver
   ! profiling
   do jrepeat = 1,driver_config%nrepeat
 #ifdef HAVE_NVTX
-     call nvtxStartRange("ecrad_it")
+    call nvtxStartRange("ecrad_it")
 #endif
+#ifdef HAVE_ROCTX
+    roctx_ret = roctxRangePushA("ecrad_it"//c_null_char)
+#endif  
 
 #ifdef COPY_ASYNC
+#ifdef OMPGPU
+#error "NOT IMPLEMENTED!"
+#endif
+#ifdef ACCGPU
     !$acc enter data create(zrgp(:,:,1)) &
 #ifdef BITIDENTITY_TESTING
     !$acc&     copyin(iseed(:,1)) &
 #endif
     !$acc&     async(2)
-
     next_il = min(nproma,ncol)
     !$acc update device(zrgp(:,ifs_config%iinbeg:ifs_config%iinend,1), &
     !$acc&              zrgp(:,ifs_config%ioutend+1:ifs_config%ifldstot,1)) async(2)
 #endif
+#endif !! COPY_ASYNC
 
 #ifndef NO_OPENMP
     if (jrepeat == driver_config%nwarmup + 1) then
@@ -422,8 +437,14 @@ program ecrad_ifs_driver
 !    if (driver_config%do_parallel) then
       ! Run radiation scheme over blocks of columns in parallel
 
+#ifndef OMPGPU
       !$OMP PARALLEL DO SCHEDULE(DYNAMIC,1)&
       !$OMP&PRIVATE(JRL,IBEG,IEND,IL,IB)
+#else
+#ifdef DEBUG_WARNING
+      write(nulout,'(a,a,i0,a)') __FILE__, " : LINE = ", __LINE__, " WARNING : Disabling Host OMP parallelization while debugging OMP TARGET parallelization. THis needs to be fixed! PJM 4-9-2025"
+#endif
+#endif
       do jrl=1,ncol,nproma
         ibeg=jrl
         iend=min(ibeg+nproma-1,ncol)
@@ -441,19 +462,46 @@ program ecrad_ifs_driver
 
 #ifdef COPY_ASYNC
         if (iend < ncol) then
+#ifdef OMPGPU
+#endif
+#ifdef ACCGPU
           !$acc enter data create(zrgp(:,:,ib+1)) &
 #ifdef BITIDENTITY_TESTING
           !$acc&     copyin(iseed(:,ib+1)) &
 #endif
           !$acc&     async(2) wait(2)
-
+#endif
           next_il = min(iend+nproma,ncol) - (ibeg+nproma) + 1
+#ifdef OMPGPU
+#endif
+#ifdef ACCGPU
           !$acc update device(zrgp(:,ifs_config%iinbeg:ifs_config%iinend,ib+1), &
           !$acc&              zrgp(:,ifs_config%ioutend+1:ifs_config%ifldstot,ib+1)) async(2)
+#endif
         endif
 
 #else  /* COPY_ASYNC */
 
+#ifdef OMPGPU
+        !$OMP TARGET ENTER DATA MAP(ALLOC:zrgp(:,:,ib))
+#ifdef BITIDENTITY_TESTING
+        !$OMP TARGET UPDATE TO(iseed(:,ib))
+#endif
+        ! write(nulout,'(a,i0,a,i0,a,i0)') "zrgp SIZE=", SIZE(zrgp,1), " ", SIZE(zrgp,2), " ", SIZE(zrgp,3)
+        ! write(nulout,'(a,i0)') "il=", il
+        ! write(nulout,'(a,i0)') "ib=", ib
+        ! write(nulout,'(a,i0)') "ifs_config%iinbeg=", ifs_config%iinbeg
+        ! write(nulout,'(a,i0)') "ifs_config%iinend=", ifs_config%iinend
+        ! write(nulout,'(a,i0)') "ifs_config%ioutend+1=", ifs_config%ioutend+1
+        ! write(nulout,'(a,i0)') "ifs_config%ifldstot=", ifs_config%ifldstot
+        ! write(nulout,'(a,i0)') "ifs_config%ioutbeg=", ifs_config%ioutbeg
+        ! write(nulout,'(a,i0)') "ifs_config%ioutend=", ifs_config%ioutend
+        ! write(nulout,'(a,i0)') "ifs_config%iemiss=", ifs_config%iemiss
+
+        !$OMP TARGET UPDATE TO(zrgp(1:il,ifs_config%iinbeg:ifs_config%iinend,ib), &
+        !$OMP&                 zrgp(1:il,ifs_config%ioutend+1:ifs_config%ifldstot,ib))
+#endif
+#ifdef ACCGPU
         !$acc data create(zrgp(:,:,ib)) &
 #ifdef BITIDENTITY_TESTING
         !$acc&     copyin(iseed(:,ib)) &
@@ -463,12 +511,13 @@ program ecrad_ifs_driver
         !$acc update device(zrgp(1:il,ifs_config%iinbeg:ifs_config%iinend,ib), &
         !$acc&            zrgp(1:il,ifs_config%ioutend+1:ifs_config%ifldstot,ib)) &
         !$acc& async(1)
+#endif
 #endif /* COPY_ASYNC */
 
         ! Call the ECRAD radiation scheme
         call radiation_scheme &
              & (yradiation, &
-             &  1, il, nproma, &                       ! startcol, endcol, ncol
+             &  jrl, 1, il, nproma, &                       ! startcol, endcol, ncol
              &  nlev, size(aerosol%mixing_ratio,3), &    ! nlev, naerosols
              &  single_level%solar_irradiance, &                               ! solar_irrad
              ! array inputs
@@ -509,16 +558,28 @@ program ecrad_ifs_driver
              &  iseed=iseed(:,ib) &
 #endif
              & )
+
+#ifdef OMPGPU
 #ifdef COPY_ASYNC
-          !$acc update host(zrgp(:,ifs_config%ioutbeg:ifs_config%ioutend,ib)) async(3) wait(1)
-          !$acc exit data delete(zrgp(:,:,ib)) async(3)
 #else
-          !$acc update host(zrgp(1:il,ifs_config%ioutbeg:ifs_config%ioutend,ib)) async(1)
-          !$acc end data
+        !!$OMP TARGET UPDATE FROM(zrgp(:,:,ib))
+        !$OMP TARGET UPDATE FROM(zrgp(1:il,ifs_config%ioutbeg:ifs_config%ioutend,ib))
+        !$OMP TARGET EXIT DATA MAP(DELETE:zrgp(:,:,ib))
+#endif
+#endif
+#ifdef ACCGPU
+#ifdef COPY_ASYNC
+        !$acc update host(zrgp(:,ifs_config%ioutbeg:ifs_config%ioutend,ib)) async(3) wait(1)
+        !$acc exit data delete(zrgp(:,:,ib)) async(3)
+#else
+        !$acc update host(zrgp(1:il,ifs_config%ioutbeg:ifs_config%ioutend,ib)) async(1)
+        !$acc end data
+#endif
 #endif
       end do
+#ifndef OMPGPU
       !$OMP END PARALLEL DO
-
+#endif
 !    else
       ! Run radiation scheme serially
 !      if (driver_config%iverbose >= 3) then
@@ -533,10 +594,18 @@ program ecrad_ifs_driver
 #ifdef HAVE_NVTX
      call nvtxEndRange
 #endif
+#ifdef HAVE_ROCTX
+     call roctxRangePop()
+     call roctxMarkA("ecrad_it"//c_null_char)
+#endif  
 
   end do
 
+#ifdef OMPGPU
+#endif
+#ifdef ACCGPU
 !$acc wait
+#endif
 
 #ifndef NO_OPENMP
   if (driver_config%nrepeat > driver_config%nwarmup) then

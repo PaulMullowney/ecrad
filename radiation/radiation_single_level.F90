@@ -19,7 +19,7 @@
 module radiation_single_level
 
   use parkind1, only : jprb
-  use radiation_io, only : nulerr, radiation_abort
+  use radiation_io, only : nulerr, nulout, radiation_abort
 
   implicit none
   public
@@ -96,14 +96,14 @@ module radiation_single_level
   contains
     procedure :: allocate   => allocate_single_level
     procedure :: deallocate => deallocate_single_level
-    procedure :: init_seed_simple
-    procedure :: get_albedos
+    procedure, nopass :: init_seed_simple
+    procedure, nopass :: get_albedos
     procedure :: out_of_physical_bounds
-#ifdef _OPENACC
-    procedure :: create_device
-    procedure :: update_host
-    procedure :: update_device
-    procedure :: delete_device
+#if defined(_OPENACC)  || defined(OMPGPU)
+    procedure, nopass :: create_device => create_device_single_level
+    procedure, nopass :: update_host   => update_host_single_level
+    procedure, nopass :: update_device => update_device_single_level
+    procedure, nopass :: delete_device => delete_device_single_level
 #endif
 
   end type single_level_type
@@ -203,7 +203,7 @@ contains
   !---------------------------------------------------------------------
   ! Unimaginative initialization of random-number seeds
   subroutine init_seed_simple(this, istartcol, iendcol, lacc)
-    class(single_level_type), intent(inout) :: this
+    type(single_level_type), intent(inout)  :: this
     integer, intent(in)                     :: istartcol, iendcol
     logical, optional, intent(in)           :: lacc
 
@@ -220,12 +220,14 @@ contains
       allocate(this%iseed(istartcol:iendcol))
     end if
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO IF (llacc)
     !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1) IF(llacc)
     !$ACC LOOP GANG VECTOR
     do jcol = istartcol,iendcol
       this%iseed(jcol) = jcol
     end do
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
   end subroutine init_seed_simple
 
@@ -239,7 +241,7 @@ contains
     use radiation_io,     only : nulerr, radiation_abort
     use yomhook,          only : lhook, dr_hook, jphook
 
-    class(single_level_type), intent(in) :: this
+    type(single_level_type),  intent(in) :: this
     type(config_type),        intent(in) :: config
     integer,                  intent(in) :: istartcol, iendcol
 
@@ -267,9 +269,14 @@ contains
 
     real(jphook) :: hook_handle
 
+#ifdef DEBUG_CORRECTNESS_RADIATION
+    integer :: s1, s2
+#endif
+
     if (lhook) call dr_hook('radiation_single_level:get_albedos',0,hook_handle)
 
     !$ACC DATA CREATE(sw_albedo_band, lw_albedo_band) ASYNC(1)
+    !$OMP TARGET ENTER DATA MAP(ALLOC: sw_albedo_band, lw_albedo_band)
 
     if (config%do_sw) then
       ! Albedos/emissivities are stored in single_level in their own
@@ -294,6 +301,7 @@ contains
           call radiation_abort()
         end if
 
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP SEQ
         do jband = 1,config%n_bands_sw
@@ -302,31 +310,51 @@ contains
             sw_albedo_band(jcol,jband) = 0.0_jprb
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: config, sw_albedo_band, this%sw_albedo, config%sw_albedo_weights)
+        do jalbedoband = 1,nalbedoband
+           !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+           do jband = 1,config%n_bands_sw
+              do jcol = istartcol,iendcol
+                sw_albedo_band(jcol,jband) &
+                     &  = sw_albedo_band(jcol,jband) &
+                     &  + config%sw_albedo_weights(jalbedoband,jband) &
+                     &    * this%sw_albedo(jcol, jalbedoband)
+             end do
+          end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        end do
+        !!$OMP END TARGET DATA
+#else
         !$ACC LOOP SEQ
         do jband = 1,config%n_bands_sw
           !$ACC LOOP SEQ
           do jalbedoband = 1,nalbedoband
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
             if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
 #endif
+
               !$ACC LOOP GANG(STATIC:1) VECTOR
               do jcol = istartcol,iendcol
                 sw_albedo_band(jcol,jband) &
                     &  = sw_albedo_band(jcol,jband) &
                     &  + config%sw_albedo_weights(jalbedoband,jband) &
                     &    * this%sw_albedo(jcol, jalbedoband)
-              end do
-#ifndef _OPENACC
+              end do              
+              
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
             end if
 #endif
           end do
         end do
-
-#ifndef _OPENACC
-        sw_albedo_diffuse = transpose(sw_albedo_band(istartcol:iendcol, &
-             &                              config%i_band_from_reordered_g_sw))
-#else
+#endif
+        
+#if defined(OMPGPU) || defined(_OPENACC)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC LOOP GANG(STATIC:1) VECTOR
         do jcol = istartcol,iendcol
           !$ACC LOOP SEQ
@@ -335,8 +363,14 @@ contains
                 &                             config%i_band_from_reordered_g_sw(jg))
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        sw_albedo_diffuse = transpose(sw_albedo_band(istartcol:iendcol, &
+             &                              config%i_band_from_reordered_g_sw))
 #endif
+
         if (allocated(this%sw_albedo_direct)) then
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           !$ACC LOOP SEQ
           do jband = 1,config%n_bands_sw
             !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -344,12 +378,28 @@ contains
               sw_albedo_band(jcol,jband) = 0.0_jprb
             end do
           end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+          do jalbedoband = 1,nalbedoband
+             !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+             do jband = 1,config%n_bands_sw
+                do jcol = istartcol,iendcol
+                   sw_albedo_band(jcol,jband) &
+                        &  = sw_albedo_band(jcol,jband) &
+                        &  + config%sw_albedo_weights(jalbedoband,jband) &
+                      &    * this%sw_albedo_direct(jcol, jalbedoband)
+                end do
+             end do
+             !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+          end do
+#else
           !$ACC LOOP SEQ
           do jband = 1,config%n_bands_sw
             !$ACC LOOP SEQ
             do jalbedoband = 1,nalbedoband
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
               if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
 #endif
                 !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -359,25 +409,31 @@ contains
                       &  + config%sw_albedo_weights(jalbedoband,jband) &
                       &    * this%sw_albedo_direct(jcol, jalbedoband)
                 end do
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
               end if
 #endif
             end do
           end do
-#ifndef _OPENACC
+#endif
+          
+#if defined(OMPGPU) || defined(_OPENACC)
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+          !$ACC LOOP GANG(STATIC:1) VECTOR
+          do jcol = istartcol,iendcol
+            !$ACC LOOP SEQ
+            do jg = 1,config%n_g_sw
+              sw_albedo_direct(jg,jcol) = sw_albedo_band(jcol, &
+                  &                         config%i_band_from_reordered_g_sw(jg))
+            end do
+          end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
           sw_albedo_direct = transpose(sw_albedo_band(istartcol:iendcol, &
                &                             config%i_band_from_reordered_g_sw))
-#else
-        !$ACC LOOP GANG(STATIC:1) VECTOR
-        do jcol = istartcol,iendcol
-          !$ACC LOOP SEQ
-          do jg = 1,config%n_g_sw
-            sw_albedo_direct(jg,jcol) = sw_albedo_band(jcol, &
-                &                         config%i_band_from_reordered_g_sw(jg))
-          end do
-        end do
 #endif
         else
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           !$ACC LOOP GANG(STATIC:1) VECTOR
           do jcol = istartcol,iendcol
             !$ACC LOOP SEQ
@@ -385,8 +441,9 @@ contains
               sw_albedo_direct(jg,jcol) = sw_albedo_diffuse(jg,jcol)
             end do
           end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
         end if
-      !$ACC END PARALLEL
+        !$ACC END PARALLEL
       else
         ! Albedos mapped less accurately to ecRad spectral bands
         if (maxval(config%i_albedo_from_band_sw) > size(this%sw_albedo,2)) then
@@ -448,11 +505,9 @@ contains
           write(nulerr,'(a,i0,a)') '*** Error: single_level%lw_emissivity has fewer than required ', &
                &  maxval(config%i_emiss_from_band_lw), ' bands'
           call radiation_abort()
-        end if
-#ifndef _OPENACC
-        lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol, &
-             &  config%i_emiss_from_band_lw(config%i_band_from_reordered_g_lw)))
-#else
+       end if
+#if defined(_OPENACC) || defined(OMPGPU)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
@@ -462,12 +517,63 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol, &
+             &  config%i_emiss_from_band_lw(config%i_band_from_reordered_g_lw)))
 #endif
       end if
     end if
 
     !$ACC WAIT
     !$ACC END DATA
+    !$OMP TARGET EXIT DATA MAP(DELETE: sw_albedo_band, lw_albedo_band)
+
+#ifdef DEBUG_CORRECTNESS_RADIATION
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(lw_albedo) IF(present(lw_albedo)) 
+    !$OMP TARGET UPDATE FROM(sw_albedo_direct, sw_albedo_diffuse)
+    !$ACC UPDATE HOST(lw_albedo) IF(present(lw_albedo)) ASYNC(1)
+    !$ACC UPDATE HOST(sw_albedo_direct, sw_albedo_diffuse) ASYNC(1)
+    !$ACC WAIT(1)
+    if (present(lw_albedo)) then
+       s1 = lbound(lw_albedo,1)
+       s2 = istartcol
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "lw_albedo=", lw_albedo(s1,s2), " at indices ", s1, " ", s2
+       s1 = ubound(lw_albedo,1)
+       s2 = istartcol
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "lw_albedo=", lw_albedo(s1,s2), " at indices ", s1, " ", s2
+       s1 = size(lw_albedo,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "lw_albedo=", lw_albedo(s1,s2), " at indices ", s1, " ", s2
+       s1 = lbound(lw_albedo,1)
+       s2 = iendcol
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "lw_albedo=", lw_albedo(s1,s2), " at indices ", s1, " ", s2
+       s1 = ubound(lw_albedo,1)
+       s2 = iendcol
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "lw_albedo=", lw_albedo(s1,s2), " at indices ", s1, " ", s2
+    endif
+    s1 = lbound(sw_albedo_direct,1)
+    s2 = lbound(sw_albedo_direct,2)
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_direct=", sw_albedo_direct(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(sw_albedo_direct,1)/2
+    s2 = size(sw_albedo_direct,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_direct=", sw_albedo_direct(s1,s2), " at indices ", s1, " ", s2
+    s1 = ubound(sw_albedo_direct,1)
+    s2 = ubound(sw_albedo_direct,2)
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_direct=", sw_albedo_direct(s1,s2), " at indices ", s1, " ", s2
+    s1 = lbound(sw_albedo_diffuse,1)
+    s2 = lbound(sw_albedo_diffuse,2)
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_diffuse=", sw_albedo_diffuse(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(sw_albedo_diffuse,1)/2
+    s2 = size(sw_albedo_diffuse,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_diffuse=", sw_albedo_diffuse(s1,s2), " at indices ", s1, " ", s2
+    s1 = ubound(sw_albedo_diffuse,1)
+    s2 = ubound(sw_albedo_diffuse,2)
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "sw_albedo_diffuse=", sw_albedo_diffuse(s1,s2), " at indices ", s1, " ", s2
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
     if (lhook) call dr_hook('radiation_single_level:get_albedos',1,hook_handle)
 
@@ -515,134 +621,204 @@ contains
 
   end function out_of_physical_bounds
 
-#ifdef _OPENACC
+#if defined(_OPENACC)  || defined(OMPGPU)
+  !---------------------------------------------------------------------
+  ! debug print
+  subroutine debug_print_single_level(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(single_level_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol,iendcol
+    integer :: s1, s2
+
+    !$OMP TARGET UPDATE FROM(this%cos_sza) IF(allocated(this%cos_sza))
+    !$OMP TARGET UPDATE FROM(this%skin_temperature) IF(allocated(this%skin_temperature))
+    !$OMP TARGET UPDATE FROM(this%sw_albedo) IF(allocated(this%sw_albedo))
+    !$OMP TARGET UPDATE FROM(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct))
+    !$OMP TARGET UPDATE FROM(this%lw_emissivity) IF(allocated(this%lw_emissivity))
+    !$OMP TARGET UPDATE FROM(this%lw_emission) IF(allocated(this%lw_emission))
+    !$OMP TARGET UPDATE FROM(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling))
+    !$OMP TARGET UPDATE FROM(this%iseed) IF(allocated(this%iseed))
+
+    !$ACC UPDATE HOST(this%cos_sza) ASYNC(1) IF(allocated(this%cos_sza))
+    !$ACC UPDATE HOST(this%skin_temperature) ASYNC(1) IF(allocated(this%skin_temperature))
+    !$ACC UPDATE HOST(this%lw_emissivity) ASYNC(1) IF(allocated(this%lw_emissivity))
+    !$ACC UPDATE HOST(this%lw_emission) ASYNC(1) IF(allocated(this%lw_emission))
+    !$ACC UPDATE HOST(this%spectral_solar_scaling) ASYNC(1) IF(allocated(this%spectral_solar_scaling))
+    !$ACC UPDATE HOST(this%sw_albedo) ASYNC(1) IF(allocated(this%sw_albedo))
+    !$ACC UPDATE HOST(this%sw_albedo_direct) ASYNC(1) IF(allocated(this%sw_albedo_direct))
+    !$ACC UPDATE HOST(this%iseed) ASYNC(1) IF(allocated(this%iseed))
+
+    !$ACC WAIT(1)
+
+    write(nulout,'(a,a,a,i0)')         "    DEVICE ARRAY DEBUG FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                         IN ", __FILE__, " : LINE = ", __LINE__
+
+    if (allocated(this%iseed)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,i0,a,i0)') "this%iseed=", this%iseed(s1), " at indices ", s1
+    end if
+    if (allocated(this%cos_sza)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0)') "this%cos_sza=", this%cos_sza(s1), " at indices ", s1
+    end if
+    if (allocated(this%skin_temperature)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0)') "this%skin_temperature=", this%skin_temperature(s1), " at indices ", s1
+    end if
+    if (allocated(this%spectral_solar_scaling)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0)') "this%spectral_solar_scaling=", this%spectral_solar_scaling(s1), " at indices ", s1
+    end if
+    if (allocated(this%sw_albedo)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_albedo,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_albedo=", this%sw_albedo(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_albedo_direct)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_albedo_direct,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_albedo_direct=", this%sw_albedo_direct(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_emissivity)) then
+       s1 = istartcol
+       s2 = lbound(this%lw_emissivity,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emissivity=", this%lw_emissivity(s1,s2), " at indices ", s1, " ", s2
+       s1 = istartcol
+       s2 = ubound(this%lw_emissivity,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emissivity=", this%lw_emissivity(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_emissivity,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emissivity=", this%lw_emissivity(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = lbound(this%lw_emissivity,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emissivity=", this%lw_emissivity(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%lw_emissivity,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emissivity=", this%lw_emissivity(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_emission)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_emission,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_emission=", this%lw_emission(s1,s2), " at indices ", s1, " ", s2
+    end if
+  end subroutine debug_print_single_level
+
   !---------------------------------------------------------------------
   ! creates fields on device
-  subroutine create_device(this)
+  subroutine create_device_single_level(this)
 
-    class(single_level_type), intent(inout) :: this
+    type(single_level_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%cos_sza) IF(allocated(this%cos_sza))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%skin_temperature) IF(allocated(this%skin_temperature))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_albedo) IF(allocated(this%sw_albedo))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_emissivity) IF(allocated(this%lw_emissivity))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_emission) IF(allocated(this%lw_emission))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%iseed) IF(allocated(this%iseed))
 
-    !$ACC ENTER DATA CREATE(this%cos_sza) ASYNC(1) &
-    !$ACC   IF(allocated(this%cos_sza))
+    !$ACC ENTER DATA CREATE(this%cos_sza) IF(allocated(this%cos_sza)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%skin_temperature) IF(allocated(this%skin_temperature)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_albedo) IF(allocated(this%sw_albedo)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_emissivity) IF(allocated(this%lw_emissivity)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_emission) IF(allocated(this%lw_emission)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 
-    !$ACC ENTER DATA CREATE(this%skin_temperature) ASYNC(1) &
-    !$ACC   IF(allocated(this%skin_temperature))
-
-    !$ACC ENTER DATA CREATE(this%sw_albedo) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo))
-
-    !$ACC ENTER DATA CREATE(this%sw_albedo_direct) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo_direct))
-
-    !$ACC ENTER DATA CREATE(this%lw_emissivity) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emissivity))
-
-    !$ACC ENTER DATA CREATE(this%lw_emission) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emission))
-
-    !$ACC ENTER DATA CREATE(this%spectral_solar_scaling) ASYNC(1) &
-    !$ACC   IF(allocated(this%spectral_solar_scaling))
-
-    !$ACC ENTER DATA CREATE(this%iseed) ASYNC(1) &
-    !$ACC   IF(allocated(this%iseed))
-
-  end subroutine create_device
+  end subroutine create_device_single_level
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host(this)
+  subroutine update_host_single_level(this)
 
-    class(single_level_type), intent(inout) :: this
+    type(single_level_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC UPDATE HOST(this%cos_sza) ASYNC(1) &
-    !$ACC   IF(allocated(this%cos_sza))
+    !$OMP TARGET UPDATE FROM(this%cos_sza) IF(allocated(this%cos_sza))
+    !$OMP TARGET UPDATE FROM(this%skin_temperature) IF(allocated(this%skin_temperature))
+    !$OMP TARGET UPDATE FROM(this%sw_albedo) IF(allocated(this%sw_albedo))
+    !$OMP TARGET UPDATE FROM(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct))
+    !$OMP TARGET UPDATE FROM(this%lw_emissivity) IF(allocated(this%lw_emissivity))
+    !$OMP TARGET UPDATE FROM(this%lw_emission) IF(allocated(this%lw_emission))
+    !$OMP TARGET UPDATE FROM(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling))
+    !$OMP TARGET UPDATE FROM(this%iseed) IF(allocated(this%iseed))
 
-    !$ACC UPDATE HOST(this%skin_temperature) ASYNC(1) &
-    !$ACC   IF(allocated(this%skin_temperature))
+    !$ACC UPDATE HOST(this%cos_sza) IF(allocated(this%cos_sza)) ASYNC(1)
+    !$ACC UPDATE HOST(this%skin_temperature) IF(allocated(this%skin_temperature)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_albedo) IF(allocated(this%sw_albedo)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_emissivity) IF(allocated(this%lw_emissivity)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_emission) IF(allocated(this%lw_emission)) ASYNC(1)
+    !$ACC UPDATE HOST(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
+    !$ACC UPDATE HOST(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 
-    !$ACC UPDATE HOST(this%sw_albedo) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo))
-
-    !$ACC UPDATE HOST(this%sw_albedo_direct) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo_direct))
-
-    !$ACC UPDATE HOST(this%lw_emissivity) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emissivity))
-
-    !$ACC UPDATE HOST(this%lw_emission) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emission))
-
-    !$ACC UPDATE HOST(this%spectral_solar_scaling) ASYNC(1) &
-    !$ACC   IF(allocated(this%spectral_solar_scaling))
-
-    !$ACC UPDATE HOST(this%iseed) ASYNC(1) &
-    !$ACC   IF(allocated(this%iseed))
-
-  end subroutine update_host
+  end subroutine update_host_single_level
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device(this)
+  subroutine update_device_single_level(this)
 
-    class(single_level_type), intent(inout) :: this
+    type(single_level_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC UPDATE DEVICE(this%cos_sza) ASYNC(1) &
-    !$ACC   IF(allocated(this%cos_sza))
+    !$OMP TARGET UPDATE TO(this%cos_sza) IF(allocated(this%cos_sza))
+    !$OMP TARGET UPDATE TO(this%skin_temperature) IF(allocated(this%skin_temperature))
+    !$OMP TARGET UPDATE TO(this%sw_albedo) IF(allocated(this%sw_albedo))
+    !$OMP TARGET UPDATE TO(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct))
+    !$OMP TARGET UPDATE TO(this%lw_emissivity) IF(allocated(this%lw_emissivity))
+    !$OMP TARGET UPDATE TO(this%lw_emission) IF(allocated(this%lw_emission))
+    !$OMP TARGET UPDATE TO(this%spectral_solar_scaling) IF( allocated(this%spectral_solar_scaling))
+    !$OMP TARGET UPDATE TO(this%iseed) IF(allocated(this%iseed))
 
-    !$ACC UPDATE DEVICE(this%skin_temperature) ASYNC(1) &
-    !$ACC   IF(allocated(this%skin_temperature))
+    !$ACC UPDATE DEVICE(this%cos_sza) IF(allocated(this%cos_sza)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%skin_temperature) IF(allocated(this%skin_temperature)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%sw_albedo) IF(allocated(this%sw_albedo)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%lw_emissivity) IF(allocated(this%lw_emissivity)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%lw_emission) IF(allocated(this%lw_emission)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%spectral_solar_scaling) IF( allocated(this%spectral_solar_scaling)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 
-    !$ACC UPDATE DEVICE(this%sw_albedo) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo))
-
-    !$ACC UPDATE DEVICE(this%sw_albedo_direct) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo_direct))
-
-    !$ACC UPDATE DEVICE(this%lw_emissivity) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emissivity))
-
-    !$ACC UPDATE DEVICE(this%lw_emission) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emission))
-
-    !$ACC UPDATE DEVICE(this%spectral_solar_scaling) ASYNC(1) &
-    !$ACC   IF( allocated(this%spectral_solar_scaling))
-
-    !$ACC UPDATE DEVICE(this%iseed) ASYNC(1) &
-    !$ACC   IF(allocated(this%iseed))
-
-  end subroutine update_device
+  end subroutine update_device_single_level
 
   !---------------------------------------------------------------------
   ! deletes fields on device
-  subroutine delete_device(this)
+  subroutine delete_device_single_level(this)
 
-    class(single_level_type), intent(inout) :: this
+    type(single_level_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC EXIT DATA DELETE(this%cos_sza) ASYNC(1) &
-    !$ACC   IF(allocated(this%cos_sza))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%cos_sza) IF(allocated(this%cos_sza))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%skin_temperature) IF(allocated(this%skin_temperature))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_albedo) IF(allocated(this%sw_albedo))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_emissivity) IF(allocated(this%lw_emissivity))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_emission) IF(allocated(this%lw_emission))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%iseed) IF(allocated(this%iseed))
 
-    !$ACC EXIT DATA DELETE(this%skin_temperature) ASYNC(1) &
-    !$ACC   IF(allocated(this%skin_temperature))
+    !$ACC EXIT DATA DELETE(this%cos_sza) IF(allocated(this%cos_sza)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%skin_temperature) IF(allocated(this%skin_temperature)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%sw_albedo) IF(allocated(this%sw_albedo)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%sw_albedo_direct) IF(allocated(this%sw_albedo_direct)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%lw_emissivity) IF(allocated(this%lw_emissivity)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%lw_emission) IF(allocated(this%lw_emission)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 
-    !$ACC EXIT DATA DELETE(this%sw_albedo) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo))
-
-    !$ACC EXIT DATA DELETE(this%sw_albedo_direct) ASYNC(1) &
-    !$ACC   IF(allocated(this%sw_albedo_direct))
-
-    !$ACC EXIT DATA DELETE(this%lw_emissivity) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emissivity))
-
-    !$ACC EXIT DATA DELETE(this%lw_emission) ASYNC(1) &
-    !$ACC   IF(allocated(this%lw_emission))
-
-    !$ACC EXIT DATA DELETE(this%spectral_solar_scaling) ASYNC(1) &
-    !$ACC   IF(allocated(this%spectral_solar_scaling))
-
-    !$ACC EXIT DATA DELETE(this%iseed) ASYNC(1) &
-    !$ACC   IF(allocated(this%iseed))
-
-  end subroutine delete_device
+  end subroutine delete_device_single_level
 #endif
 
 end module radiation_single_level

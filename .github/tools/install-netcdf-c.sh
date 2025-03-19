@@ -43,8 +43,8 @@ fi
 
 mkdir -p ${TEMPORARY_FILES}/build-${FOLDER} && cd ${TEMPORARY_FILES}/build-${FOLDER}
 rm -rf ./*
-cmake -G Ninja ${TEMPORARY_FILES}/${FOLDER} \
+cmake ${TEMPORARY_FILES}/${FOLDER} \
     -DHDF5_DIR=${HDF5_ROOT}/cmake -DCMAKE_INSTALL_PREFIX="${NETCDF_INSTALL_DIR}" \
-    -DENABLE_TESTS=OFF
+    -DENABLE_TESTS=OFF  -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_Fortran_COMPILER=$FC -DCURL_LIBRARY="-lcurl" -DCMAKE_BUILD_TYPE=RELEASE
 cmake --build . --config Release
 cmake --install .

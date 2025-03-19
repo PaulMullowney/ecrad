@@ -19,7 +19,7 @@
 module radiation_aerosol
 
   use parkind1, only : jprb
-  use radiation_io, only : nulerr, radiation_abort
+  use radiation_io, only : nulerr, radiation_abort, nulout
 
   implicit none
   public
@@ -54,11 +54,11 @@ module radiation_aerosol
       procedure :: allocate_direct => allocate_aerosol_arrays_direct
       procedure :: deallocate      => deallocate_aerosol_arrays
       procedure :: out_of_physical_bounds
-#ifdef _OPENACC
-      procedure :: create_device
-      procedure :: update_host
-      procedure :: update_device
-      procedure :: delete_device
+#if defined(_OPENACC)  || defined(OMPGPU)
+      procedure, nopass :: create_device => create_device_aerosol
+      procedure, nopass :: update_host   => update_host_aerosol
+      procedure, nopass :: update_device => update_device_aerosol
+      procedure, nopass :: delete_device => delete_device_aerosol
 #endif
   end type aerosol_type
 
@@ -124,7 +124,8 @@ contains
       allocate(this%g_lw  (config%n_bands_lw,istartlev:iendlev,ncol))
 
       ! for openacc, this is done during create_device
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
       ! If longwave scattering by aerosol is not to be represented,
       ! then the user may wish to just provide absorption optical
       ! depth in od_lw, in which case we must set the following two
@@ -220,12 +221,90 @@ contains
 
   end function out_of_physical_bounds
 
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+  !---------------------------------------------------------------------
+  ! debug print
+  subroutine debug_print_aerosol(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(aerosol_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol, iendcol
+    integer :: s1, s2, s3
+    
+    !$OMP TARGET UPDATE FROM(this%mixing_ratio, this%od_sw, this%ssa_sw, this%g_sw, this%od_lw, this%ssa_lw, this%g_lw)
+
+    !$ACC UPDATE HOST(this%mixing_ratio) ASYNC(1) IF(allocated(this%mixing_ratio))
+    !$ACC UPDATE HOST(this%od_sw) ASYNC(1) IF(allocated(this%od_sw))
+    !$ACC UPDATE HOST(this%ssa_sw) ASYNC(1) IF(allocated(this%ssa_sw))
+    !$ACC UPDATE HOST(this%g_sw) ASYNC(1) IF(allocated(this%g_sw))
+    !$ACC UPDATE HOST(this%od_lw) ASYNC(1) IF(allocated(this%od_lw))
+    !$ACC UPDATE HOST(this%ssa_lw) ASYNC(1) IF(allocated(this%ssa_lw))
+    !$ACC UPDATE HOST(this%g_lw) ASYNC(1) IF(allocated(this%g_lw))
+
+    !$ACC WAIT(1)
+
+    write(nulout,'(a,a,a,i0)')         "    DEVICE ARRAY DEBUG FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                         IN ", __FILE__, " : LINE = ", __LINE__
+    
+    if (allocated(this%mixing_ratio)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%mixing_ratio,2)/2
+       s3 = size(this%mixing_ratio,3)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%mixing_ratio=", this%mixing_ratio(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    s3 = iendcol
+    if (allocated(this%od_sw)) then
+       s1 = size(this%od_sw,1)/2
+       s2 = size(this%od_sw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%od_sw=", this%od_sw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%ssa_sw)) then
+       s1 = size(this%ssa_sw,1)/2
+       s2 = size(this%ssa_sw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%ssa_sw=", this%ssa_sw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%g_sw)) then
+       s1 = size(this%g_sw,1)/2
+       s2 = size(this%g_sw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%g_sw=", this%g_sw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%od_lw)) then
+       s1 = size(this%od_lw,1)/2
+       s2 = size(this%od_lw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%od_lw=", this%od_lw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%ssa_lw)) then
+       s1 = size(this%ssa_lw,1)/2
+       s2 = size(this%ssa_lw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%ssa_lw=", this%ssa_lw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%g_lw)) then
+       s1 = size(this%g_lw,1)/2
+       s2 = size(this%g_lw,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%g_lw=", this%g_lw(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+  end subroutine debug_print_aerosol
+
   !---------------------------------------------------------------------
   ! Creates fields on device
-  subroutine create_device(this)
+  subroutine create_device_aerosol(this)
 
-    class(aerosol_type), intent(inout) :: this
+    type(aerosol_type), intent(inout) :: this
+#if defined(OMPGPU)
+    integer :: i,j,k
+#endif
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%mixing_ratio) IF(allocated(this%mixing_ratio))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%od_sw) IF(allocated(this%od_sw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%ssa_sw) IF(allocated(this%ssa_sw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%g_sw) IF(allocated(this%g_sw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%od_lw) IF(allocated(this%od_lw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%ssa_lw) IF(allocated(this%ssa_lw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%g_lw) IF(allocated(this%g_lw))
 
     !$ACC ENTER DATA CREATE(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
     !$ACC ENTER DATA CREATE(this%od_sw) IF(allocated(this%od_sw)) ASYNC(1)
@@ -241,19 +320,44 @@ contains
       ! then the user may wish to just provide absorption optical
       ! depth in od_lw, in which case we must set the following two
       ! variables to zero
+#if defined(_OPENACC)
       !$ACC KERNELS DEFAULT(PRESENT) ASYNC(1)
       this%ssa_lw(:,:,:) = 0.0_jprb
       this%g_lw(:,:,:) = 0.0_jprb
       !$ACC END KERNELS
+#endif
+#if defined(OMPGPU)
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      do k = 1,SIZE(this%ssa_lw, 3)
+        do j = 1,SIZE(this%ssa_lw, 2)
+          do i = 1,SIZE(this%ssa_lw, 1)
+            this%ssa_lw(i,j,k) = 0.0_jprb
+            this%g_lw(i,j,k) = 0.0_jprb
+          end do
+        end do
+      end do
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
     endif
 
-  end subroutine create_device
+  end subroutine create_device_aerosol
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host(this)
+  subroutine update_host_aerosol(this)
 
-    class(aerosol_type), intent(inout) :: this
+    type(aerosol_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET UPDATE FROM(this%mixing_ratio) IF(allocated(this%mixing_ratio))
+    !$OMP TARGET UPDATE FROM(this%od_sw) IF(allocated(this%od_sw))
+    !$OMP TARGET UPDATE FROM(this%ssa_sw) IF(allocated(this%ssa_sw))
+    !$OMP TARGET UPDATE FROM(this%g_sw) IF(allocated(this%g_sw))
+    !$OMP TARGET UPDATE FROM(this%od_lw) IF(allocated(this%od_lw))
+    !$OMP TARGET UPDATE FROM(this%ssa_lw) IF(allocated(this%ssa_lw))
+    !$OMP TARGET UPDATE FROM(this%g_lw) IF(allocated(this%g_lw))
 
     !$ACC UPDATE HOST(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
     !$ACC UPDATE HOST(this%od_sw) IF(allocated(this%od_sw)) ASYNC(1)
@@ -263,13 +367,24 @@ contains
     !$ACC UPDATE HOST(this%ssa_lw) IF(allocated(this%ssa_lw)) ASYNC(1)
     !$ACC UPDATE HOST(this%g_lw) IF(allocated(this%g_lw)) ASYNC(1)
 
-  end subroutine update_host
+  end subroutine update_host_aerosol
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device(this)
+  subroutine update_device_aerosol(this)
 
-    class(aerosol_type), intent(inout) :: this
+    type(aerosol_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET UPDATE TO(this%mixing_ratio) IF(allocated(this%mixing_ratio))
+    !$OMP TARGET UPDATE TO(this%od_sw) IF(allocated(this%od_sw))
+    !$OMP TARGET UPDATE TO(this%ssa_sw) IF(allocated(this%ssa_sw))
+    !$OMP TARGET UPDATE TO(this%g_sw) IF(allocated(this%g_sw))
+    !$OMP TARGET UPDATE TO(this%od_lw) IF(allocated(this%od_lw))
+    !$OMP TARGET UPDATE TO(this%ssa_lw) IF(allocated(this%ssa_lw))
+    !$OMP TARGET UPDATE TO(this%g_lw) IF(allocated(this%g_lw))
 
     !$ACC UPDATE DEVICE(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%od_sw) IF(allocated(this%od_sw)) ASYNC(1)
@@ -279,13 +394,24 @@ contains
     !$ACC UPDATE DEVICE(this%ssa_lw) IF(allocated(this%ssa_lw)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%g_lw) IF(allocated(this%g_lw)) ASYNC(1)
 
-  end subroutine update_device
+  end subroutine update_device_aerosol
 
   !---------------------------------------------------------------------
   ! Deletes fields on device
-  subroutine delete_device(this)
+  subroutine delete_device_aerosol(this)
 
-    class(aerosol_type), intent(inout) :: this
+    type(aerosol_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%mixing_ratio) IF(allocated(this%mixing_ratio))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%od_sw) IF(allocated(this%od_sw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%ssa_sw) IF(allocated(this%ssa_sw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%g_sw) IF(allocated(this%g_sw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%od_lw) IF(allocated(this%od_lw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%ssa_lw) IF(allocated(this%ssa_lw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%g_lw) IF(allocated(this%g_lw))
 
     !$ACC EXIT DATA DELETE(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%od_sw) IF(allocated(this%od_sw)) ASYNC(1)
@@ -295,7 +421,7 @@ contains
     !$ACC EXIT DATA DELETE(this%ssa_lw) IF(allocated(this%ssa_lw)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%g_lw) IF(allocated(this%g_lw)) ASYNC(1)
 
-  end subroutine delete_device
+  end subroutine delete_device_aerosol
 #endif
 
 end module radiation_aerosol

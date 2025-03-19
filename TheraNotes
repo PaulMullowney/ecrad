@@ -1,0 +1,27 @@
+#################################################
+# AMD GPUs
+#################################################
+
+# To build with flang-new on Thera, do:
+# amd-staging
+source env_amd-staging.sh
+.github/tools/install-hdf5.sh --prefix $PWD/deps/amd-staging/hdf5
+.github/tools/install-netcdf-c.sh --prefix $PWD/deps/amd-staging/netcdf --hdf5-root $PWD/deps/amd-staging/hdf5
+.github/tools/install-netcdf-fortran.sh --prefix $PWD/deps/amd-staging/netcdf --netcdf-root $PWD/deps/amd-staging/netcdf
+sh build_amd.sh -r=1 -arch=gfx90a -staging -cmake
+
+# amd-staging
+source env_afar_5.3.0.sh
+.github/tools/install-hdf5.sh --prefix $PWD/deps/rocm-afar-5.3.0/hdf5
+.github/tools/install-netcdf-c.sh --prefix $PWD/deps/rocm-afar-5.3.0/netcdf --hdf5-root $PWD/deps/rocm-afar-5.3.0/hdf5
+.github/tools/install-netcdf-fortran.sh --prefix $PWD/deps/rocm-afar-5.3.0/netcdf --netcdf-root $PWD/deps/rocm-afar-5.3.0/netcdf
+sh build_amd.sh -r=1 -arch=gfx90a -staging -cmake
+
+#################################################
+# Nvidia GPUs : Using nvhpc sdk 24.5
+#################################################
+source env_H100.sh
+.github/tools/install-hdf5.sh --prefix $PWD/deps/nvhpc-24.5/hdf5
+.github/tools/install-netcdf-c.sh --prefix $PWD/deps/nvhpc-24.5/netcdf --hdf5-root $PWD/deps/nvhpc-24.5/hdf5
+.github/tools/install-netcdf-fortran.sh --prefix $PWD/deps/nvhpc-24.5/netcdf --netcdf-root $PWD/deps/nvhpc-24.5/netcdf
+sh build_nvidia.sh -device=H100 -r=1

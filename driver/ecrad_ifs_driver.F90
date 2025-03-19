@@ -70,6 +70,10 @@ program ecrad_ifs_driver
 #ifdef HAVE_NVTX
   use nvtx
 #endif
+#ifdef HAVE_ROCTX
+  use roctx_profiling, only: roctxmarka, roctxrangepusha, roctxrangepop
+  use iso_c_binding, only: c_null_char
+#endif
 
   implicit none
 
@@ -136,6 +140,10 @@ program ecrad_ifs_driver
 
   ! Are any variables out of bounds?
   logical :: is_out_of_bounds
+
+#ifdef HAVE_ROCTX
+  integer(4) :: roctx_ret
+#endif
 
 !  integer    :: iband(20), nweights
 !  real(jprb) :: weight(20)
@@ -273,7 +281,7 @@ program ecrad_ifs_driver
   call file%close()
 
   ! Convert gas units to mass-mixing ratio
-  call gas%set_units(IMassMixingRatio, lacc=.false.)
+  call gas%set_units(gas, IMassMixingRatio, lacc=.false.)
 
   ! Compute seed from skin temperature residual
   !  single_level%iseed = int(1.0e9*(single_level%skin_temperature &
@@ -298,7 +306,7 @@ program ecrad_ifs_driver
 
   ! Compute saturation with respect to liquid (needed for aerosol
   ! hydration) call
-   call thermodynamics%calc_saturation_wrt_liquid(driver_config%istartcol,driver_config%iendcol)
+  call thermodynamics%calc_saturation_wrt_liquid(thermodynamics, driver_config%istartcol,driver_config%iendcol)
 
   ! Check inputs are within physical bounds, printing message if not
   is_out_of_bounds =     gas%out_of_physical_bounds(driver_config%istartcol, driver_config%iendcol, &
@@ -379,10 +387,13 @@ program ecrad_ifs_driver
 #endif
 
 #ifdef HAVE_NVTX
-     call nvtxStartRange("ecrad_offload")
+  call nvtxStartRange("ecrad_offload")
+#endif
+#ifdef HAVE_ROCTX
+  roctx_ret = roctxRangePushA("ecrad_offload"//c_null_char)
 #endif
 
-#ifdef _OPENACC
+#if defined(_OPENACC) 
   !$ACC DATA COPYIN(yradiation, yradiation%rad_config, single_level, thermodynamics, &
   !$ACC&            gas, aerosol, cloud, ccn_land, ccn_sea, longitude_rad, sin_latitude, &
   !$ACC&            land_frac, pressure_fl, temperature_fl, cloud_fraction, cloud_q_liq, &
@@ -391,24 +402,38 @@ program ecrad_ifs_driver
   !$ACC&     COPYOUT(flux_sw_direct_normal, flux_uv, flux_par, flux_par_clear, emissivity_out, &
   !$ACC&            flux_diffuse_band, flux_direct_band) &
   !$ACC&     ASYNC(1)
-  call yradiation%rad_config%create_device()
-  call single_level%create_device()
-  call thermodynamics%create_device()
-  call gas%create_device()
-  call aerosol%create_device()
-  call cloud%create_device()
-  call flux%create_device()
-
-  call single_level%update_device()
-  call thermodynamics%update_device()
-  call gas%update_device()
-  call aerosol%update_device()
-  call cloud%update_device()
-  call flux%update_device()
+#endif
+#if defined(OMPGPU)
+  !$OMP TARGET DATA MAP(TO:yradiation, yradiation%rad_config, single_level, thermodynamics, &
+  !$OMP&                gas, aerosol, cloud, ccn_land, ccn_sea, longitude_rad, sin_latitude, &
+  !$OMP&                land_frac, pressure_fl, temperature_fl, cloud_fraction, cloud_q_liq, &
+  !$OMP&                cloud_q_ice, zeros, tegen_aerosol)
+  !$OMP TARGET DATA MAP(ALLOC: flux)
+  !$OMP TARGET DATA MAP(FROM: flux_sw_direct_normal, flux_uv, flux_par, flux_par_clear, emissivity_out, &
+  !$OMP&                flux_diffuse_band, flux_direct_band)
 #endif
 
+  call yradiation%rad_config%create_device(yradiation%rad_config)
+  call single_level%create_device(single_level)
+  call thermodynamics%create_device(thermodynamics)
+  call gas%create_device(gas)
+  call aerosol%create_device(aerosol)
+  call cloud%create_device(cloud)
+  call flux%create_device(flux)
+
+  call single_level%update_device(single_level)
+  call thermodynamics%update_device(thermodynamics)
+  call gas%update_device(gas)
+  call aerosol%update_device(aerosol)
+  call cloud%update_device(cloud)
+  call flux%update_device(flux)
+
 #ifdef HAVE_NVTX
-     call nvtxEndRange
+  call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+  call roctxRangePop()
+  call roctxMarkA("ecrad_offload"//c_null_char)
 #endif
 
   ! --------------------------------------------------------
@@ -424,13 +449,16 @@ program ecrad_ifs_driver
   do jrepeat = 1,driver_config%nrepeat
 
 #ifndef NO_OPENMP
-    if (jrepeat == driver_config%nwarmup + 1) then
-      tstart = omp_get_wtime()
-    end if
+      if (jrepeat == driver_config%nwarmup + 1) then
+        tstart = omp_get_wtime()
+      end if
 #endif
 
 #ifdef HAVE_NVTX
-    call nvtxStartRange("ecrad_it")
+      call nvtxStartRange("ecrad_it")
+#endif
+#ifdef HAVE_ROCTX
+      roctx_ret = roctxRangePushA("ecrad_it"//c_null_char)
 #endif
 
       ! Compute number of blocks to process
@@ -457,7 +485,7 @@ program ecrad_ifs_driver
         ! Call the ECRAD radiation scheme; note that we are simply
         ! passing arrays in rather than ecRad structures, which are
         ! used here just for convenience
-        call radiation_scheme(yradiation, istartcol, iendcol, ncol, nlev, size(aerosol%mixing_ratio,3), &
+        call radiation_scheme(yradiation, 1, istartcol, iendcol, ncol, nlev, size(aerosol%mixing_ratio,3), &
              &  single_level%solar_irradiance, single_level%cos_sza, single_level%skin_temperature, &
              &  single_level%sw_albedo, single_level%sw_albedo_direct, single_level%lw_emissivity, &
              &  ccn_land, ccn_sea, longitude_rad, sin_latitude, land_frac, pressure_fl, temperature_fl, &
@@ -483,11 +511,17 @@ program ecrad_ifs_driver
              & )
       end do
       !$OMP END PARALLEL DO
+#ifdef HAVE_NVTX
+      call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+      call roctxRangePop()
+      call roctxMarkA("ecrad_it"//c_null_char)
+#endif
 
   end do
-
-#ifdef HAVE_NVTX
-  call nvtxEndRange
+#ifdef DEBUG
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Done Radiative Transfer Calculations"
 #endif
 
 #ifndef NO_OPENMP
@@ -503,25 +537,37 @@ program ecrad_ifs_driver
 #ifdef HAVE_NVTX
      call nvtxStartRange("ecrad_pullback")
 #endif
-
-#ifdef _OPENACC
-  call cloud%update_host()
-  call flux%update_host()
-
-  call yradiation%rad_config%delete_device()
-  call single_level%delete_device()
-  call thermodynamics%delete_device()
-  call gas%delete_device()
-  call aerosol%delete_device()
-  call cloud%delete_device()
-  call flux%delete_device()
+#ifdef HAVE_ROCTX
+     roctx_ret = roctxRangePushA("ecrad_pullback"//c_null_char)
 #endif
 
+  call cloud%update_host(cloud)
+  call flux%update_host(flux)
+
+  call yradiation%rad_config%delete_device(yradiation%rad_config)
+  call single_level%delete_device(single_level)
+  call thermodynamics%delete_device(thermodynamics)
+  call gas%delete_device(gas)
+  call aerosol%delete_device(aerosol)
+  call cloud%delete_device(cloud)
+  call flux%delete_device(flux)
+
+#if defined(_OPENACC)
   !$ACC WAIT(1)
   !$ACC END DATA
+#endif
+#if defined(OMPGPU)
+  !$OMP END TARGET DATA
+  !$OMP END TARGET DATA
+  !$OMP END TARGET DATA
+#endif
 
 #ifdef HAVE_NVTX
-     call nvtxEndRange
+  call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+  call roctxRangePop()
+  call roctxMarkA("ecrad_pullback"//c_null_char)
 #endif
 
 #ifndef NO_OPENMP

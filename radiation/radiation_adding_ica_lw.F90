@@ -21,6 +21,10 @@ module radiation_adding_ica_lw
 
   public
 
+  !$omp declare target(fast_adding_ica_lw)
+  !$omp declare target(fast_adding_ica_lw_OMP)  
+  !$omp declare target(calc_fluxes_no_scattering_lw)
+  !$omp declare target(calc_fluxes_no_scattering_lw_OMP)
 contains
 
   !---------------------------------------------------------------------
@@ -130,7 +134,6 @@ contains
 
   end subroutine adding_ica_lw
 
-
   !---------------------------------------------------------------------
   ! Use the scalar "adding" method to compute longwave flux profiles,
   ! including scattering in cloudy layers only.
@@ -188,7 +191,8 @@ contains
 
     !$ACC ROUTINE WORKER 
 
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_adding_ica_lw:fast_adding_ica_lw',0,hook_handle)
 #endif
 
@@ -275,12 +279,144 @@ contains
       end if
     end do
 
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_adding_ica_lw:fast_adding_ica_lw',1,hook_handle)
 #endif
 
   end subroutine fast_adding_ica_lw
 
+  !---------------------------------------------------------------------
+  ! Use the scalar "adding" method to compute longwave flux profiles,
+  ! including scattering in cloudy layers only.
+  subroutine fast_adding_ica_lw_OMP(jg, ng, nlev, &
+       &  reflectance, transmittance, source_up, source_dn, emission_surf, albedo_surf, &
+       &  is_clear_sky_layer, i_cloud_top, flux_dn_clear, &
+       &  flux_up, flux_dn, albedo, source, inv_denominator)
+
+    use parkind1, only           : jprb
+    use yomhook,  only           : lhook, dr_hook, jphook
+
+    implicit none
+
+    ! Inputs
+    integer, intent(in) :: jg ! spectral index
+    integer, intent(in) :: ng ! number of spectral bands
+    integer, intent(in) :: nlev ! number of levels
+
+    ! Surface emission (W m-2) and albedo
+    real(jprb), intent(in),  dimension(ng) :: emission_surf, albedo_surf
+
+    ! Diffuse reflectance and transmittance of each layer
+    real(jprb), intent(in),  dimension(ng, nlev)   :: reflectance, transmittance
+
+    ! Emission from each layer in an upward and downward direction
+    real(jprb), intent(in),  dimension(ng, nlev)   :: source_up, source_dn
+
+    ! Determine which layers are cloud-free
+    logical, intent(in) :: is_clear_sky_layer(nlev)
+
+    ! Index to highest cloudy layer
+    integer, intent(in) :: i_cloud_top
+
+    ! Pre-computed clear-sky downwelling fluxes (W m-2) at half-levels
+    real(jprb), intent(in), dimension(ng, nlev+1)  :: flux_dn_clear
+
+    ! Resulting fluxes (W m-2) at half-levels: diffuse upwelling and
+    ! downwelling
+    real(jprb), intent(out), dimension(ng, nlev+1) :: flux_up, flux_dn
+    
+    ! Albedo of the entire earth/atmosphere system below each half
+    ! level
+    real(jprb), intent(out), dimension(ng, nlev+1) :: albedo
+
+    ! Upwelling radiation at each half-level due to emission below
+    ! that half-level (W m-2)
+    real(jprb), intent(out), dimension(ng, nlev+1) :: source
+
+    ! Equal to 1/(1-albedo*reflectance)
+    real(jprb), intent(out), dimension(ng, nlev)   :: inv_denominator
+
+    ! Loop index for model level and column
+    integer :: jlev
+
+    real(jphook) :: hook_handle
+
+    !$ACC ROUTINE WORKER 
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_adding_ica_lw:fast_adding_ica_lw',0,hook_handle)
+#endif
+
+    ! Copy over downwelling fluxes above cloud from clear sky
+    flux_dn(:,1:i_cloud_top) = flux_dn_clear(:,1:i_cloud_top)
+
+    albedo(:,nlev+1) = albedo_surf
+    
+    ! At the surface, the source is thermal emission
+    source(:,nlev+1) = emission_surf
+
+    ! Work back up through the atmosphere and compute the albedo of
+    ! the entire earth/atmosphere system below that half-level, and
+    ! also the "source", which is the upwelling flux due to emission
+    ! below that level
+    do jlev = nlev,i_cloud_top,-1
+      if (is_clear_sky_layer(jlev)) then
+         ! Reflectance of this layer is zero, simplifying the expression
+         albedo(jg,jlev) = transmittance(jg,jlev)*transmittance(jg,jlev)*albedo(jg,jlev+1)
+         source(jg,jlev) = source_up(jg,jlev) &
+              &  + transmittance(jg,jlev) * (source(jg,jlev+1) &
+              &                    + albedo(jg,jlev+1)*source_dn(jg,jlev))
+      else
+         ! Loop over columns; explicit loop seems to be faster
+         ! Lacis and Hansen (1974) Eq 33, Shonk & Hogan (2008) Eq 10:
+         inv_denominator(jg,jlev) = 1.0_jprb &
+              &  / (1.0_jprb-albedo(jg,jlev+1)*reflectance(jg,jlev))
+         ! Shonk & Hogan (2008) Eq 9, Petty (2006) Eq 13.81:
+         albedo(jg,jlev) = reflectance(jg,jlev) + transmittance(jg,jlev)*transmittance(jg,jlev) &
+              &  * albedo(jg,jlev+1) * inv_denominator(jg,jlev)
+         ! Shonk & Hogan (2008) Eq 11:
+         source(jg,jlev) = source_up(jg,jlev) &
+              &  + transmittance(jg,jlev) * (source(jg,jlev+1) &
+              &                    + albedo(jg,jlev+1)*source_dn(jg,jlev)) &
+              &                   * inv_denominator(jg,jlev)
+      end if
+    end do
+
+    ! Compute the fluxes above the highest cloud
+    flux_up(jg,i_cloud_top) = source(jg,i_cloud_top) &
+         &                 + albedo(jg,i_cloud_top)*flux_dn(jg,i_cloud_top)
+    do jlev = i_cloud_top-1,1,-1
+       flux_up(jg,jlev) = transmittance(jg,jlev)*flux_up(jg,jlev+1) + source_up(jg,jlev)
+    end do
+
+    ! Work back down through the atmosphere from cloud top computing
+    ! the fluxes at each half-level
+    do jlev = i_cloud_top,nlev
+      if (is_clear_sky_layer(jlev)) then
+         flux_dn(jg,jlev+1) = transmittance(jg,jlev)*flux_dn(jg,jlev) &
+              &               + source_dn(jg,jlev)
+         flux_up(jg,jlev+1) = albedo(jg,jlev+1)*flux_dn(jg,jlev+1) &
+              &               + source(jg,jlev+1)
+      else
+         ! Shonk & Hogan (2008) Eq 14 (after simplification):
+         flux_dn(jg,jlev+1) &
+              &  = (transmittance(jg,jlev)*flux_dn(jg,jlev) &
+              &     + reflectance(jg,jlev)*source(jg,jlev+1) &
+              &     + source_dn(jg,jlev)) * inv_denominator(jg,jlev)
+         ! Shonk & Hogan (2008) Eq 12:
+         flux_up(jg,jlev+1) = albedo(jg,jlev+1)*flux_dn(jg,jlev+1) &
+              &               + source(jg,jlev+1)
+      end if
+   end do
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_adding_ica_lw:fast_adding_ica_lw',1,hook_handle)
+#endif
+
+  end subroutine fast_adding_ica_lw_OMP
 
   !---------------------------------------------------------------------
   ! If there is no scattering then fluxes may be computed simply by
@@ -292,7 +428,8 @@ contains
        &  transmittance, source_up, source_dn, emission_surf, albedo_surf, flux_up, flux_dn)
 
     use parkind1, only           : jprb
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     use yomhook,  only           : lhook, dr_hook, jphook
 #endif
 
@@ -318,13 +455,15 @@ contains
     ! Loop index for model level
     integer :: jlev, jcol
 
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     real(jphook) :: hook_handle
 #endif
 
     !$ACC ROUTINE WORKER
 
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_adding_ica_lw:calc_fluxes_no_scattering_lw',0,hook_handle)
 #endif
 
@@ -364,10 +503,88 @@ contains
       end do
     end do
     
-#ifndef _OPENACC
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_adding_ica_lw:calc_fluxes_no_scattering_lw',1,hook_handle)
 #endif
 
   end subroutine calc_fluxes_no_scattering_lw
+
+
+  !---------------------------------------------------------------------
+  ! If there is no scattering then fluxes may be computed simply by
+  ! passing down through the atmosphere computing the downwelling
+  ! fluxes from the transmission and emission of each layer, and then
+  ! passing back up through the atmosphere to compute the upwelling
+  ! fluxes in the same way.
+  subroutine calc_fluxes_no_scattering_lw_OMP(jg, ng, nlev, &
+       &  transmittance, source_up, source_dn, emission_surf, albedo_surf, flux_up, flux_dn)
+
+    use parkind1, only           : jprb
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
+    use yomhook,  only           : lhook, dr_hook, jphook
+#endif
+
+    implicit none
+
+    ! Inputs
+    integer, intent(in) :: jg, ng
+    integer, intent(in) :: nlev ! number of levels
+
+    ! Surface emission (W m-2) and albedo
+    real(jprb), intent(in),  dimension(ng) :: emission_surf, albedo_surf
+
+    ! Diffuse reflectance and transmittance of each layer
+    real(jprb), intent(in),  dimension(ng, nlev)   :: transmittance
+
+    ! Emission from each layer in an upward and downward direction
+    real(jprb), intent(in),  dimension(ng, nlev)   :: source_up, source_dn
+
+    ! Resulting fluxes (W m-2) at half-levels: diffuse upwelling and
+    ! downwelling
+    real(jprb), intent(out), dimension(ng, nlev+1) :: flux_up, flux_dn
+    
+    ! Loop index for model level
+    integer :: jlev, jcol
+
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
+    real(jphook) :: hook_handle
+#endif
+
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_adding_ica_lw:calc_fluxes_no_scattering_lw_OMP',0,hook_handle)
+#endif
+
+    ! At top-of-atmosphere there is no diffuse downwelling radiation
+    flux_dn(jg,1) = 0.0_jprb
+    
+    ! Work down through the atmosphere computing the downward fluxes
+    ! at each half-level
+! Added for DWD (2020)
+!NEC$ outerloop_unroll(8)
+    do jlev = 1,nlev
+       flux_dn(jg,jlev+1) = transmittance(jg,jlev)*flux_dn(jg,jlev) + source_dn(jg,jlev)
+    end do
+    
+    ! Surface reflection and emission
+    flux_up(jg,nlev+1) = emission_surf(jg) + albedo_surf(jg) * flux_dn(jg,nlev+1)
+    
+    ! Work back up through the atmosphere computing the upward fluxes
+    ! at each half-level
+! Added for DWD (2020)
+!NEC$ outerloop_unroll(8)
+    do jlev = nlev,1,-1
+       flux_up(jg,jlev) = transmittance(jg,jlev)*flux_up(jg,jlev+1) + source_up(jg,jlev)
+    end do
+
+#if defined (_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_adding_ica_lw:calc_fluxes_no_scattering_lw_OMP',1,hook_handle)
+#endif
+
+  end subroutine calc_fluxes_no_scattering_lw_OMP
 
 end module radiation_adding_ica_lw

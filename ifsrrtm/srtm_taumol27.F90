@@ -24,6 +24,7 @@ USE PARSRTM  , ONLY : JPG
 USE YOESRTM  , ONLY : NG27
 USE YOESRTA27, ONLY : ABSA, ABSB, SFLUXREFC, RAYLC, LAYREFFR, SCALEKUR  
 USE YOESRTWN , ONLY : NSPA, NSPB
+use radiation_io, only : nulout
 
 IMPLICIT NONE
 
@@ -56,17 +57,22 @@ REAL(KIND=JPRB) ::  &
  & Z_TAURAY  
 REAL(KIND=JPRB) :: ZHOOK_HANDLE
 
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Begin"
+#endif
     !$ACC DATA CREATE(i_laysolfr) &
     !$ACC   PRESENT(P_FAC00, P_FAC01, P_FAC10, P_FAC11, K_JP, K_JT, K_JT1, &
     !$ACC           P_COLMOL, P_COLO3, K_LAYTROP, P_SFLUXZEN, P_TAUG, P_TAUR, &
     !$ACC           PRMU0)
-
-#ifndef _OPENACC
-    laytrop_min = MINVAL(k_laytrop(KIDIA:KFDIA))
-    laytrop_max = MAXVAL(k_laytrop(KIDIA:KFDIA))
-#else
+    !$OMP TARGET ENTER DATA MAP(ALLOC: i_laysolfr)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: P_FAC00, P_FAC01, P_FAC10, P_FAC11, K_JP, K_JT, K_JT1, &
+    !$OMP           P_COLMOL, P_COLO3, K_LAYTROP, P_SFLUXZEN, P_TAUG, P_TAUR, &
+    !$OMP           PRMU0)
+    
+#if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
     do iplon = KIDIA,KFDIA
@@ -74,16 +80,23 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
       laytrop_max = MAX(laytrop_max, k_laytrop(iplon))
     end do
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+    laytrop_min = MINVAL(k_laytrop(KIDIA:KFDIA))
+    laytrop_max = MAXVAL(k_laytrop(KIDIA:KFDIA))
 #endif
 
     i_nlayers = klev
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG(STATIC:1) VECTOR
     DO iplon = KIDIA,KFDIA
       i_laysolfr(iplon) = i_nlayers
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
     !$ACC WAIT
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1)
@@ -105,7 +118,9 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
        ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1)
     DO i_lay = laytrop_min+1, laytrop_max
@@ -146,7 +161,9 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
        ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1)
     DO i_lay = laytrop_max+1, i_nlayers
@@ -171,8 +188,16 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
        ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !$ACC WAIT
     !$ACC END DATA
+
+    !$OMP TARGET EXIT DATA MAP(DELETE: i_laysolfr)
+    !$OMP END TARGET DATA
+
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Done"
+#endif
 
 END SUBROUTINE SRTM_TAUMOL27

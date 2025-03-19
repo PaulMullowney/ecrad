@@ -79,8 +79,23 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
     !$ACC             jt1, colh2o, colo3, coln2o, colco2, coldry, laytrop, &
     !$ACC             selffac, selffrac, indself, fracs, indfor, forfrac, forfac, &
     !$ACC             minorfrac, indminor)
-
-#ifndef _OPENACC
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC:taug, wx, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, &
+    !$OMP             jt1, colh2o, colo3, coln2o, colco2, coldry, laytrop, &
+    !$OMP             selffac, selffrac, indself, fracs, indfor, forfrac, forfac, &
+    !$OMP             minorfrac, indminor)
+#if defined(_OPENACC) || defined(OMPGPU)
+    laytrop_min = HUGE(laytrop_min) 
+    laytrop_max = -HUGE(laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    do jc = KIDIA,KFDIA
+      laytrop_min = MIN(laytrop_min, laytrop(jc))
+      laytrop_max = MAX(laytrop_max, laytrop(jc))
+    end do
+    !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     laytrop_min = MINVAL(laytrop)
     laytrop_max = MAXVAL(laytrop)
 
@@ -103,16 +118,6 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
       enddo
       ixc(lay) = icl
     enddo
-#else
-    laytrop_min = HUGE(laytrop_min) 
-    laytrop_max = -HUGE(laytrop_max)
-    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
-    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
-    do jc = KIDIA,KFDIA
-      laytrop_min = MIN(laytrop_min, laytrop(jc))
-      laytrop_max = MAX(laytrop_max, laytrop(jc))
-    end do
-    !$ACC END PARALLEL
 #endif
 
 ! Minor gas mapping level:
@@ -129,6 +134,8 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
 ! separately.
 
       ! Lower atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, indm, chi_co2, ratco2, &
+      !$OMP adjfac, adjcolco2, taufor, tauself, abso3, absco2, absn2o)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, indm, chi_co2, ratco2, adjfac, adjcolco2)
@@ -182,8 +189,10 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ! Upper atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, indm, chi_co2, ratco2, adjfac, adjcolco2, absco2, absn2o)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, indm, chi_co2, ratco2, adjfac, adjcolco2)
       do lay = laytrop_max+1, KLEV
@@ -226,14 +235,17 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       IF (laytrop_max /= laytrop_min) THEN
         ! Mixed loop
         ! Lower atmosphere part
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(chi_co2, ratco2, adjfac, adjcolco2, ind0, ind1, &
+        !$OMP  inds, indf, indm, tauself, taufor, absco2, abso3, absn2o)
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(chi_co2, ratco2, adjfac, adjcolco2, ind0, ind1, inds, indf, indm)
         do lay = laytrop_min+1, laytrop_max
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
           do jl = KIDIA, KFDIA
             if ( lay <= laytrop(jl) ) then
 #else
@@ -286,7 +298,7 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
                   + wx(jl,4,lay) * cfc22adj(ig)
               fracs(jl,ngs7+ig,lay) = fracrefa(ig)
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
          else
 #else
           enddo
@@ -331,16 +343,18 @@ REAL(KIND=JPRB) :: taufor,tauself, abso3, absco2, absn2o
                   + wx(jl,4,lay) * cfc22adj(ig)
               fracs(jl,ngs7+ig,lay) = fracrefb(ig)
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
            endif
 #endif
           enddo
 
         enddo
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL8

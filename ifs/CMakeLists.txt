@@ -11,6 +11,7 @@ set( ifs_SOURCES
         ice_effective_radius.F90
         liquid_effective_radius.F90
         radiation_scheme.F90
+        radiation_scheme_new.F90
         radiation_setup.F90
         yoerdu.F90
         yomrip.F90
@@ -28,6 +29,9 @@ ecbuild_add_library(
     PRIVATE_LIBS
         ecrad.${PREC}
         ecrad_base.${PREC}
+	ecrad_utilities.${PREC}
     PUBLIC_LIBS
         $<${HAVE_NVTX}:${NVTX_TARGET}>
+        $<${HAVE_ROCTX}:${ECRAD_GPU_ROCPROFILER_SDK_LIBRARIES}>
+    PRIVATE_DEFINITIONS ${GPU_OFFLOAD}GPU
 )

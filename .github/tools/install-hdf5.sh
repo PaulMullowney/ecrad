@@ -3,6 +3,7 @@
 version=1.14.4-3
 
 TEMPORARY_FILES="${TMPDIR:-/tmp}"
+TEMPORARY_FILES=${PWD}/tmp
 export HDF5_INSTALL_DIR=$(pwd)/hdf5-install
 while [ $# != 0 ]; do
     case "$1" in
@@ -38,6 +39,7 @@ MINOR_VERSION_PARTS=($(echo ${VERSION_PARTS[2]} | tr "-" "\n"))
 MINOR_VERSION=${MINOR_VERSION_PARTS[0]}
 
 URL=${HDF5_MIRROR}/hdf5-${MAJOR_VERSION}/hdf5-${MAJOR_VERSION}.${MINOR_VERSION}/src/hdf5-${HDF5_VERSION}.tar.gz
+#URL=https://github.com/HDFGroup/hdf5/releases/download/hdf5_${MAJOR_VERSION}.${MINOR_VERSION}/hdf5-${HDF5_VERSION}.tar.gz
 FOLDER=hdf5-${HDF5_VERSION}
 
 if [ ! -d "${TEMPORARY_FILES}/${FOLDER}" ]; then
@@ -51,6 +53,6 @@ fi
 
 mkdir -p ${TEMPORARY_FILES}/build-${FOLDER} && cd ${TEMPORARY_FILES}/build-${FOLDER}
 rm -rf ./*
-cmake -G Ninja ${TEMPORARY_FILES}/${FOLDER} -DHDF5_BUILD_FORTRAN=ON -DHDF5_BUILD_HL_LIB=ON -DBUILD_TESTING=OFF
+cmake ${TEMPORARY_FILES}/${FOLDER} -DHDF5_BUILD_FORTRAN=ON -DHDF5_BUILD_HL_LIB=ON -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_Fortran_COMPILER=$FC -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_VERBOSE_MAKEFILE=OFF
 cmake --build . --config Release
 cmake --install . --prefix "${HDF5_INSTALL_DIR}"

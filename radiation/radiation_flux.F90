@@ -24,7 +24,8 @@
 
 module radiation_flux
 
-  use parkind1, only : jprb
+  use parkind1,     only : jprb
+  use radiation_io, only : nulout, nulerr
 
   implicit none
   public
@@ -111,24 +112,26 @@ module radiation_flux
    contains
     procedure :: allocate   => allocate_flux_type
     procedure :: deallocate => deallocate_flux_type
-    procedure :: calc_surface_spectral
+    procedure, nopass :: calc_surface_spectral
     procedure :: calc_toa_spectral
     procedure :: out_of_physical_bounds
     procedure :: heating_rate_out_of_physical_bounds
-#ifdef _OPENACC
-    procedure :: create_device
-    procedure :: update_host
-    procedure :: update_device
-    procedure :: delete_device
+#if defined(_OPENACC)  || defined(OMPGPU)
+    procedure, nopass :: create_device => create_device_flux
+    procedure, nopass :: update_host   => update_host_flux
+    procedure, nopass :: update_device => update_device_flux
+    procedure, nopass :: delete_device => delete_device_flux
 #endif
   end type flux_type
 
 ! Added for DWD (2020)
 #ifdef DWD_VECTOR_OPTIMIZATIONS
-      logical, parameter :: use_indexed_sum_vec = .true.
+  logical, parameter :: use_indexed_sum_vec = .true.
 #else
-      logical, parameter :: use_indexed_sum_vec = .false.
+  logical, parameter :: use_indexed_sum_vec = .false.
 #endif
+
+  !$omp declare target(indexed_sum)
 
 contains
 
@@ -412,12 +415,21 @@ contains
   subroutine calc_surface_spectral(this, config, istartcol, iendcol)
 
     use yomhook,          only : lhook, dr_hook, jphook
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
     use radiation_io,     only : nulerr, radiation_abort
 #endif
     use radiation_config, only : config_type
 
-    class(flux_type),  intent(inout) :: this
+#ifdef HAVE_NVTX
+    use nvtx
+#endif
+#ifdef HAVE_ROCTX
+    use roctx_profiling, only: roctxmarka, roctxrangepusha, roctxrangepop
+    use iso_c_binding, only: c_null_char
+    integer(4) :: roctx_ret
+#endif
+
+    type(flux_type),  intent(inout) :: this
     type(config_type), intent(in)    :: config
     integer,           intent(in)    :: istartcol, iendcol
 
@@ -428,10 +440,21 @@ contains
     real(jprb) :: lw_dn_surf_band(config%n_bands_lw,istartcol:iendcol)
 
     real(jphook) :: hook_handle
+#if defined(OMPGPU)
+    integer :: istart, iend, ig
+    real(jprb) :: s1, s2
+#endif
+    
+#ifdef HAVE_NVTX
+      call nvtxStartRange("radiation_flux::calc_surface_spectral")
+#endif
+#ifdef HAVE_ROCTX
+      roctx_ret = roctxRangePushA("radiation_flux::calc_surface_spectral"//c_null_char)
+#endif
 
     if (lhook) call dr_hook('radiation_flux:calc_surface_spectral',0,hook_handle)
 
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
     if (use_indexed_sum_vec) then
       write(nulerr,'(a)') '*** Error: radiation_flux:calc_surface_spectral use_indexed_sum_vec==.true. not ported to GPU'
       call radiation_abort()
@@ -452,7 +475,20 @@ contains
                &  = this%sw_dn_surf_band(:,jcol) &
                &  + this%sw_dn_direct_surf_band(:,jcol)
         end do
-      else
+     else
+
+#if defined(OMPGPU)
+        istart = lbound(this%sw_dn_surf_band,1)
+        iend = ubound(this%sw_dn_surf_band,1)
+#endif
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%sw_dn_direct_surf_g,  config%i_band_from_reordered_g_sw, &
+        !!$OMP   this%sw_dn_direct_surf_band, this%sw_dn_diffuse_surf_g, this%sw_dn_surf_band)
+
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        !$OMP TARGET TEAMS DISTRIBUTE
+#endif
         !$ACC PARALLEL DEFAULT(PRESENT) NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
         !$ACC   VECTOR_LENGTH(32*((config%n_g_sw-1)/32+1)) ASYNC(1)
         !$ACC LOOP GANG
@@ -463,11 +499,31 @@ contains
           call indexed_sum(this%sw_dn_diffuse_surf_g(:,jcol), &
                &           config%i_band_from_reordered_g_sw, &
                &           this%sw_dn_surf_band(:,jcol))
+#if defined(OMPGPU)
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP PARALLEL DO
+#endif
+          do ig = istart, iend
+             this%sw_dn_surf_band(ig,jcol) &
+                  &  = this%sw_dn_surf_band(ig,jcol) &
+                  &  + this%sw_dn_direct_surf_band(ig,jcol)
+          end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP END PARALLEL DO
+#endif
+#else
           this%sw_dn_surf_band(:,jcol) &
                &  = this%sw_dn_surf_band(:,jcol) &
                &  + this%sw_dn_direct_surf_band(:,jcol)
+#endif
         end do
         !$ACC END PARALLEL
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+        !!$OMP END TARGET DATA
       end if
 
       if (config%do_clear) then
@@ -483,7 +539,19 @@ contains
                  &  = this%sw_dn_surf_clear_band(:,jcol) &
                  &  + this%sw_dn_direct_surf_clear_band(:,jcol)
           end do
-        else
+       else
+#if defined(OMPGPU)
+          istart = lbound(this%sw_dn_surf_clear_band,1)
+          iend = ubound(this%sw_dn_surf_clear_band,1)
+#endif
+          !!$OMP TARGET DATA MAP(PRESENT, ALLOC: &
+          !!$OMP   this%sw_dn_direct_surf_clear_g, config%i_band_from_reordered_g_sw, this%sw_dn_direct_surf_clear_band,  &
+          !!$OMP   this%sw_dn_diffuse_surf_clear_g, this%sw_dn_surf_clear_band)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP TARGET TEAMS DISTRIBUTE          
+#endif
           !$ACC PARALLEL DEFAULT(PRESENT) NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
           !$ACC   VECTOR_LENGTH(32*(config%n_g_sw-1)/32+1) ASYNC(1)
           !$ACC LOOP GANG
@@ -494,12 +562,32 @@ contains
             call indexed_sum(this%sw_dn_diffuse_surf_clear_g(:,jcol), &
                  &           config%i_band_from_reordered_g_sw, &
                  &           this%sw_dn_surf_clear_band(:,jcol))
+#if defined(OMPGPU)
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP PARALLEL DO
+#endif
+            do ig = istart, iend
+               this%sw_dn_surf_clear_band(ig,jcol) &
+                    &  = this%sw_dn_surf_clear_band(ig,jcol) &
+                    &  + this%sw_dn_direct_surf_clear_band(ig,jcol)
+            end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP END PARALLEL DO
+#endif
+#else
             this%sw_dn_surf_clear_band(:,jcol) &
                  &  = this%sw_dn_surf_clear_band(:,jcol) &
                  &  + this%sw_dn_direct_surf_clear_band(:,jcol)
+#endif
           end do
           !$ACC END PARALLEL
-        end if
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+          !!$OMP END TARGET DATA
+       end if
       end if
 
     end if ! do_surface_sw_spectral_flux
@@ -507,6 +595,9 @@ contains
     ! Fluxes in bands required for canopy radiative transfer
     if (config%do_sw .and. config%do_canopy_fluxes_sw) then
       if (config%use_canopy_full_spectrum_sw) then
+        !$OMP TARGET DATA MAP(PRESENT, ALLOC: this%sw_dn_diffuse_surf_canopy, this%sw_dn_diffuse_surf_g, &
+        !$OMP   this%sw_dn_direct_surf_canopy, this%sw_dn_direct_surf_g)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
@@ -516,6 +607,8 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        !$OMP END TARGET DATA
       else if (config%do_nearest_spectral_sw_albedo) then
         if (use_indexed_sum_vec) then
           call indexed_sum_vec(this%sw_dn_direct_surf_g, &
@@ -525,6 +618,14 @@ contains
                &               config%i_albedo_from_band_sw(config%i_band_from_reordered_g_sw), &
                &               this%sw_dn_diffuse_surf_canopy, istartcol, iendcol)
         else
+          !$OMP TARGET DATA MAP(PRESENT, ALLOC: &
+          !$OMP   this%sw_dn_direct_surf_g, config%i_albedo_from_band_sw, config%i_band_from_reordered_g_sw, &
+          !$OMP   this%sw_dn_direct_surf_canopy, this%sw_dn_diffuse_surf_g, this%sw_dn_diffuse_surf_canopy)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP TARGET TEAMS DISTRIBUTE
+#endif
           !$ACC PARALLEL DEFAULT(PRESENT) NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
           !$ACC   VECTOR_LENGTH(32*(config%n_g_sw-1)/32+1) ASYNC(1)
           !$ACC LOOP GANG
@@ -537,12 +638,20 @@ contains
                  &           this%sw_dn_diffuse_surf_canopy(:,jcol))
           end do
           !$ACC END PARALLEL
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+          !$OMP END TARGET DATA
         end if
       else
         ! More accurate calculations using weights, but requires
         ! this%sw_dn_[direct_]surf_band to be defined, i.e.
         ! config%do_surface_sw_spectral_flux == .true.
         nalbedoband = size(config%sw_albedo_weights,1)
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%sw_dn_diffuse_surf_canopy,  this%sw_dn_direct_surf_canopy)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1) &
         !$ACC     PRESENT(this%sw_dn_diffuse_surf_canopy, this%sw_dn_direct_surf_canopy, &
         !$ACC             config%sw_albedo_weights)
@@ -553,9 +662,41 @@ contains
             this%sw_dn_direct_surf_canopy (jalbedoband,jcol) = 0.0_jprb
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        !!$OMP END TARGET DATA
+
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: &
+        !!$OMP   config%sw_albedo_weights, this%sw_dn_diffuse_surf_canopy, this%sw_dn_diffuse_surf_canopy, this%sw_dn_surf_band, &
+        !!$OMP   this%sw_dn_direct_surf_canopy, this%sw_dn_direct_surf_canopy, this%sw_dn_direct_surf_band)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+#else
+        !$OMP TARGET TEAMS DISTRIBUTE COLLAPSE(2)
+#endif
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol, iendcol
           do jalbedoband = 1,nalbedoband
+#if defined(OMPGPU)
+            s1 = 0 
+            s2 = 0
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP PARALLEL DO REDUCTION(+ : s1, s2)
+#endif
+            do jband = 1,config%n_bands_sw
+              if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
+                ! Initially, "diffuse" is actually "total"
+                s1 = s1 + config%sw_albedo_weights(jalbedoband,jband) &
+                    &    * this%sw_dn_surf_band(jband,jcol)
+                s2 = s2 + config%sw_albedo_weights(jalbedoband,jband) &
+                   &    * this%sw_dn_direct_surf_band(jband,jcol)
+              end if
+            end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP END PARALLEL DO
+#endif
+            this%sw_dn_diffuse_surf_canopy(jalbedoband,jcol) = this%sw_dn_diffuse_surf_canopy(jalbedoband,jcol) + s1
+            this%sw_dn_direct_surf_canopy(jalbedoband,jcol) = this%sw_dn_direct_surf_canopy(jalbedoband,jcol) + s2
+#else
             !$ACC LOOP SEQ
             do jband = 1,config%n_bands_sw
               if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
@@ -570,8 +711,18 @@ contains
                     &    * this%sw_dn_direct_surf_band(jband,jcol)
               end if
             end do
+#endif 
           end do
         end do
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+        !!$OMP END TARGET DATA
+
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%sw_dn_diffuse_surf_canopy, this%sw_dn_direct_surf_canopy)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
           do jalbedoband = 1,nalbedoband
@@ -582,12 +733,16 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        !!$OMP END TARGET DATA
       end if
 
     end if ! do_canopy_fluxes_sw
 
     if (config%do_lw .and. config%do_canopy_fluxes_lw) then
       if (config%use_canopy_full_spectrum_lw) then
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%lw_dn_surf_canopy, this%lw_dn_surf_g)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
@@ -596,6 +751,8 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        !!$OMP END TARGET DATA
       else if (config%do_nearest_spectral_lw_emiss) then
         if (use_indexed_sum_vec) then
           call indexed_sum_vec(this%lw_dn_surf_g, &
@@ -603,23 +760,48 @@ contains
                &               this%lw_dn_surf_canopy, istartcol, iendcol)
         else
 #ifdef _OPENACC
+          !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%lw_dn_surf_canopy, config%i_emiss_from_band_lw, config%i_band_from_reordered_g_lw, &
+          !!$OMP   this%lw_dn_surf_g)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP TARGET TEAMS DISTRIBUTE
+#endif
           !$ACC PARALLEL DEFAULT(PRESENT) &
-          !$ACC    NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
-          !$ACC    VECTOR_LENGTH(32*(config%n_g_lw-1)/32+1) ASYNC(1)
-                    !$ACC LOOP GANG
+          !$ACC   NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
+          !$ACC   VECTOR_LENGTH(32*(config%n_g_lw-1)/32+1) ASYNC(1)
+          !$ACC LOOP GANG
           do jcol = istartcol,iendcol
             ! Inlined indexed_sum because of an on-device segfault due to the nested
             ! array index-subscript passed as `ind` to indexed_sum
             this%lw_dn_surf_canopy(:,jcol) = 0.0
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP PARALLEL DO PRIVATE(jband)
+#endif
             !$ACC LOOP VECTOR
             do jg = 1,config%n_g_lw
               jband = config%i_emiss_from_band_lw(config%i_band_from_reordered_g_lw(jg))
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+              !$OMP ATOMIC UPDATE
+#endif
               !$ACC ATOMIC UPDATE
               this%lw_dn_surf_canopy(jband,jcol) = this%lw_dn_surf_canopy(jband,jcol) + this%lw_dn_surf_g(jg,jcol)
               !$ACC END ATOMIC
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+              !$OMP END ATOMIC
+#endif
             end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP END PARALLEL DO
+#endif
           end do
           !$ACC END PARALLEL
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+          !!$OMP END TARGET DATA
 #else
           do jcol = istartcol,iendcol
             call indexed_sum(this%lw_dn_surf_g(:,jcol), &
@@ -629,6 +811,7 @@ contains
 #endif
         end if
       else
+        !$OMP TARGET ENTER DATA MAP(ALLOC: lw_dn_surf_band)
         !$ACC DATA CREATE(lw_dn_surf_band) ASYNC(1)
         ! Compute fluxes in each longwave emissivity interval using
         ! weights; first sum over g points to get the values in bands
@@ -637,6 +820,12 @@ contains
                &               config%i_band_from_reordered_g_lw, &
                &               lw_dn_surf_band, istartcol, iendcol)
         else
+          !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%lw_dn_surf_g, config%i_band_from_reordered_g_lw)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP TARGET TEAMS DISTRIBUTE
+#endif
           !$ACC PARALLEL DEFAULT(PRESENT) NUM_GANGS(iendcol-istartcol+1) NUM_WORKERS(1) &
           !$ACC   VECTOR_LENGTH(32*(config%n_g_lw-1)/32+1) ASYNC(1)
           !$ACC LOOP GANG
@@ -646,8 +835,16 @@ contains
                  &           lw_dn_surf_band(:,jcol))
           end do
           !$ACC END PARALLEL
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+          !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+          !!$OMP END TARGET DATA
         end if
         nalbedoband = size(config%lw_emiss_weights,1)
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: this%lw_dn_surf_canopy)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) &
         !$ACC   PRESENT(this%lw_dn_surf_canopy, config%lw_emiss_weights) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
@@ -656,27 +853,70 @@ contains
             this%lw_dn_surf_canopy(jalbedoband,jcol) = 0.0_jprb
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        !!$OMP END TARGET DATA
+
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: config%lw_emiss_weights, this%lw_dn_surf_canopy, this%lw_dn_surf_canopy, config%lw_emiss_weights)
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+#else
+        !$OMP TARGET TEAMS DISTRIBUTE COLLAPSE(2)
+#endif
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
           do jalbedoband = 1,nalbedoband
+#if defined(OMPGPU)
+            s1 = 0
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP PARALLEL DO REDUCTION(+:s1)
+#endif
+            do jband = 1,config%n_bands_lw
+               if (config%lw_emiss_weights(jalbedoband,jband) /= 0.0_jprb) then
+                  s1 = s1 + config%lw_emiss_weights(jalbedoband,jband) &
+                   &    * lw_dn_surf_band(jband,jcol)
+               end if
+            end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+            !$OMP END PARALLEL DO
+#endif
+            this%lw_dn_surf_canopy(jalbedoband,jcol) &
+                 &  = this%lw_dn_surf_canopy(jalbedoband,jcol) + s1
+#else
             !$ACC LOOP SEQ
             do jband = 1,config%n_bands_lw
-            if (config%lw_emiss_weights(jalbedoband,jband) /= 0.0_jprb) then
-                this%lw_dn_surf_canopy(jalbedoband,jcol) &
-                    &  = this%lw_dn_surf_canopy(jalbedoband,jcol) &
-                   &  + config%lw_emiss_weights(jalbedoband,jband) &
-                    &    * lw_dn_surf_band(jband,jcol)
-            end if
-          end do
+               if (config%lw_emiss_weights(jalbedoband,jband) /= 0.0_jprb) then
+                  this%lw_dn_surf_canopy(jalbedoband,jcol) &
+                       &  = this%lw_dn_surf_canopy(jalbedoband,jcol) &
+                       &  + config%lw_emiss_weights(jalbedoband,jband) &
+                       &    * lw_dn_surf_band(jband,jcol)
+               end if
+            end do
+#endif
         end do
         end do
         !$ACC END PARALLEL
+#ifdef WORKAROUND_NESTED_PARALLEL_FLUX
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        !$OMP END TARGET TEAMS DISTRIBUTE
+#endif
+        !!$OMP END TARGET DATA
+
         !$ACC END DATA
+        !$OMP TARGET EXIT DATA MAP(DELETE: lw_dn_surf_band)
       end if
     end if
 
     if (lhook) call dr_hook('radiation_flux:calc_surface_spectral',1,hook_handle)
 
+#ifdef HAVE_NVTX
+    !$ACC WAIT(1)
+    call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+    call roctxRangePop()
+    call roctxMarkA("radiation_flux:calc_surface_spectra"//c_null_char)
+#endif
   end subroutine calc_surface_spectral
 
 
@@ -687,7 +927,7 @@ contains
 
     use yomhook,          only : lhook, dr_hook, jphook
     use radiation_config, only : config_type
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
     use radiation_io,     only : nulerr, radiation_abort
 #endif
 
@@ -702,7 +942,7 @@ contains
 
     if (lhook) call dr_hook('radiation_flux:calc_toa_spectral',0,hook_handle)
 
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
     if (config%do_toa_spectral_flux) then
       write(nulerr,'(a)') '*** Error: radiation_flux:calc_toa_spectral not ported to GPU.'
       call radiation_abort()
@@ -710,7 +950,6 @@ contains
 #endif
 
     if (config%do_sw .and. config%do_toa_spectral_flux) then
-
       if (use_indexed_sum_vec) then
         call indexed_sum_vec(this%sw_dn_toa_g, &
              &               config%i_band_from_reordered_g_sw, &
@@ -745,7 +984,6 @@ contains
     end if
 
     if (config%do_lw .and. config%do_toa_spectral_flux) then
-
       if (use_indexed_sum_vec) then
         call indexed_sum_vec(this%lw_up_toa_g, &
              &               config%i_band_from_reordered_g_lw, &
@@ -891,19 +1129,44 @@ contains
 
     !$ACC ROUTINE VECTOR
 
+    istart = lbound(dest,1)
+    iend   = ubound(dest,1)
+
+#if defined(OMPGPU)
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+    !$OMP PARALLEL DO
+#endif
+    do jg = istart, iend
+       dest(jg) = 0.0
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+    !$OMP END PARALLEL DO
+#endif
+#else
     dest = 0.0
+#endif
 
     istart = lbound(source,1)
     iend   = ubound(source,1)
-
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+    !$OMP PARALLEL DO PRIVATE(ig)
+#endif
     !$ACC LOOP VECTOR
     do jg = istart, iend
       ig = ind(jg)
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+      !$OMP ATOMIC UPDATE 
+#endif
       !$ACC ATOMIC UPDATE
       dest(ig) = dest(ig) + source(jg)
       !$ACC END ATOMIC
-    end do
-
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+      !$END OMP ATOMIC
+#endif
+   end do
+#ifndef WORKAROUND_NESTED_PARALLEL_FLUX
+    !$OMP END PARALLEL DO
+#endif
   end subroutine indexed_sum
 
   !---------------------------------------------------------------------
@@ -977,67 +1240,604 @@ contains
 
   end subroutine indexed_sum_profile
 
-#ifdef _OPENACC
+#if defined(_OPENACC)  || defined(OMPGPU)
   !---------------------------------------------------------------------
-  ! Creates fields on device
-  subroutine create_device(this)
+  ! debug dump
+  subroutine debug_dump(this,istartcol,iendcol,k)
+    use radiation_io,     only : nulout
+    type(flux_type), intent(in) :: this
+    integer, intent(in) :: istartcol, iendcol,k
+    integer :: file_idx, fidx1, fidx2,shift
+    character*100 :: FNAME
+    !$OMP TARGET UPDATE FROM(this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET UPDATE FROM(this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET UPDATE FROM(this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
 
-    class(flux_type), intent(inout) :: this
+    !$ACC WAIT(1)
+    !$ACC UPDATE HOST(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_clear) IF(allocated(this%lw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_clear) IF(allocated(this%lw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_derivatives) IF(allocated(this%lw_derivatives)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up) IF(allocated(this%sw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn) IF(allocated(this%sw_dn)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_clear) IF(allocated(this%sw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_clear) IF(allocated(this%sw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct) IF(allocated(this%sw_dn_direct)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band)) ASYNC(1)
+    !$ACC WAIT(1)
+    shift = k-1
+    write(*,*) "shift=",shift
 
-    !$ACC ENTER DATA CREATE(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_clear) IF(allocated(this%lw_up_clear)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_clear) IF(allocated(this%lw_dn_clear)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up) IF(allocated(this%sw_up)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn) IF(allocated(this%sw_dn)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_clear) IF(allocated(this%sw_up_clear)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_clear) IF(allocated(this%sw_dn_clear)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct) IF(allocated(this%sw_dn_direct)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_band) IF(allocated(this%lw_up_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_band) IF(allocated(this%lw_dn_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_band) IF(allocated(this%sw_up_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_band) IF(allocated(this%sw_dn_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_derivatives) IF(allocated(this%lw_derivatives)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
-    !$ACC ENTER DATA CREATE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
+    if (allocated(this%sw_dn_surf_band)) then
+       FNAME='sw_dn_surf_band.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
 
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_surf_band, dim=1), ubound(this%sw_dn_surf_band, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2+shift,",",this%sw_dn_surf_band(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
 
-  end subroutine create_device
+    if (allocated(this%sw_dn_surf_clear_band)) then
+       FNAME='sw_dn_surf_clear_band.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_surf_clear_band, dim=1), ubound(this%sw_dn_surf_clear_band, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2+shift,",",this%sw_dn_surf_clear_band(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_diffuse_surf_canopy)) then
+       FNAME='sw_dn_diffuse_surf_canopy.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_diffuse_surf_canopy, dim=1), ubound(this%sw_dn_diffuse_surf_canopy, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2+shift,",",this%sw_dn_diffuse_surf_canopy(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_direct_surf_canopy)) then
+       FNAME='sw_dn_direct_surf_canopy.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_direct_surf_canopy, dim=1), ubound(this%sw_dn_direct_surf_canopy, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2+shift,",",this%sw_dn_direct_surf_canopy(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_up)) then
+       FNAME='sw_up.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_up, dim=2), ubound(this%sw_up, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_up(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn)) then
+       FNAME='sw_dn.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_dn, dim=2), ubound(this%sw_dn, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_dn(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_up_clear)) then
+       FNAME='sw_up_clear.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_up_clear, dim=2), ubound(this%sw_up_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_up_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_clear)) then
+       FNAME='sw_dn_clear.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_dn_clear, dim=2), ubound(this%sw_dn_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_dn_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_direct_clear)) then
+       FNAME='sw_dn_direct_clear.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_dn_direct_clear, dim=2), ubound(this%sw_dn_direct_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_dn_direct_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_direct)) then
+       FNAME='sw_dn_direct.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%sw_dn_direct, dim=2), ubound(this%sw_dn_direct, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%sw_dn_direct(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_up)) then
+       FNAME='lw_up.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%lw_up, dim=2), ubound(this%lw_up, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%lw_up(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%lw_dn)) then
+       FNAME='lw_dn.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%lw_dn, dim=2), ubound(this%lw_dn, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%lw_dn(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_up_clear)) then
+       FNAME='lw_up_clear.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%lw_up_clear, dim=2), ubound(this%lw_up_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%lw_up_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_dn_clear)) then
+       FNAME='lw_dn_clear.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%lw_dn_clear, dim=2), ubound(this%lw_dn_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%lw_dn_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_derivatives)) then
+       FNAME='lw_derivatives.txt'
+       if (k==1) then
+          open(newunit=file_idx, file=FNAME, action='write',status='replace')
+       else
+          open(newunit=file_idx, file=FNAME, action='write',position='append')
+       endif
+
+       do fidx2 = lbound(this%lw_derivatives, dim=2), ubound(this%lw_derivatives, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1+shift,",",fidx2,",",this%lw_derivatives(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+  end subroutine debug_dump
+  
   !---------------------------------------------------------------------
-  ! updates fields on host
-  subroutine update_host(this)
+  ! debug dump
+  subroutine debug_dump_sw(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(flux_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol, iendcol
+    integer :: file_idx, fidx1, fidx2, fidx3
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET UPDATE FROM(this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET UPDATE FROM(this%sw_dn) IF(allocated(this%sw_dn))
 
-    class(flux_type), intent(inout) :: this
+    !$ACC UPDATE HOST(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))  ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_clear) IF(allocated(this%sw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_clear) IF(allocated(this%sw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct) IF(allocated(this%sw_dn_direct)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up) IF(allocated(this%sw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn) IF(allocated(this%sw_dn)) ASYNC(1)
+
+    !$ACC WAIT(1)
+    write(nulout,'(a,a,a,i0)')         "    DUMPING DEVICE ARRAYS FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                            IN ", __FILE__, " : LINE = ", __LINE__
+
+    if (allocated(this%cloud_cover_sw)) then
+       open(newunit=file_idx, file='cloud_cover_sw.txt', status='replace')
+       do fidx1 = istartcol, iendcol
+          write(file_idx, '(i0,a,es13.6)') fidx1,",",this%cloud_cover_sw(fidx1)
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_diffuse_surf_clear_g)) then
+       open(newunit=file_idx, file='sw_dn_diffuse_surf_clear_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_diffuse_surf_clear_g, dim=1), ubound(this%sw_dn_diffuse_surf_clear_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_diffuse_surf_clear_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_direct_surf_clear_g)) then
+       open(newunit=file_idx, file='sw_dn_direct_surf_clear_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_direct_surf_clear_g, dim=1), ubound(this%sw_dn_direct_surf_clear_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_direct_surf_clear_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_diffuse_surf_g)) then
+       open(newunit=file_idx, file='sw_dn_diffuse_surf_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_diffuse_surf_g, dim=1), ubound(this%sw_dn_diffuse_surf_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_diffuse_surf_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_direct_surf_g)) then
+       open(newunit=file_idx, file='sw_dn_direct_surf_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%sw_dn_direct_surf_g, dim=1), ubound(this%sw_dn_direct_surf_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_direct_surf_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_up_clear)) then
+       open(newunit=file_idx, file='sw_up_clear.txt', status='replace')
+       do fidx2 = lbound(this%sw_up_clear, dim=2), ubound(this%sw_up_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_up_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_clear)) then
+       open(newunit=file_idx, file='sw_dn_clear.txt', status='replace')
+       do fidx2 = lbound(this%sw_dn_clear, dim=2), ubound(this%sw_dn_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_up)) then
+       open(newunit=file_idx, file='sw_up.txt', status='replace')
+       do fidx2 = lbound(this%sw_up, dim=2), ubound(this%sw_up, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_up(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn)) then
+       open(newunit=file_idx, file='sw_dn.txt', status='replace')
+       do fidx2 = lbound(this%sw_dn, dim=2), ubound(this%sw_dn, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%sw_dn_direct_clear)) then
+       open(newunit=file_idx, file='sw_dn_direct_clear.txt', status='replace')
+       do fidx2 = lbound(this%sw_dn_direct_clear, dim=2), ubound(this%sw_dn_direct_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_direct_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%sw_dn_direct)) then
+       open(newunit=file_idx, file='sw_dn_direct.txt', status='replace')
+       do fidx2 = lbound(this%sw_dn_direct, dim=2), ubound(this%sw_dn_direct, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%sw_dn_direct(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+  end subroutine debug_dump_sw
+      
+  !---------------------------------------------------------------------
+  ! debug dump
+  subroutine debug_dump_lw(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(flux_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol, iendcol
+    integer :: file_idx, fidx1, fidx2, fidx3
+    !$OMP TARGET UPDATE FROM(this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET UPDATE FROM(this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET UPDATE FROM(this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+
+    !$ACC UPDATE HOST(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_clear) IF(allocated(this%lw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_clear) IF(allocated(this%lw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_derivatives) IF(allocated(this%lw_derivatives)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g)) ASYNC(1)
+
+    !$ACC WAIT(1)
+    write(nulout,'(a,a,a,i0)')         "    DUMPING DEVICE ARRAYS FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                            IN ", __FILE__, " : LINE = ", __LINE__
+
+    if (allocated(this%lw_up)) then
+       open(newunit=file_idx, file='lw_up.txt', status='replace')
+       do fidx2 = lbound(this%lw_up, dim=2), ubound(this%lw_up, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_up(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%lw_dn)) then
+       open(newunit=file_idx, file='lw_dn.txt', status='replace')
+       do fidx2 = lbound(this%lw_dn, dim=2), ubound(this%lw_dn, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_dn(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_up_clear)) then
+       open(newunit=file_idx, file='lw_up_clear.txt', status='replace')
+       do fidx2 = lbound(this%lw_up_clear, dim=2), ubound(this%lw_up_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_up_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    
+    if (allocated(this%lw_dn_clear)) then
+       open(newunit=file_idx, file='lw_dn_clear.txt', status='replace')
+       do fidx2 = lbound(this%lw_dn_clear, dim=2), ubound(this%lw_dn_clear, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_dn_clear(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%lw_dn_surf_g)) then
+       open(newunit=file_idx, file='lw_dn_surf_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%lw_dn_surf_g, dim=1), ubound(this%lw_dn_surf_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_dn_surf_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+    if (allocated(this%lw_dn_surf_clear_g)) then
+       open(newunit=file_idx, file='lw_dn_surf_clear_g.txt', status='replace')
+       do fidx2 = istartcol, iendcol
+          do fidx1 = lbound(this%lw_dn_surf_clear_g, dim=1), ubound(this%lw_dn_surf_clear_g, dim=1)
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_dn_surf_clear_g(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+    if (allocated(this%cloud_cover_lw)) then
+       open(newunit=file_idx, file='cloud_cover_lw.txt', status='replace')
+       do fidx1 = istartcol, iendcol
+          write(file_idx, '(i0,a,es13.6)') fidx1,",",this%cloud_cover_lw(fidx1)
+       enddo
+       close(file_idx)
+    end if
+    if (allocated(this%lw_derivatives)) then
+       open(newunit=file_idx, file='lw_derivatives.txt', status='replace')
+       do fidx2 = lbound(this%lw_derivatives, dim=2), ubound(this%lw_derivatives, dim=2)
+          do fidx1 = istartcol, iendcol
+             write(file_idx, '(i0,a,i0,a,es13.6)') fidx1,",",fidx2,",",this%lw_derivatives(fidx1,fidx2)
+          enddo
+       enddo
+       close(file_idx)
+    end if
+
+  end subroutine debug_dump_lw
+
+  !---------------------------------------------------------------------
+  ! debug print
+  subroutine debug_print_flux(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(flux_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol, iendcol
+    integer :: s1, s2, s3
+
+    !$OMP TARGET UPDATE FROM(this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET UPDATE FROM(this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET UPDATE FROM(this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_up_band) IF(allocated(this%lw_up_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_band) IF(allocated(this%lw_dn_band))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_band) IF(allocated(this%sw_up_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_band) IF(allocated(this%sw_dn_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw))
+    !$OMP TARGET UPDATE FROM(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET UPDATE FROM(this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band))
 
     !$ACC UPDATE HOST(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
     !$ACC UPDATE HOST(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
@@ -1086,13 +1886,504 @@ contains
     !$ACC UPDATE HOST(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC UPDATE HOST(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 
-  end subroutine update_host
+    !$ACC WAIT(1)
+
+    write(nulout,'(a,a,a,i0)')         "    DEVICE ARRAY DEBUG FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                         IN ", __FILE__, " : LINE = ", __LINE__
+
+    if (allocated(this%lw_up)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_up,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up=", this%lw_up(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_dn)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_dn,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_dn=", this%lw_dn(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_clear)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_up_clear,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_clear=", this%lw_up_clear(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_dn_clear)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_dn_clear,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_dn_clear=", this%lw_dn_clear(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_up)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_up,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_up=", this%sw_up(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_dn,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn=", this%sw_dn(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_up_clear)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_up_clear,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_up_clear=", this%sw_up_clear(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_clear)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_dn_clear,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_clear=", this%sw_dn_clear(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_dn_direct,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct=", this%sw_dn_direct(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_clear)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%sw_dn_direct_clear,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_clear=", this%sw_dn_direct_clear(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_band)) then
+       s1 = size(this%lw_up_band,1)/2
+       s2 = size(this%lw_up_band,2)/2
+       s3 = size(this%lw_up_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%lw_up_band=", this%lw_up_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%lw_dn_band)) then
+       s1 = size(this%lw_dn_band,1)/2
+       s2 = size(this%lw_dn_band,2)/2
+       s3 = size(this%lw_dn_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%lw_dn_band=", this%lw_dn_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%sw_up_band)) then
+       s1 = size(this%sw_up_band,1)/2
+       s2 = size(this%sw_up_band,2)/2
+       s3 = size(this%sw_up_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%sw_up_band=", this%sw_up_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%sw_dn_band)) then
+       s1 = size(this%sw_dn_band,1)/2
+       s2 = size(this%sw_dn_band,2)/2
+       s3 = size(this%sw_dn_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%sw_dn_band=", this%sw_dn_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%sw_dn_direct_band)) then
+       s1 = size(this%sw_dn_direct_band,1)/2
+       s2 = size(this%sw_dn_direct_band,2)/2
+       s3 = size(this%sw_dn_direct_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%sw_dn_direct_band=", this%sw_dn_direct_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%lw_up_clear_band)) then
+       s1 = size(this%lw_up_clear_band,1)/2
+       s2 = size(this%lw_up_clear_band,2)/2
+       s3 = size(this%lw_up_clear_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%lw_up_clear_band=", this%lw_up_clear_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%lw_dn_clear_band)) then
+       s1 = size(this%lw_dn_clear_band,1)/2
+       s2 = size(this%lw_dn_clear_band,2)/2
+       s3 = size(this%lw_dn_clear_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%lw_dn_clear_band=", this%lw_dn_clear_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%sw_dn_direct_clear_band)) then
+       s1 = size(this%sw_dn_direct_clear_band,1)/2
+       s2 = size(this%sw_dn_direct_clear_band,2)/2
+       s3 = size(this%sw_dn_direct_clear_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "this%sw_dn_direct_clear_band=", this%sw_dn_direct_clear_band(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    end if
+    if (allocated(this%lw_dn_surf_g)) then
+       s1 = size(this%lw_dn_surf_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_dn_surf_g=", this%lw_dn_surf_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_dn_surf_clear_g)) then
+       s1 = size(this%lw_dn_surf_clear_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_dn_surf_clear_g=", this%lw_dn_surf_clear_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_diffuse_surf_g)) then
+       s1 = size(this%sw_dn_diffuse_surf_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_diffuse_surf_g=", this%sw_dn_diffuse_surf_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_surf_g)) then
+       s1 = size(this%sw_dn_direct_surf_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_surf_g=", this%sw_dn_direct_surf_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_diffuse_surf_clear_g)) then
+       s1 = size(this%sw_dn_diffuse_surf_clear_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_diffuse_surf_clear_g=", this%sw_dn_diffuse_surf_clear_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_surf_clear_g)) then
+       s1 = size(this%sw_dn_direct_surf_clear_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_surf_clear_g=", this%sw_dn_direct_surf_clear_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_toa_g)) then
+       s1 = size(this%sw_dn_toa_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_toa_g=", this%sw_dn_toa_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_toa_g)) then
+       s1 = size(this%lw_up_toa_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_toa_g=", this%lw_up_toa_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_toa_clear_g)) then
+       s1 = size(this%lw_up_toa_clear_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_toa_clear_g=", this%lw_up_toa_clear_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_up_toa_g)) then
+       s1 = size(this%sw_up_toa_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_up_toa_g=", this%sw_up_toa_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_up_toa_clear_g)) then
+       s1 = size(this%sw_up_toa_clear_g,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_up_toa_clear_g=", this%sw_up_toa_clear_g(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_surf_band)) then
+       s1 = size(this%sw_dn_surf_band,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_surf_band=", this%sw_dn_surf_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_surf_band)) then
+       s1 = size(this%sw_dn_direct_surf_band,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_surf_band=", this%sw_dn_direct_surf_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_surf_clear_band)) then
+       s1 = size(this%sw_dn_surf_clear_band,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_surf_clear_band=", this%sw_dn_surf_clear_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_surf_clear_band)) then
+       s1 = size(this%sw_dn_direct_surf_clear_band,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_surf_clear_band=", this%sw_dn_direct_surf_clear_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_toa_band)) then
+       s1 = size(this%sw_dn_toa_band,1)/2
+       s2 = size(this%sw_dn_toa_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_toa_band=", this%sw_dn_toa_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_toa_band)) then
+       s1 = size(this%lw_up_toa_band,1)/2
+       s2 = size(this%lw_up_toa_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_toa_band=", this%lw_up_toa_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_toa_clear_band)) then
+       s1 = size(this%lw_up_toa_clear_band,1)/2
+       s2 = size(this%lw_up_toa_clear_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_toa_clear_band=", this%lw_up_toa_clear_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_up_toa_band)) then
+       s1 = size(this%sw_up_toa_band,1)/2
+       s2 = size(this%sw_up_toa_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_up_toa_band=", this%sw_up_toa_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_up_toa_clear_band)) then
+       s1 = size(this%lw_up_toa_clear_band,1)/2
+       s2 = size(this%lw_up_toa_clear_band,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_up_toa_clear_band=", this%lw_up_toa_clear_band(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%cloud_cover_lw)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0)') "this%cloud_cover_lw=", this%cloud_cover_lw(s1), " at indices ", s1
+    end if
+    if (allocated(this%cloud_cover_sw)) then
+       s1 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0)') "this%cloud_cover_sw=", this%cloud_cover_sw(s1), " at indices ", s1
+    end if
+    if (allocated(this%lw_dn_surf_canopy)) then
+       s1 = size(this%lw_dn_surf_canopy,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_dn_surf_canopy=", this%lw_dn_surf_canopy(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_diffuse_surf_canopy)) then
+       s1 = size(this%sw_dn_diffuse_surf_canopy,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_diffuse_surf_canopy=", this%sw_dn_diffuse_surf_canopy(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%sw_dn_direct_surf_canopy)) then
+       s1 = size(this%sw_dn_direct_surf_canopy,1)/2
+       s2 = (iendcol-istartcol)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%sw_dn_direct_surf_canopy=", this%sw_dn_direct_surf_canopy(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%lw_derivatives)) then
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%lw_derivatives,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%lw_derivatives=", this%lw_derivatives(s1,s2), " at indices ", s1, " ", s2
+    end if
+  end subroutine debug_print_flux
+
+  !---------------------------------------------------------------------
+  ! Creates fields on device
+  subroutine create_device_flux(this)
+
+    type(flux_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_band) IF(allocated(this%lw_up_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_band) IF(allocated(this%lw_dn_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_band) IF(allocated(this%sw_up_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_band) IF(allocated(this%sw_dn_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band))
+
+    !$ACC ENTER DATA CREATE(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_clear) IF(allocated(this%lw_up_clear)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_clear) IF(allocated(this%lw_dn_clear)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up) IF(allocated(this%sw_up)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn) IF(allocated(this%sw_dn)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_clear) IF(allocated(this%sw_up_clear)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_clear) IF(allocated(this%sw_dn_clear)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct) IF(allocated(this%sw_dn_direct)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_band) IF(allocated(this%lw_up_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_band) IF(allocated(this%lw_dn_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_band) IF(allocated(this%sw_up_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_band) IF(allocated(this%sw_dn_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_derivatives) IF(allocated(this%lw_derivatives)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
+
+  end subroutine create_device_flux
+
+  !---------------------------------------------------------------------
+  ! updates fields on host
+  subroutine update_host_flux(this)
+
+    type(flux_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET UPDATE FROM(this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET UPDATE FROM(this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET UPDATE FROM(this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET UPDATE FROM(this%lw_up_band) IF(allocated(this%lw_up_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_band) IF(allocated(this%lw_dn_band))
+    !$OMP TARGET UPDATE FROM(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_band) IF(allocated(this%sw_up_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_band) IF(allocated(this%sw_dn_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET UPDATE FROM(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw))
+    !$OMP TARGET UPDATE FROM(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET UPDATE FROM(this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET UPDATE FROM(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band))
+    !$OMP TARGET UPDATE FROM(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band))
+    !$OMP TARGET UPDATE FROM(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band))
+    !$OMP TARGET UPDATE FROM(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band))
+
+    !$ACC UPDATE HOST(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_clear) IF(allocated(this%lw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_clear) IF(allocated(this%lw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up) IF(allocated(this%sw_up)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn) IF(allocated(this%sw_dn)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_clear) IF(allocated(this%sw_up_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_clear) IF(allocated(this%sw_dn_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct) IF(allocated(this%sw_dn_direct)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_band) IF(allocated(this%lw_up_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_band) IF(allocated(this%lw_dn_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_band) IF(allocated(this%sw_up_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_band) IF(allocated(this%sw_dn_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy)) ASYNC(1)
+    !$ACC UPDATE HOST(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw)) ASYNC(1)
+    !$ACC UPDATE HOST(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_derivatives) IF(allocated(this%lw_derivatives)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
+    !$ACC UPDATE HOST(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
+
+  end subroutine update_host_flux
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device(this)
+  subroutine update_device_flux(this)
 
-    class(flux_type), intent(inout) :: this
+    type(flux_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET UPDATE TO(this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET UPDATE TO(this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET UPDATE TO(this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET UPDATE TO(this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET UPDATE TO(this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET UPDATE TO(this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET UPDATE TO(this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET UPDATE TO(this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET UPDATE TO(this%lw_up_band) IF(allocated(this%lw_up_band))
+    !$OMP TARGET UPDATE TO(this%lw_dn_band) IF(allocated(this%lw_dn_band))
+    !$OMP TARGET UPDATE TO(this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band))
+    !$OMP TARGET UPDATE TO(this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_up_band) IF(allocated(this%sw_up_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_band) IF(allocated(this%sw_dn_band))
+    !$OMP TARGET UPDATE TO(this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band))
+    !$OMP TARGET UPDATE TO(this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy))
+    !$OMP TARGET UPDATE TO(this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET UPDATE TO(this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw))
+    !$OMP TARGET UPDATE TO(this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET UPDATE TO(this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET UPDATE TO(this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET UPDATE TO(this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+    !$OMP TARGET UPDATE TO(this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET UPDATE TO(this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET UPDATE TO(this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET UPDATE TO(this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g))
+    !$OMP TARGET UPDATE TO(this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g))
+    !$OMP TARGET UPDATE TO(this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g))
+    !$OMP TARGET UPDATE TO(this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g))
+    !$OMP TARGET UPDATE TO(this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g))
+    !$OMP TARGET UPDATE TO(this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band))
+    !$OMP TARGET UPDATE TO(this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band))
+    !$OMP TARGET UPDATE TO(this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band))
+    !$OMP TARGET UPDATE TO(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band))
+    !$OMP TARGET UPDATE TO(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band))
 
     !$ACC UPDATE DEVICE(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
@@ -1141,13 +2432,63 @@ contains
     !$ACC UPDATE DEVICE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 
-  end subroutine update_device
+  end subroutine update_device_flux
 
   !---------------------------------------------------------------------
   ! Deletes fields on device
-  subroutine delete_device(this)
+  subroutine delete_device_flux(this)
 
-    class(flux_type), intent(inout) :: this
+    type(flux_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up) IF(allocated(this%lw_up))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn) IF(allocated(this%lw_dn))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_clear) IF(allocated(this%lw_up_clear))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_clear) IF(allocated(this%lw_dn_clear))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up) IF(allocated(this%sw_up))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn) IF(allocated(this%sw_dn))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_clear) IF(allocated(this%sw_up_clear))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_clear) IF(allocated(this%sw_dn_clear))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct) IF(allocated(this%sw_dn_direct))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_clear) IF(allocated(this%sw_dn_direct_clear))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_band) IF(allocated(this%lw_up_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_band) IF(allocated(this%lw_dn_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_clear_band) IF(allocated(this%lw_up_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_clear_band) IF(allocated(this%lw_dn_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_band) IF(allocated(this%sw_up_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_band) IF(allocated(this%sw_dn_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_clear_band) IF(allocated(this%sw_up_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_clear_band) IF(allocated(this%sw_dn_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_band) IF(allocated(this%sw_dn_direct_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_clear_band) IF(allocated(this%sw_dn_direct_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_surf_band) IF(allocated(this%sw_dn_surf_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_surf_band) IF(allocated(this%sw_dn_direct_surf_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_surf_clear_band) IF(allocated(this%sw_dn_surf_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_surf_clear_band) IF(allocated(this%sw_dn_direct_surf_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_surf_canopy) IF(allocated(this%lw_dn_surf_canopy))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_diffuse_surf_canopy) IF(allocated(this%sw_dn_diffuse_surf_canopy))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_surf_canopy) IF(allocated(this%sw_dn_direct_surf_canopy))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%cloud_cover_sw) IF(allocated(this%cloud_cover_sw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%cloud_cover_lw) IF(allocated(this%cloud_cover_lw))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_derivatives) IF(allocated(this%lw_derivatives))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_surf_g) IF(allocated(this%lw_dn_surf_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_dn_surf_clear_g) IF(allocated(this%lw_dn_surf_clear_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_diffuse_surf_g) IF(allocated(this%sw_dn_diffuse_surf_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_surf_g) IF(allocated(this%sw_dn_direct_surf_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_diffuse_surf_clear_g) IF(allocated(this%sw_dn_diffuse_surf_clear_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_direct_surf_clear_g) IF(allocated(this%sw_dn_direct_surf_clear_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_toa_g) IF(allocated(this%lw_up_toa_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_toa_clear_g) IF(allocated(this%lw_up_toa_clear_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_toa_g) IF(allocated(this%sw_dn_toa_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_toa_g) IF(allocated(this%sw_up_toa_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_toa_clear_g) IF(allocated(this%sw_up_toa_clear_g))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_toa_band) IF(allocated(this%lw_up_toa_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up_toa_clear_band) IF(allocated(this%lw_up_toa_clear_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_dn_toa_band) IF(allocated(this%sw_dn_toa_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band))
 
     !$ACC EXIT DATA DELETE(this%lw_up) IF(allocated(this%lw_up)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%lw_dn) IF(allocated(this%lw_dn)) ASYNC(1)
@@ -1196,7 +2537,7 @@ contains
     !$ACC EXIT DATA DELETE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 
-  end subroutine delete_device
+  end subroutine delete_device_flux
 #endif
 
 end module radiation_flux

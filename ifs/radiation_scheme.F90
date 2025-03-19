@@ -1,5 +1,5 @@
 SUBROUTINE RADIATION_SCHEME &
-     & (YRADIATION,KIDIA, KFDIA, KLON, KLEV, KAEROSOL, &
+     & (YRADIATION, IB, KIDIA, KFDIA, KLON, KLEV, KAEROSOL, &
      &  PSOLAR_IRRADIANCE, &
      &  PMU0, PTEMPERATURE_SKIN, PALBEDO_DIF, PALBEDO_DIR, &
      &  PSPECTRALEMISS, &
@@ -70,32 +70,37 @@ SUBROUTINE RADIATION_SCHEME &
 USE PARKIND1       , ONLY : JPIM, JPRB, JPRD
 USE YOMHOOK        , ONLY : LHOOK, DR_HOOK, JPHOOK
 USE YOMCST         , ONLY : RPI, RSIGMA ! Stefan-Boltzmann constant
-USE YOMLUN         , ONLY : NULERR
+USE YOMLUN         , ONLY : NULERR, NULOUT
 USE RADIATION_SETUP, ONLY : ITYPE_TROP_BG_AER, ITYPE_STRAT_BG_AER, TRADIATION
 
 ! Modules from ecRad radiation library
 USE RADIATION_CONFIG,         ONLY : ISOLVERSPARTACUS
-USE RADIATION_SINGLE_LEVEL,   ONLY : SINGLE_LEVEL_TYPE
-USE RADIATION_THERMODYNAMICS, ONLY : THERMODYNAMICS_TYPE
+USE RADIATION_SINGLE_LEVEL,   ONLY : SINGLE_LEVEL_TYPE, debug_print_single_level
+USE RADIATION_THERMODYNAMICS, ONLY : THERMODYNAMICS_TYPE, debug_print_thermodynamics
 USE RADIATION_GAS,            ONLY : GAS_TYPE,&
      &                               IMASSMIXINGRATIO, IVOLUMEMIXINGRATIO,&
      &                               IH2O, ICO2, ICH4, IN2O, ICFC11, ICFC12, IHCFC22, ICCL4, IO3, IO2
 USE RADIATION_CLOUD,          ONLY : CLOUD_TYPE
 USE RADIATION_AEROSOL,        ONLY : AEROSOL_TYPE
-USE RADIATION_FLUX,           ONLY : FLUX_TYPE
+USE RADIATION_FLUX,           ONLY : FLUX_TYPE, DEBUG_DUMP
 USE RADIATION_INTERFACE,      ONLY : RADIATION, SET_GAS_UNITS
 USE RADIATION_SAVE,           ONLY : SAVE_INPUTS, SAVE_FLUXES
 #ifdef HAVE_NVTX
 USE NVTX
+#endif
+#ifdef HAVE_ROCTX
+USE ROCTX_PROFILING, ONLY: roctxMarkA, roctxRangePushA, roctxRangePop
+USE ISO_C_BINDING, ONLY: c_null_char
 #endif
 
 IMPLICIT NONE
 
 ! INPUT ARGUMENTS
 
-TYPE(TRADIATION), INTENT(IN)    :: YRADIATION
+TYPE(TRADIATION), INTENT(INOUT)    :: YRADIATION
 
 ! *** Array dimensions and ranges
+INTEGER(KIND=JPIM),INTENT(IN)   :: IB
 INTEGER(KIND=JPIM),INTENT(IN)   :: KIDIA    ! Start column to process
 INTEGER(KIND=JPIM),INTENT(IN)   :: KFDIA    ! End column to process
 INTEGER(KIND=JPIM),INTENT(IN)   :: KLON     ! Number of columns
@@ -256,6 +261,10 @@ REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 INTEGER(KIND=JPIM) :: MPL_MYRANK
 MPL_MYRANK() = 1
 
+#ifdef HAVE_ROCTX
+INTEGER(4) :: roctx_ret
+#endif
+
 ! Import time functions for iseed calculation
 #include "fcttim.func.h"
 
@@ -267,8 +276,14 @@ MPL_MYRANK() = 1
 
 IF (LHOOK) CALL DR_HOOK('RADIATION_SCHEME',0,ZHOOK_HANDLE)
 
+!
+! PJM 4-8-2025
+! Use of this association causes seg faults with Nvidia. Not sure
+! why. So use the full variable name instead throughout
+!
+!     &    RAD_CONFIG=>YRADIATION%RAD_CONFIG, &
+
 ASSOCIATE(YRERAD    =>YRADIATION%YRERAD, &
-     &    RAD_CONFIG=>YRADIATION%RAD_CONFIG, &
      &    NWEIGHT_UV=>YRADIATION%NWEIGHT_UV, &
      &    IBAND_UV  =>YRADIATION%IBAND_UV(:), &
      &    WEIGHT_UV =>YRADIATION%WEIGHT_UV(:), &
@@ -277,10 +292,14 @@ ASSOCIATE(YRERAD    =>YRADIATION%YRERAD, &
      &    WEIGHT_PAR=>YRADIATION%WEIGHT_PAR(:), &
      &    TROP_BG_AER_MASS_EXT=>YRADIATION%TROP_BG_AER_MASS_EXT, &
      &    STRAT_BG_AER_MASS_EXT=>YRADIATION%STRAT_BG_AER_MASS_EXT)
-! Allocate memory in radiation objects
+  ! Allocate memory in radiation objects
 #ifdef HAVE_NVTX
 call nvtxStartRange("allocate")
 #endif
+#ifdef HAVE_ROCTX
+  roctx_ret = roctxRangePushA("allocate"//c_null_char)
+#endif
+
 CALL SINGLE_LEVEL%ALLOCATE(KLON, YRERAD%NSW, YRERAD%NLWEMISS, &
      &                     USE_SW_ALBEDO_DIRECT=.TRUE.)
 CALL THERMODYNAMICS%ALLOCATE(KLON, KLEV, USE_H2O_SAT=.TRUE.)
@@ -291,22 +310,40 @@ IF (YRERAD%NAERMACC == 1) THEN
 ELSE
   CALL AEROSOL%ALLOCATE(KLON, 1, KLEV, 6) ! Tegen climatology
 ENDIF
-CALL FLUX%ALLOCATE(RAD_CONFIG, 1, KLON, KLEV)
+CALL FLUX%ALLOCATE(YRADIATION%RAD_CONFIG, 1, KLON, KLEV)
 #ifdef HAVE_NVTX
 call nvtxEndRange
 #endif
-
-#ifdef _OPENACC
-!$ACC DATA COPYIN(yradiation, rad_config, single_level, thermodynamics, gas, aerosol, ylcloud, flux) ASYNC(1)
-call rad_config%create_device()
-call single_level%create_device()
-call thermodynamics%create_device()
-call gas%create_device()
-call aerosol%create_device()
-call ylcloud%create_device()
-call flux%create_device()
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("allocate"//c_null_char)
+#endif
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
 #endif
 
+#if defined(_OPENACC)
+!$ACC DATA COPYIN(yradiation, yradiation%rad_config, single_level, thermodynamics, gas, aerosol, ylcloud, flux) ASYNC(1)
+#endif
+#if defined(OMPGPU)
+!$OMP TARGET ENTER DATA MAP(TO:yradiation, yradiation%rad_config, single_level, thermodynamics, gas, aerosol, ylcloud, flux)
+#endif
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+call yradiation%rad_config%create_device(yradiation%rad_config)
+call single_level%create_device(single_level)
+call thermodynamics%create_device(thermodynamics)
+call gas%create_device(gas)
+call aerosol%create_device(aerosol)
+call ylcloud%create_device(ylcloud)
+call flux%create_device(flux)
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+#if defined(_OPENACC)
 !$ACC DATA &
 !$ACC CREATE(ZRE_LIQUID_UM, ZRE_ICE_UM, ZDECORR_LEN_KM, ZLAYER_MASS) &
 !$ACC PRESENT(PMU0, PTEMPERATURE_SKIN, PALBEDO_DIF, PALBEDO_DIR, PSPECTRALEMISS, &
@@ -320,13 +357,43 @@ call flux%create_device()
 !$ACC         PFLUX_UV, PFLUX_PAR, PFLUX_PAR_CLEAR, PFLUX_SW_DN_TOA, &
 !$ACC         PEMIS_OUT, PLWDERIVATIVE) &
 !$ACC NO_CREATE(PSWDIRECTBAND, PSWDIFFUSEBAND, PRE_LIQ) ASYNC(1)
+#endif
+#if defined(OMPGPU)
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
+!$OMP TARGET ENTER DATA MAP(ALLOC:ZRE_LIQUID_UM, ZRE_ICE_UM, ZDECORR_LEN_KM,ZLAYER_MASS)
+#ifdef DEBUG_WARNING
+write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Checking the PRESENT status of subarrays does not work. This needs to be fixed! PJM 4-9-2025"
+#endif
+!!$OMP TARGET DATA MAP(PRESENT,ALLOC: &
+!!$OMP&         PMU0, PTEMPERATURE_SKIN, PALBEDO_DIF, PALBEDO_DIR, PSPECTRALEMISS, &
+!!$OMP&         PCCN_LAND, PCCN_SEA, PGEMU, PLAND_SEA_MASK, PPRESSURE, PTEMPERATURE, &
+!!$OMP&         PPRESSURE_H, PTEMPERATURE_H, &
+!!$OMP&         PCLOUD_FRAC, PQ_LIQUID, PQ_ICE, PQ_RAIN, PQ_SNOW, &
+!!$OMP&         PAEROSOL_OLD, PAEROSOL, &
+!!$OMP&         PFLUX_SW, PFLUX_LW, PFLUX_SW_CLEAR, PFLUX_LW_CLEAR, &
+!!$OMP&         PFLUX_SW_DN, PFLUX_LW_DN, PFLUX_SW_DN_CLEAR, PFLUX_LW_DN_CLEAR, &
+!!$OMP&         PFLUX_DIR, PFLUX_DIR_CLEAR, PFLUX_DIR_INTO_SUN, &
+!!$OMP&         PFLUX_UV, PFLUX_PAR, PFLUX_PAR_CLEAR, PFLUX_SW_DN_TOA, &
+!!$OMP&         PEMIS_OUT, PLWDERIVATIVE)
+!!$OMP TARGET DATA MAP(PRESENT,ALLOC:PSWDIRECTBAND, PSWDIFFUSEBAND, PRE_LIQ)
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxStartRange("thermodynamics setup")
 #endif
+#ifdef HAVE_ROCTX
+roctx_ret = roctxRangePushA("thermodynamics setup"//c_null_char)
+#endif
 ! Set thermodynamic profiles: simply copy over the half-level
 ! pressure and temperature
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL LOOP GANG VECTOR COLLAPSE (2) DEFAULT(PRESENT) ASYNC(1)
 DO JLEV = 1,KLEV+1
   DO JLON = KIDIA,KFDIA
@@ -358,6 +425,7 @@ DO JLEV = 1,KLEV+1
     ENDIF
   ENDDO
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC END PARALLEL
 
 ! Alternatively we respect the model's atmospheric temperature in the
@@ -374,16 +442,70 @@ ENDDO
 !     &  PPRESSURE, PTEMPERATURE, THERMODYNAMICS%H2O_SAT_LIQ, 2)
 ! Alternative approximate version using temperature and pressure from
 ! the thermodynamics structure
-CALL thermodynamics%calc_saturation_wrt_liquid(KIDIA, KFDIA, lacc=.true.)
+
+CALL thermodynamics%calc_saturation_wrt_liquid(thermodynamics, KIDIA, KFDIA, lacc=.true.)
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
 call nvtxStartRange("single level setup")
 #endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("thermodynamics setup"//c_null_char)
+roctx_ret = roctxRangePushA("single level setup"//c_null_char)
+#endif
 
 ! Set single-level fileds
 SINGLE_LEVEL%SOLAR_IRRADIANCE              = PSOLAR_IRRADIANCE
+!$OMP TARGET UPDATE TO(SINGLE_LEVEL%SOLAR_IRRADIANCE)
 !$ACC UPDATE DEVICE(SINGLE_LEVEL%SOLAR_IRRADIANCE) ASYNC(1)
+
+#if defined(OMPGPU)
+
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : This code needs to be fixed. This seems to be come a problem in the 2nd and later calls to radiation_scheme. Not sure why."
+#endif
+
+!$OMP TARGET UPDATE TO(PMU0, PTEMPERATURE_SKIN, PALBEDO_DIF, PALBEDO_DIR, PSPECTRALEMISS)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+DO JLON = KIDIA,KFDIA
+  SINGLE_LEVEL%COS_SZA(JLON)          = PMU0(JLON)
+  SINGLE_LEVEL%SKIN_TEMPERATURE(JLON) = PTEMPERATURE_SKIN(JLON)
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JBAND = 1,YRADIATION%YRERAD%NSW
+  DO JLON = KIDIA,KFDIA
+    SINGLE_LEVEL%SW_ALBEDO(JLON,JBAND)      = PALBEDO_DIF(JLON,JBAND)
+    SINGLE_LEVEL%SW_ALBEDO_DIRECT(JLON,JBAND)=PALBEDO_DIR(JLON,JBAND)
+  ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+! !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+! DO JBAND = 1,YRADIATION%YRERAD%NLWEMISS
+!   DO JLON = KIDIA,KFDIA
+!     ! Spectral longwave emissivity
+!     SINGLE_LEVEL%LW_EMISSIVITY(JLON,JBAND)  = PSPECTRALEMISS(JLON,JBAND)
+!   ENDDO
+! ENDDO
+! !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET UPDATE FROM(PSPECTRALEMISS)
+DO JBAND = 1,YRADIATION%YRERAD%NLWEMISS
+  DO JLON = KIDIA,KFDIA
+    ! Spectral longwave emissivity
+    SINGLE_LEVEL%LW_EMISSIVITY(JLON,JBAND)  = PSPECTRALEMISS(JLON,JBAND)
+  ENDDO
+ENDDO  
+!$OMP TARGET UPDATE TO(SINGLE_LEVEL%LW_EMISSIVITY)
+
+#else
 
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR
@@ -391,7 +513,6 @@ DO JLON = KIDIA,KFDIA
   SINGLE_LEVEL%COS_SZA(JLON)          = PMU0(JLON)
   SINGLE_LEVEL%SKIN_TEMPERATURE(JLON) = PTEMPERATURE_SKIN(JLON)
 ENDDO
-
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JBAND = 1,YRADIATION%YRERAD%NSW
   DO JLON = KIDIA,KFDIA
@@ -407,6 +528,8 @@ DO JBAND = 1,YRADIATION%YRERAD%NLWEMISS
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+
+#endif
 
 ! Create the relevant seed from date and time get the starting day
 ! and number of minutes since start
@@ -428,22 +551,35 @@ ENDDO
 ! ENDDO
 
 ! Simple initialization of the seeds for the Monte Carlo scheme
-call single_level%init_seed_simple(kidia, kfdia, lacc=.true.)
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+call single_level%init_seed_simple(single_level, kidia, kfdia, lacc=.true.)
 
 ! Added for bit-identity validation against ecrad standalone:
 ! Overwrite seed with user-specified values
 if (present(iseed)) then
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Manually copying ISEED to device. This needs to be fixed."
+#endif
+  !$OMP TARGET UPDATE TO(iseed)
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR
   DO JLON = KIDIA,KFDIA
     single_level%iseed(jlon) = iseed(jlon)
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 end if
 
 ! Set the solar spectrum scaling, if required
 IF (YRERAD%NSOLARSPECTRUM == 1) THEN
-  ALLOCATE(SINGLE_LEVEL%SPECTRAL_SOLAR_SCALING(RAD_CONFIG%N_BANDS_SW))
+#ifdef DEBUG
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " has OpenACC code that has not been ported"
+#endif
+  ALLOCATE(SINGLE_LEVEL%SPECTRAL_SOLAR_SCALING(YRADIATION%RAD_CONFIG%N_BANDS_SW))
   ! Ratio of SORCE (Coddington et al. 2016) and Kurucz solar spectra
   SINGLE_LEVEL%SPECTRAL_SOLAR_SCALING &
        &  = (/  1.0, 1.0, 1.0, 1.0478, 1.0404, 1.0317, 1.0231, &
@@ -451,12 +587,26 @@ IF (YRERAD%NSOLARSPECTRUM == 1) THEN
   !$ACC ENTER DATA COPYIN(SINGLE_LEVEL%SPECTRAL_SOLAR_SCALING) ASYNC(1)
 ENDIF
 
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
 #ifdef HAVE_NVTX
 call nvtxEndRange
 call nvtxStartRange("cloud setup")
 #endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("single level setup"//c_null_char)
+roctx_ret = roctxRangePushA("cloud setup"//c_null_char)
+#endif
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Set cloud fields
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JLEV = 1,KLEV
@@ -467,9 +617,19 @@ DO JLEV = 1,KLEV
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Compute effective radii and convert to metres
 IF (PRESENT(PRE_LIQ)) THEN
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Manually copying PRE_LIQ to device. This needs to be fixed."
+#endif
+  !$OMP TARGET UPDATE TO(PRE_LIQ)
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR COLLAPSE(2)
   DO JLEV = 1,KLEV
@@ -478,12 +638,14 @@ IF (PRESENT(PRE_LIQ)) THEN
     ENDDO
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 ELSE
 CALL LIQUID_EFFECTIVE_RADIUS(YRERAD, &
      &  KIDIA, KFDIA, KLON, KLEV, &
      &  PPRESSURE, PTEMPERATURE, PCLOUD_FRAC, PQ_LIQUID, PQ_RAIN, &
      &  PLAND_SEA_MASK, PCCN_LAND, PCCN_SEA, &
      &  ZRE_LIQUID_UM) !, PPERT=PPERT)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JLEV = 1,KLEV
@@ -492,9 +654,20 @@ DO JLEV = 1,KLEV
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 ENDIF
 
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+
 IF (PRESENT(PRE_ICE)) THEN
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Manually copying PRE_ICE to device. This needs to be fixed."
+#endif
+  !$OMP TARGET UPDATE TO(PRE_ICE)
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR COLLAPSE(2)
   DO JLEV = 1,KLEV
@@ -503,10 +676,12 @@ IF (PRESENT(PRE_ICE)) THEN
     ENDDO
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 ELSE
 CALL ICE_EFFECTIVE_RADIUS(YRERAD, KIDIA, KFDIA, KLON, KLEV, &
      &  PPRESSURE, PTEMPERATURE, PCLOUD_FRAC, PQ_ICE, PQ_SNOW, PGEMU, &
      &  ZRE_ICE_UM) !, PPERT=PPERT)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JLEV = 1,KLEV
@@ -515,7 +690,12 @@ DO JLEV = 1,KLEV
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 ENDIF
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Get the cloud overlap decorrelation length (for cloud boundaries),
 ! in km, according to the parameterization specified by NDECOLAT,
@@ -527,26 +707,38 @@ CALL CLOUD_OVERLAP_DECORR_LEN(KIDIA,KFDIA,KLON, &
      &  PDECORR_LEN_EDGES_KM=ZDECORR_LEN_KM) !, PDECORR_LEN_RATIO=ZDECORR_LEN_RATIO)
 
 ! Compute cloud overlap parameter from decorrelation length
-!RAD_CONFIG%CLOUD_INHOM_DECORR_SCALING = ZDECORR_LEN_RATIO
+!YRADIATION%RAD_CONFIG%CLOUD_INHOM_DECORR_SCALING = ZDECORR_LEN_RATIO
 ! DO JLON = KIDIA,KFDIA
 !   CALL YLCLOUD%SET_OVERLAP_PARAM(THERMODYNAMICS,&
 !       &                       ZDECORR_LEN_KM(JLON)*1000.0_JPRB,&
 !       &                       ISTARTCOL=JLON, IENDCOL=JLON)
 ! ENDDO
 ! Or we can call the routine on all columns at once
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR
 DO JLON = KIDIA,KFDIA
   ZDECORR_LEN_KM(JLON) = 1000.0_JPRB*ZDECORR_LEN_KM(JLON)
 ENDDO
 !$ACC END PARALLEL
-  CALL YLCLOUD%SET_OVERLAP_PARAM(THERMODYNAMICS,&
-    &                       ZDECORR_LEN_KM,&
-    &                       ISTARTCOL=KIDIA, IENDCOL=KFDIA, LACC=.TRUE.)
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+CALL YLCLOUD%SET_OVERLAP_PARAM(YLCLOUD, THERMODYNAMICS,&
+     &                       ZDECORR_LEN_KM,&
+     &                       ISTARTCOL=KIDIA, IENDCOL=KFDIA, LACC=.TRUE.)
 
 ! Added for bit-identity validation against ecrad standalone:
 ! Overwrite overlap param with provided value
 if(present(PCLOUD_OVERLAP)) then
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Manually copying PCLOUD_OVERLAP to device. This needs to be fixed."
+#endif
+  !$OMP TARGET UPDATE TO(PCLOUD_OVERLAP)
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR COLLAPSE(2)
   DO JLEV = 1,KLEV-1
@@ -555,16 +747,27 @@ if(present(PCLOUD_OVERLAP)) then
     ENDDO
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 endif
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Cloud water content fractional standard deviation is configurable
 ! from namelist NAERAD but must be globally constant. Before it was
 ! hard coded at 1.0.
-CALL YLCLOUD%CREATE_FRACTIONAL_STD(KLON, KLEV, YRERAD%RCLOUD_FRAC_STD, LACC=.TRUE.)
+CALL YLCLOUD%CREATE_FRACTIONAL_STD(YLCLOUD, KLON, KLEV, YRERAD%RCLOUD_FRAC_STD, LACC=.TRUE.)
 
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-IF (         RAD_CONFIG%I_SOLVER_LW == ISOLVERSPARTACUS &
-     &  .OR. RAD_CONFIG%I_SOLVER_SW == ISOLVERSPARTACUS) THEN
+IF (         YRADIATION%RAD_CONFIG%I_SOLVER_LW == ISOLVERSPARTACUS &
+     &  .OR. YRADIATION%RAD_CONFIG%I_SOLVER_SW == ISOLVERSPARTACUS) THEN
+#ifdef DEBUG
+  write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
   ! We are using the SPARTACUS solver so need to specify cloud scale,
   ! and use Mark Fielding's parameterization based on ARM data
   CALL YLCLOUD%PARAM_CLOUD_EFFECTIVE_SEPARATION_ETA(KLON, KLEV, &
@@ -573,13 +776,30 @@ IF (         RAD_CONFIG%I_SOLVER_LW == ISOLVERSPARTACUS &
        &  KIDIA, KFDIA)
 ENDIF
 
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
 ! Compute the dry mass of each layer neglecting humidity effects, in
 ! kg m-2, needed to scale some of the aerosol inputs
-CALL THERMODYNAMICS%GET_LAYER_MASS(KIDIA,KFDIA,ZLAYER_MASS)
+CALL THERMODYNAMICS%GET_LAYER_MASS(THERMODYNAMICS, KIDIA,KFDIA,ZLAYER_MASS)
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
 call nvtxStartRange("aerosol setup")
+#endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("cloud setup"//c_null_char)
+roctx_ret = roctxRangePushA("aerosol setup"//c_null_char)
+#endif
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
 #endif
 
 ! Copy over aerosol mass mixing ratio
@@ -591,6 +811,12 @@ IF (YRERAD%NAERMACC == 1) THEN
   ! orientation so we can copy it over directly
   ! AB need to cap the minimum mass mixing ratio/AOD to avoid instability
   ! in case of negative values in input
+#ifdef DEBUG_WARNING
+   write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING : Manually copying PAEROSOL, PAEROSOL_OLD to device. This needs to be fixed."
+#endif
+
+  !$OMP TARGET UPDATE TO(PAEROSOL,PAEROSOL_OLD)
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR COLLAPSE(3)
   DO JAER = 1,KAEROSOL
@@ -601,11 +827,13 @@ IF (YRERAD%NAERMACC == 1) THEN
     ENDDO
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
   IF (YRERAD%NAERMACC == 1) THEN
     ! Add the tropospheric and stratospheric backgrounds contained in the
     ! old Tegen arrays - this is very ugly!
     IF (TROP_BG_AER_MASS_EXT > 0.0_JPRB) THEN
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
       !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2)
       DO JLEV = 1,KLEV
@@ -617,8 +845,10 @@ IF (YRERAD%NAERMACC == 1) THEN
         ENDDO
       ENDDO
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDIF
     IF (STRAT_BG_AER_MASS_EXT > 0.0_JPRB) THEN
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
       !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2)
       DO JLEV = 1,KLEV
@@ -630,6 +860,7 @@ IF (YRERAD%NAERMACC == 1) THEN
         ENDDO
       ENDDO
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDIF
   ENDIF
 ELSE
@@ -643,6 +874,7 @@ ELSE
   ! need to divide by the layer mass (in kg m-2) to obtain the 550-nm
   ! cross-section per unit mass of dry air (so in m2 kg-1).  We also
   ! need to permute the array.
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
   !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
   !$ACC LOOP GANG VECTOR COLLAPSE(3)
   DO JLEV = 1,KLEV
@@ -655,33 +887,59 @@ ELSE
     ENDDO
   ENDDO
   !$ACC END PARALLEL
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
 ENDIF
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
 call nvtxStartRange("gas setup")
 #endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("aerosol setup"//c_null_char)
+roctx_ret = roctxRangePushA("gas setup"//c_null_char)
+#endif
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Insert gas mixing ratios
-CALL GAS%PUT(IH2O,    IMASSMIXINGRATIO, PQ, LACC=.TRUE.)
-CALL GAS%PUT(ICO2,    IMASSMIXINGRATIO, PCO2, LACC=.TRUE.)
-CALL GAS%PUT(ICH4,    IMASSMIXINGRATIO, PCH4, LACC=.TRUE.)
-CALL GAS%PUT(IN2O,    IMASSMIXINGRATIO, PN2O, LACC=.TRUE.)
-CALL GAS%PUT(ICFC11,  IMASSMIXINGRATIO, PCFC11, LACC=.TRUE.)
-CALL GAS%PUT(ICFC12,  IMASSMIXINGRATIO, PCFC12, LACC=.TRUE.)
-CALL GAS%PUT(IHCFC22, IMASSMIXINGRATIO, PHCFC22, LACC=.TRUE.)
-CALL GAS%PUT(ICCL4,   IMASSMIXINGRATIO, PCCL4, LACC=.TRUE.)
-CALL GAS%PUT(IO3,     IMASSMIXINGRATIO, PO3, LACC=.TRUE.)
-CALL GAS%PUT_WELL_MIXED(IO2, IVOLUMEMIXINGRATIO, 0.20944_JPRB, LACC=.TRUE.)
+CALL GAS%PUT(GAS, IH2O,    IMASSMIXINGRATIO, PQ, LACC=.TRUE.)
+CALL GAS%PUT(GAS, ICO2,    IMASSMIXINGRATIO, PCO2, LACC=.TRUE.)
+CALL GAS%PUT(GAS, ICH4,    IMASSMIXINGRATIO, PCH4, LACC=.TRUE.)
+CALL GAS%PUT(GAS, IN2O,    IMASSMIXINGRATIO, PN2O, LACC=.TRUE.)
+CALL GAS%PUT(GAS, ICFC11,  IMASSMIXINGRATIO, PCFC11, LACC=.TRUE.)
+CALL GAS%PUT(GAS, ICFC12,  IMASSMIXINGRATIO, PCFC12, LACC=.TRUE.)
+CALL GAS%PUT(GAS, IHCFC22, IMASSMIXINGRATIO, PHCFC22, LACC=.TRUE.)
+CALL GAS%PUT(GAS, ICCL4,   IMASSMIXINGRATIO, PCCL4, LACC=.TRUE.)
+CALL GAS%PUT(GAS, IO3,     IMASSMIXINGRATIO, PO3, LACC=.TRUE.)
+CALL GAS%PUT_WELL_MIXED(GAS, IO2, IVOLUMEMIXINGRATIO, 0.20944_JPRB, LACC=.TRUE.)
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! Ensure the units of the gas mixing ratios are what is required by
 ! the gas absorption model
-CALL SET_GAS_UNITS(RAD_CONFIG, GAS, LACC=.TRUE.)
+CALL SET_GAS_UNITS(YRADIATION%RAD_CONFIG, GAS, LACC=.TRUE.)
 !$ACC WAIT(1)
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("gas setup"//c_null_char)
 #endif
 
 !call save_inputs('inputs_ifs.nc', rad_config, single_level, thermodynamics, &
@@ -694,63 +952,90 @@ call nvtxEndRange
 #ifdef HAVE_NVTX
 call nvtxStartRange("radiation")
 #endif
+#ifdef HAVE_ROCTX
+roctx_ret = roctxRangePushA("radiation"//c_null_char)
+#endif
 
-CALL RADIATION(KLON, KLEV, KIDIA, KFDIA, RAD_CONFIG,&
+CALL RADIATION(KLON, KLEV, KIDIA, KFDIA, YRADIATION%RAD_CONFIG,&
      &  SINGLE_LEVEL, THERMODYNAMICS, GAS, YLCLOUD, AEROSOL, FLUX)
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("radiation"//c_null_char)
 #endif
 
 ! Check fluxes are within physical bounds
 IF (YRERAD%NDUMPBADINPUTS /= 0 &
      &  .AND. (N_BAD_FLUXES == 0 .OR. N_BAD_FLUXES < YRERAD%NDUMPBADINPUTS)) THEN
   IF (FLUX%OUT_OF_PHYSICAL_BOUNDS(KIDIA,KFDIA)) THEN
+#ifndef OMPGPU
 !$OMP CRITICAL
+#endif
     N_BAD_FLUXES = N_BAD_FLUXES+1
     WRITE(CL_FILE_NAME, '(A,I0,A,I0,A)') '/home/parr/ifs_dump/bad_inputs_', &
          &  MPL_MYRANK(), '_', N_BAD_FLUXES, '.nc'
     WRITE(NULERR,*) '  Writing ', TRIM(CL_FILE_NAME)
     ! Implicit assumption that KFDIA==KLON
-    CALL SAVE_INPUTS(TRIM(CL_FILE_NAME), RAD_CONFIG, SINGLE_LEVEL, &
+    CALL SAVE_INPUTS(TRIM(CL_FILE_NAME), YRADIATION%RAD_CONFIG, SINGLE_LEVEL, &
          &  THERMODYNAMICS, GAS, YLCLOUD, AEROSOL, &
          &  LAT=ASIN(PGEMU)*180.0/RPI, LON=PGELAM*180.0/RPI, IVERBOSE=3)
     WRITE(CL_FILE_NAME, '(A,I0,A,I0,A)') '/home/parr/ifs_dump/bad_outputs_', &
          &  MPL_MYRANK(), '_', N_BAD_FLUXES, '.nc'
     WRITE(NULERR,*) '  Writing ', TRIM(CL_FILE_NAME)
-    CALL SAVE_FLUXES(TRIM(CL_FILE_NAME), RAD_CONFIG, THERMODYNAMICS, FLUX, IVERBOSE=3)
+    CALL SAVE_FLUXES(TRIM(CL_FILE_NAME), YRADIATION%RAD_CONFIG, THERMODYNAMICS, FLUX, IVERBOSE=3)
     IF (YRERAD%NDUMPBADINPUTS < 0) THEN
       ! Abort on the first set of bad fluxes
       CALL ABOR1("RADIATION_SCHEME: ABORT DUE TO FLUXES OUT OF PHYSICAL BOUNDS")
-    ENDIF
+   ENDIF
+#ifndef OMPGPU
 !$OMP END CRITICAL
+#endif
   ENDIF
 ENDIF
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 ! For debugging, do we store a certain number of inputs and outputs
 ! regardless of whether bad fluxes have been detected?
 IF (N_OUTPUT_FLUXES < YRERAD%NDUMPINPUTS) THEN
+#ifndef OMPGPU
 !$OMP CRITICAL
+#endif
   N_OUTPUT_FLUXES = N_OUTPUT_FLUXES+1
   WRITE(CL_FILE_NAME, '(A,I0,A,I0,A)') '/home/parr/ifs_dump/inputs_', &
        &  MPL_MYRANK(), '_', N_OUTPUT_FLUXES, '.nc'
   WRITE(NULERR,*) '  Writing ', TRIM(CL_FILE_NAME)
   ! Implicit assumption that KFDIA==KLON
-  CALL SAVE_INPUTS(TRIM(CL_FILE_NAME), RAD_CONFIG, SINGLE_LEVEL, &
+  CALL SAVE_INPUTS(TRIM(CL_FILE_NAME), YRADIATION%RAD_CONFIG, SINGLE_LEVEL, &
        &  THERMODYNAMICS, GAS, YLCLOUD, AEROSOL, &
        &  LAT=ASIN(PGEMU)*180.0/RPI, LON=PGELAM*180.0/RPI, IVERBOSE=3)
   WRITE(CL_FILE_NAME, '(A,I0,A,I0,A)') '/home/parr/ifs_dump/outputs_', &
        &  MPL_MYRANK(), '_', N_OUTPUT_FLUXES, '.nc'
   WRITE(NULERR,*) '  Writing ', TRIM(CL_FILE_NAME)
-  CALL SAVE_FLUXES(TRIM(CL_FILE_NAME), RAD_CONFIG, THERMODYNAMICS, FLUX, IVERBOSE=3)
+  CALL SAVE_FLUXES(TRIM(CL_FILE_NAME), YRADIATION%RAD_CONFIG, THERMODYNAMICS, FLUX, IVERBOSE=3)
+#ifndef OMPGPU
 !$OMP END CRITICAL
+#endif
 ENDIF
+
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
 #ifdef HAVE_NVTX
 call nvtxStartRange("compute fluxes")
 #endif
+#ifdef HAVE_ROCTX
+roctx_ret = roctxRangePushA("compute fluxes"//c_null_char)
+#endif
 ! Compute required output fluxes
 ! First the net fluxes
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JLEV=1,KLEV+1
@@ -763,6 +1048,7 @@ DO JLEV=1,KLEV+1
         &  = FLUX%LW_DN_CLEAR(JLON,JLEV) - FLUX%LW_UP_CLEAR(JLON,JLEV)
   ENDDO
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 !PFLUX_SW(KIDIA:KFDIA,:) = FLUX%SW_DN(KIDIA:KFDIA,:) - FLUX%SW_UP(KIDIA:KFDIA,:)
 !PFLUX_LW(KIDIA:KFDIA,:) = FLUX%LW_DN(KIDIA:KFDIA,:) - FLUX%LW_UP(KIDIA:KFDIA,:)
 !PFLUX_SW_CLEAR(KIDIA:KFDIA,:)&
@@ -770,6 +1056,7 @@ ENDDO
 !PFLUX_LW_CLEAR(KIDIA:KFDIA,:)&
 !    &  = FLUX%LW_DN_CLEAR(KIDIA:KFDIA,:) - FLUX%LW_UP_CLEAR(KIDIA:KFDIA,:)
 
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC LOOP GANG VECTOR
 DO JLON=KIDIA,KFDIA
   ! Now the surface fluxes
@@ -823,7 +1110,9 @@ DO JLON=KIDIA,KFDIA
     PEMIS_OUT(JLON) = MAX(0.8_JPRB, MIN(0.99_JPRB, PFLUX_LW(JLON,KLEV+1) / ZBLACK_BODY_NET_LW))
   ENDIF
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(_OPENACC)
 !$ACC LOOP GANG VECTOR COLLAPSE(2)
 DO JLEV=1,KLEV+1
   DO JLON=KIDIA,KFDIA
@@ -840,25 +1129,83 @@ DO JLEV=1,KLEV+1
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+#endif
+#if defined(OMPGPU)
+IF (YRADIATION%YRERAD%LAPPROXLWUPDATE .AND. YRADIATION%YRERAD%LAPPROXSWUPDATE) THEN
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+   DO JLEV=1,KLEV+1
+      DO JLON=KIDIA,KFDIA
+         ! Copy longwave derivatives
+         PLWDERIVATIVE(JLON,JLEV) = FLUX%LW_DERIVATIVES(JLON,JLEV)
+         
+         ! Store the shortwave downwelling fluxes in each albedo band
+         PSWDIFFUSEBAND(JLON,JLEV) = FLUX%SW_DN_DIFFUSE_SURF_CANOPY(JLEV,JLON)
+         PSWDIRECTBAND (JLON,JLEV) = FLUX%SW_DN_DIRECT_SURF_CANOPY (JLEV,JLON)
+      ENDDO
+   ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+ELSEIF (YRADIATION%YRERAD%LAPPROXLWUPDATE) THEN
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+   DO JLEV=1,KLEV+1
+      DO JLON=KIDIA,KFDIA
+         ! Copy longwave derivatives
+         PLWDERIVATIVE(JLON,JLEV) = FLUX%LW_DERIVATIVES(JLON,JLEV)
+      ENDDO
+   ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+ELSEIF (YRADIATION%YRERAD%LAPPROXLWUPDATE) THEN
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+   DO JLEV=1,KLEV+1
+      DO JLON=KIDIA,KFDIA
+         ! Store the shortwave downwelling fluxes in each albedo band
+         PSWDIFFUSEBAND(JLON,JLEV) = FLUX%SW_DN_DIFFUSE_SURF_CANOPY(JLEV,JLON)
+         PSWDIRECTBAND (JLON,JLEV) = FLUX%SW_DN_DIRECT_SURF_CANOPY (JLEV,JLON)
+      ENDDO
+   ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+ENDIF
+#endif
 
-!$ACC END DATA
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
+
+! Write to FIle
+!CALL DEBUG_DUMP(FLUX,KIDIA,KFDIA,IB)
+
 #ifdef HAVE_NVTX
 call nvtxEndRange
 call nvtxStartRange("cleanup")
 #endif
-
-#ifdef _OPENACC
-call rad_config%delete_device()
-call single_level%delete_device()
-call thermodynamics%delete_device()
-call gas%delete_device()
-call aerosol%delete_device()
-call ylcloud%delete_device()
-call flux%delete_device()
-!$ACC END DATA
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("compute fluxes"//c_null_char)
+roctx_ret = roctxRangePushA("cleanup"//c_null_char)
 #endif
 
-!$ACC WAIT(1)
+#if defined(_OPENACC)
+!$ACC END DATA
+#endif
+#if defined(OMPGPU)
+!$OMP TARGET EXIT DATA MAP(DELETE:ZRE_LIQUID_UM, ZRE_ICE_UM, ZDECORR_LEN_KM,ZLAYER_MASS)
+!!$OMP END TARGET DATA
+!!$OMP END TARGET DATA
+#endif
+
+call yradiation%rad_config%delete_device(yradiation%rad_config)
+call single_level%delete_device(single_level)
+call thermodynamics%delete_device(thermodynamics)
+call gas%delete_device(gas)
+call aerosol%delete_device(aerosol)
+call ylcloud%delete_device(ylcloud)
+call flux%delete_device(flux)
+
+#if defined(_OPENACC)
+!$ACC END DATA
+#endif
+#if defined(OMPGPU)
+!$OMP TARGET EXIT DATA MAP(DELETE:yradiation, yradiation%rad_config, single_level, thermodynamics, gas, aerosol, ylcloud, flux)
+#endif
 
 CALL SINGLE_LEVEL%DEALLOCATE
 CALL THERMODYNAMICS%DEALLOCATE
@@ -869,6 +1216,10 @@ CALL FLUX%DEALLOCATE
 
 #ifdef HAVE_NVTX
 call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+CALL roctxRangePop()
+CALL roctxMarkA("cleanup"//c_null_char)
 #endif
 
 END ASSOCIATE

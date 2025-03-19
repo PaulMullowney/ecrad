@@ -20,6 +20,7 @@
 module radiation_thermodynamics
 
   use parkind1, only : jprb
+  use radiation_io, only : nulout
 
   implicit none
   public
@@ -53,17 +54,16 @@ module radiation_thermodynamics
    contains
      procedure :: allocate   => allocate_thermodynamics_arrays
      procedure :: deallocate => deallocate_thermodynamics_arrays
-     procedure :: calc_saturation_wrt_liquid
-     procedure :: get_layer_mass
+     procedure, nopass :: get_layer_mass
      procedure :: get_layer_mass_column
      procedure :: out_of_physical_bounds
-#ifdef _OPENACC
-    procedure :: create_device
-    procedure :: update_host
-    procedure :: update_device
-    procedure :: delete_device
+     procedure, nopass :: calc_saturation_wrt_liquid
+#if defined(_OPENACC)  || defined(OMPGPU)
+     procedure, nopass :: create_device => create_device_thermodynamics
+     procedure, nopass :: update_host   => update_host_thermodynamics
+     procedure, nopass :: update_device => update_device_thermodynamics
+     procedure, nopass :: delete_device => delete_device_thermodynamics
 #endif
-
   end type thermodynamics_type
 
 contains
@@ -155,7 +155,7 @@ contains
 
     use yomhook,  only : lhook, dr_hook, jphook
 
-    class(thermodynamics_type), intent(inout) :: this
+    type(thermodynamics_type), intent(inout)  :: this
     integer, intent(in)                       :: istartcol, iendcol
     logical, optional, intent(in)             :: lacc
 
@@ -182,12 +182,16 @@ contains
 
     ncol = size(this%pressure_hl,1)
     nlev = size(this%pressure_hl,2) - 1
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " has OpenACC code"
+#endif
 
     if (.not. allocated(this%h2o_sat_liq)) then
       ! only required in non blocked mode
       allocate(this%h2o_sat_liq(ncol,nlev))
     endif
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(pressure, temperature, e_sat) IF(llacc)
     !$ACC PARALLEL DEFAULT(NONE) PRESENT(this) ASYNC(1) IF(llacc)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(pressure, temperature, e_sat)
     do jlev = 1,nlev
@@ -201,6 +205,7 @@ contains
        end do
     end do
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     if (lhook) call dr_hook('radiation_thermodynamics:calc_saturation_wrt_liquid',1,hook_handle)
 
@@ -215,7 +220,7 @@ contains
     use yomhook,              only : lhook, dr_hook, jphook
     use radiation_constants,  only : AccelDueToGravity
 
-    class(thermodynamics_type), intent(in)  :: this
+    type(thermodynamics_type),  intent(in)  :: this
     integer,                    intent(in)  :: istartcol, iendcol
     real(jprb),                 intent(out) :: layer_mass(istartcol:iendcol,ubound(this%pressure_hl,2))
 
@@ -229,6 +234,7 @@ contains
     nlev  = ubound(this%pressure_hl,2) - 1
     inv_g = 1.0_jprb / AccelDueToGravity
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
     !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2)
     DO jl=istartcol, iendcol
@@ -240,6 +246,7 @@ contains
       END DO
     END DO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     if (lhook) call dr_hook('radiation_thermodynamics:get_layer_mass',1,hook_handle)
 
@@ -383,99 +390,178 @@ contains
 
   end function out_of_physical_bounds
 
-#ifdef _OPENACC
+#if defined(_OPENACC)  || defined(OMPGPU)
+  !---------------------------------------------------------------------
+  ! debug print
+  subroutine debug_print_thermodynamics(this,FILE,LINE,istartcol,iendcol)
+    use radiation_io,     only : nulout
+    type(thermodynamics_type), intent(in) :: this
+    character, intent(in) :: FILE
+    integer, intent(in) :: LINE
+    integer, intent(in) :: istartcol, iendcol
+    integer :: s1, s2, s3
+
+    !$OMP TARGET UPDATE FROM(this%pressure_hl, this%temperature_hl, this%pressure_fl, this%temperature_fl, this%h2o_sat_liq)
+
+    !$ACC UPDATE HOST(this%temperature_hl) ASYNC(1) IF(allocated(this%temperature_hl))
+    !$ACC UPDATE HOST(this%pressure_hl) ASYNC(1) IF(allocated(this%pressure_hl))
+    !$ACC UPDATE HOST(this%temperature_fl) ASYNC(1) IF(allocated(this%temperature_fl))
+    !$ACC UPDATE HOST(this%pressure_fl) ASYNC(1) IF(allocated(this%pressure_fl))
+    !$ACC UPDATE HOST(this%h2o_sat_liq) ASYNC(1) IF(allocated(this%h2o_sat_liq))
+
+    !$ACC WAIT(1)
+
+    write(nulout,'(a,a,a,i0)')         "    DEVICE ARRAY DEBUG FROM ", FILE, " : LINE = ", LINE
+    write(nulout,'(a,a,a,i0)')         "                         IN ", __FILE__, " : LINE = ", __LINE__
+
+    if (allocated(this%temperature_hl)) then
+       s1 = istartcol
+       s2 = lbound(this%temperature_hl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_hl=", this%temperature_hl(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%temperature_hl,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_hl=", this%temperature_hl(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%temperature_hl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_hl=", this%temperature_hl(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%pressure_hl)) then
+       s1 = istartcol
+       s2 = lbound(this%pressure_hl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_hl=", this%pressure_hl(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%pressure_hl,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_hl=", this%pressure_hl(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%pressure_hl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_hl=", this%pressure_hl(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%temperature_fl)) then
+       s1 = istartcol
+       s2 = lbound(this%temperature_fl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_fl=", this%temperature_fl(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%temperature_fl,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_fl=", this%temperature_fl(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%temperature_fl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%temperature_fl=", this%temperature_fl(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%pressure_fl)) then
+       s1 = istartcol
+       s2 = lbound(this%pressure_fl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_fl=", this%pressure_fl(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%pressure_fl,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_fl=", this%pressure_fl(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%pressure_fl,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%pressure_fl=", this%pressure_fl(s1,s2), " at indices ", s1, " ", s2
+    end if
+    if (allocated(this%h2o_sat_liq)) then
+       s1 = istartcol
+       s2 = lbound(this%h2o_sat_liq,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%h2o_sat_liq=", this%h2o_sat_liq(s1,s2), " at indices ", s1, " ", s2
+       s1 = (iendcol-istartcol)/2
+       s2 = size(this%h2o_sat_liq,2)/2
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%h2o_sat_liq=", this%h2o_sat_liq(s1,s2), " at indices ", s1, " ", s2
+       s1 = iendcol
+       s2 = ubound(this%h2o_sat_liq,2)
+       write(nulout,'(a,g0.5,a,i0,a,i0)') "this%h2o_sat_liq=", this%h2o_sat_liq(s1,s2), " at indices ", s1, " ", s2
+    end if
+  end subroutine debug_print_thermodynamics
 
   !---------------------------------------------------------------------
   ! Creates fields on device
-  subroutine create_device(this)
+  subroutine create_device_thermodynamics(this)
 
-    class(thermodynamics_type), intent(inout) :: this
+    type(thermodynamics_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC ENTER DATA CREATE(this%pressure_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_hl))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%pressure_hl) IF(allocated(this%pressure_hl))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%temperature_hl) IF(allocated(this%temperature_hl))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%pressure_fl) IF(allocated(this%pressure_fl))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%temperature_fl) IF(allocated(this%temperature_fl))
+    !$OMP TARGET ENTER DATA MAP(ALLOC:this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq))
 
-    !$ACC ENTER DATA CREATE(this%temperature_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_hl))
+    !$ACC ENTER DATA CREATE(this%pressure_hl) IF(allocated(this%pressure_hl)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%temperature_hl) IF(allocated(this%temperature_hl)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%pressure_fl) IF(allocated(this%pressure_fl)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
+    !$ACC ENTER DATA CREATE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 
-    !$ACC ENTER DATA CREATE(this%pressure_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_fl))
-
-    !$ACC ENTER DATA CREATE(this%temperature_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_fl))
-
-    !$ACC ENTER DATA CREATE(this%h2o_sat_liq) ASYNC(1) &
-    !$ACC   IF(allocated(this%h2o_sat_liq))
-
-  end subroutine create_device
+  end subroutine create_device_thermodynamics
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host(this)
+  subroutine update_host_thermodynamics(this)
 
-    class(thermodynamics_type), intent(inout) :: this
+    type(thermodynamics_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC UPDATE HOST(this%pressure_hl) &
-    !$ACC   IF(allocated(this%pressure_hl))
+    !$OMP TARGET UPDATE FROM(this%pressure_hl) IF(allocated(this%pressure_hl))
+    !$OMP TARGET UPDATE FROM(this%temperature_hl) IF(allocated(this%temperature_hl))
+    !$OMP TARGET UPDATE FROM(this%pressure_fl) IF(allocated(this%pressure_fl))
+    !$OMP TARGET UPDATE FROM(this%temperature_fl) IF(allocated(this%temperature_fl))
+    !$OMP TARGET UPDATE FROM(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq))
 
-    !$ACC UPDATE HOST(this%temperature_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_hl))
+    !$ACC UPDATE HOST(this%pressure_hl) IF(allocated(this%pressure_hl)) ASYNC(1)
+    !$ACC UPDATE HOST(this%temperature_hl) IF(allocated(this%temperature_hl)) ASYNC(1)
+    !$ACC UPDATE HOST(this%pressure_fl) IF(allocated(this%pressure_fl)) ASYNC(1)
+    !$ACC UPDATE HOST(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
+    !$ACC UPDATE HOST(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 
-    !$ACC UPDATE HOST(this%pressure_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_fl))
-
-    !$ACC UPDATE HOST(this%temperature_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_fl))
-
-    !$ACC UPDATE HOST(this%h2o_sat_liq) ASYNC(1) &
-    !$ACC   IF(allocated(this%h2o_sat_liq))
-
-  end subroutine update_host
+  end subroutine update_host_thermodynamics
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device(this)
+  subroutine update_device_thermodynamics(this)
 
-    class(thermodynamics_type), intent(inout) :: this
+    type(thermodynamics_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC UPDATE DEVICE(this%pressure_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_hl))
+    !$OMP TARGET UPDATE TO(this%pressure_hl) IF(allocated(this%pressure_hl))
+    !$OMP TARGET UPDATE TO(this%temperature_hl) IF(allocated(this%temperature_hl))
+    !$OMP TARGET UPDATE TO(this%pressure_fl) IF(allocated(this%pressure_fl))
+    !$OMP TARGET UPDATE TO(this%temperature_fl) IF(allocated(this%temperature_fl))
+    !$OMP TARGET UPDATE TO(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq))
 
-    !$ACC UPDATE DEVICE(this%temperature_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_hl))
+    !$ACC UPDATE DEVICE(this%pressure_hl) IF(allocated(this%pressure_hl)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%temperature_hl) IF(allocated(this%temperature_hl)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%pressure_fl) IF(allocated(this%pressure_fl)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
+    !$ACC UPDATE DEVICE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 
-    !$ACC UPDATE DEVICE(this%pressure_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_fl))
-
-    !$ACC UPDATE DEVICE(this%temperature_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_fl))
-
-    !$ACC UPDATE DEVICE(this%h2o_sat_liq) ASYNC(1) &
-    !$ACC   IF(allocated(this%h2o_sat_liq))
-
-  end subroutine update_device
+  end subroutine update_device_thermodynamics
 
   !---------------------------------------------------------------------
   ! Deletes fields on device
-  subroutine delete_device(this)
+  subroutine delete_device_thermodynamics(this)
 
-    class(thermodynamics_type), intent(inout) :: this
+    type(thermodynamics_type), intent(inout) :: this
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0)') "    ", __FILE__, " : LINE = ", __LINE__
+#endif
 
-    !$ACC EXIT DATA DELETE(this%pressure_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_hl))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%pressure_hl) IF(allocated(this%pressure_hl))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%temperature_hl) IF(allocated(this%temperature_hl))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%pressure_fl) IF(allocated(this%pressure_fl))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%temperature_fl) IF(allocated(this%temperature_fl))
+    !$OMP TARGET EXIT DATA MAP(DELETE:this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq))
 
-    !$ACC EXIT DATA DELETE(this%temperature_hl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_hl))
+    !$ACC EXIT DATA DELETE(this%pressure_hl) IF(allocated(this%pressure_hl)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%temperature_hl) IF(allocated(this%temperature_hl)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%pressure_fl) IF(allocated(this%pressure_fl)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
+    !$ACC EXIT DATA DELETE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 
-    !$ACC EXIT DATA DELETE(this%pressure_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%pressure_fl))
-
-    !$ACC EXIT DATA DELETE(this%temperature_fl) ASYNC(1) &
-    !$ACC   IF(allocated(this%temperature_fl))
-
-    !$ACC EXIT DATA DELETE(this%h2o_sat_liq) ASYNC(1) &
-    !$ACC   IF(allocated(this%h2o_sat_liq))
-
-  end subroutine delete_device
+  end subroutine delete_device_thermodynamics
 #endif
 
 end module radiation_thermodynamics

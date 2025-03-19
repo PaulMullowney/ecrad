@@ -47,6 +47,8 @@ set( radiation_SOURCES
         radiation_liquid_optics_socrates.F90
         radiation_lw_derivatives.F90
         radiation_matrix.F90
+        radiation_mcica_omp_lw.F90
+        radiation_mcica_omp_sw.F90
         radiation_mcica_acc_lw.F90
         radiation_mcica_acc_sw.F90
         radiation_mcica_lw.F90
@@ -85,6 +87,9 @@ ecbuild_add_library(
         $<${HAVE_OMP}:OpenMP::OpenMP_Fortran>
     PUBLIC_LIBS
         $<${HAVE_ACC}:OpenACC::OpenACC_Fortran>
+        $<${HAVE_NVTX}:${NVTX_TARGET}>
+	$<${HAVE_ROCTX}:${ECRAD_GPU_ROCPROFILER_SDK_LIBRARIES}>
+    PRIVATE_DEFINITIONS ${GPU_OFFLOAD}GPU
 )
 
 # Improve performance via function inlining for NVHPC
