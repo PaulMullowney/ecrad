@@ -84,7 +84,6 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !$OMP             P_SELFFAC, P_SELFFRAC, K_INDSELF, P_FORFAC, P_FORFRAC, &
     !$OMP             K_INDFOR, P_SFLUXZEN, P_TAUG, P_TAUR, PRMU0)
 
-    !$OMP TARGET UPDATE TO(ABSA, ABSB, SELFREFC, FORREFC, SFLUXREFC)
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
