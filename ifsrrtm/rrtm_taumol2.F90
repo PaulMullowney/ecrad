@@ -1,7 +1,7 @@
 !----------------------------------------------------------------------------
 SUBROUTINE RRTM_TAUMOL2 (KIDIA,KFDIA,KLEV,taug,PAVEL,coldry,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,&
- & colh2o,laytrop,selffac,selffrac,indself,fracs)  
+ & colh2o,laytrop,selffac,selffrac,indself,fracs,laytrop_min,laytrop_max)  
 
 !     BAND 2:  250-500 cm-1 (low - H2O; high - H2O)
 
@@ -66,7 +66,7 @@ INTEGER(KIND=JPIM) :: IG, lay
 
 REAL(KIND=JPRB) :: taufor,tauself,corradj,pp
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -76,6 +76,9 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp
     !$OMP TARGET DATA MAP(PRESENT, ALLOC: taug, PAVEL, coldry, P_TAUAERL, fac00, fac01, fac10, &
     !$OMP             fac11, forfrac, forfac, jp, jt, jt1, colh2o, laytrop, &
     !$OMP             selffac, selffrac, indself, indfor, fracs)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
+
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
@@ -112,7 +115,7 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp
       ixc(lay) = icl
     enddo
 #endif
-
+    endif
 
 !     Compute the optical depth by interpolating in ln(pressure) and 
 !     temperature.  Below LAYTROP, the water vapor self-continuum is 
@@ -259,6 +262,7 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp
     ENDIF
 
     !$ACC END DATA
+    !$OMP END TARGET DATA
     !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL2

@@ -1,7 +1,7 @@
 SUBROUTINE RRTM_TAUMOL1 (KIDIA,KFDIA,KLEV,taug,PAVEL,&
  & P_TAUAERL,FAC00,FAC01,FAC10,FAC11,FORFAC,FORFRAC,INDFOR,JP,JT,jt1,&
  & COLH2O,LAYTROP,SELFFAC,SELFFRAC,INDSELF,fracs,MINORFRAC,INDMINOR,&
- & SCALEMINORN2,COLBRD)  
+ & SCALEMINORN2,COLBRD,laytrop_min,laytrop_max)  
 
 !******************************************************************************
 !                                                                             *
@@ -184,7 +184,7 @@ INTEGER(KIND=JPIM) :: INDF,INDM
 INTEGER(KIND=JPIM) :: IG, LAY
 REAL(KIND=JPRB) :: taufor,tauself,corradj,pp,scalen2, taun2
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -196,7 +196,9 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp,scalen2, taun2
     !$OMP             FORFAC, FORFRAC, JP, JT, jt1, COLH2O, LAYTROP, SELFFAC, &
     !$OMP             SELFFRAC, MINORFRAC, INDSELF, fracs, &
     !$OMP             INDFOR, INDMINOR, SCALEMINORN2, COLBRD)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
     
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
@@ -233,7 +235,7 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp,scalen2, taun2
       ixc(lay) = icl
     enddo
 #endif
-
+    endif
 
 ! Minor gas mapping levels:
 !     lower - n2, p = 142.5490 mbar, t = 215.70 k
@@ -415,6 +417,7 @@ REAL(KIND=JPRB) :: taufor,tauself,corradj,pp,scalen2, taun2
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
       !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL1

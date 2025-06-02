@@ -83,7 +83,7 @@ program ecrad_ifs_driver
 
 #include "radiation_scheme.intfb.h"
 
-  integer(kind=int64)    :: count_rate,t(2)
+  integer(kind=int64)    :: count_rate,t(4)
 
   ! The NetCDF file containing the input profiles
   type(netcdf_file)         :: file
@@ -126,7 +126,7 @@ program ecrad_ifs_driver
   character(len=512) :: file_name
   integer            :: istatus ! Result of command_argument_count
 
-  real(kind=jprd) :: total_dt, current_dt
+  real(kind=jprd) :: total_dt, kernel_dt
 
   ! For demonstration of get_sw_weights later on
   ! Ultraviolet weightings
@@ -510,12 +510,12 @@ program ecrad_ifs_driver
     write(nulout,'(a)')  'Performing radiative transfer calculations in new'
   end if
 
-  total_dt=0
-  current_dt=0
-  
   ! Option of repeating calculation multiple time for more accurate
   ! profiling
   do jrepeat = 1,driver_config%nrepeat
+     total_dt=0
+     kernel_dt=0
+  
 #ifdef HAVE_NVTX
     call nvtxStartRange("ecrad_it")
 #endif
@@ -575,6 +575,8 @@ program ecrad_ifs_driver
 !    if (driver_config%do_parallel) then
       ! Run radiation scheme over blocks of columns in parallel
 
+      total_dt=0
+      kernel_dt=0
       do jrl=1,ncol,nproma
         ibeg=jrl
         iend=min(ibeg+nproma-1,ncol)
@@ -623,10 +625,7 @@ program ecrad_ifs_driver
         roctx_ret = roctxRangePushA("copy_to_device"//c_null_char)
 #endif  
 
-        if (jrepeat>driver_config%nwarmup) then
-           current_dt=0
-           call system_clock (count=t(1))
-        endif
+        call system_clock (count=t(1))
 
 #if defined(OMPGPU)
         !$OMP TARGET UPDATE TO(PMU0, PTEMPERATURE_SKIN, &
@@ -671,6 +670,7 @@ program ecrad_ifs_driver
         call roctxMarkA("copy_to_device"//c_null_char)
         roctx_ret = roctxRangePushA("radiation_scheme"//c_null_char)
 #endif  
+        call system_clock (count=t(3))
 
         ! Call the ECRAD radiation scheme
         call radiation_scheme_new &
@@ -715,6 +715,7 @@ program ecrad_ifs_driver
         call roctxMarkA("radiation_scheme"//c_null_char)
         roctx_ret = roctxRangePushA("copy_from_device"//c_null_char)
 #endif  
+        call system_clock (count=t(4))
 
 #if defined(OMPGPU)
         !$OMP TARGET UPDATE FROM(PFLUX_SW, PFLUX_LW, &
@@ -736,13 +737,9 @@ program ecrad_ifs_driver
         !$ACC&  PSWDIFFUSEBAND, PSWDIRECTBAND)
 #endif
 
-        if (jrepeat>driver_config%nwarmup) then
-           call system_clock (count=t(2))
-           current_dt = (t(2)-t(1))/dble(count_rate)
-           total_dt = total_dt + current_dt
-           write(nulout, '(a,g12.5,a)') 'Total time elapsed in radiative transfer: ', current_dt, ' seconds'
-           write(nulout, '(a,i0)') 'Columns/s : ', int((ncol)/(current_dt))
-        endif
+        call system_clock (count=t(2))
+        total_dt = total_dt + (t(2)-t(1))/dble(count_rate)
+        kernel_dt = kernel_dt + (t(4)-t(3))/dble(count_rate)
 
 #ifdef HAVE_NVTX
         call nvtxEndRange
@@ -771,7 +768,14 @@ program ecrad_ifs_driver
 #endif  
 
      end do
-     
+
+     write(nulout, '(a,g12.5,a)') 'time elapsed in radiative transfer: ', &
+          &                         (total_dt), ' seconds'
+     write(nulout, '(a,g12.5,a)') 'time elapsed in radiative transfer kernel: ', &
+          &                         (kernel_dt), ' seconds'
+     write(nulout, '(a,i0)') 'Columns/s : ', int((ncol)/(total_dt))
+     write(nulout, '(a,i0)') 'Columns/s : ', int((ncol)/(kernel_dt))
+
 #if defined(OMPGPU)
      !$OMP TARGET EXIT DATA MAP(DELETE: PMU0, PTEMPERATURE_SKIN, &
      !$OMP& PALBEDO_DIF, PALBEDO_DIR, &
@@ -812,13 +816,6 @@ program ecrad_ifs_driver
 #endif  
 
   end do
-
-  if (driver_config%nrepeat > driver_config%nwarmup) then
-    write(nulout, '(a,g12.5,a)') 'Total time elapsed in radiative transfer: ', total_dt, ' seconds'
-    write(nulout, '(a,g12.5,a)') 'Average time elapsed in radiative transfer: ', &
-      &                         (total_dt)/(driver_config%nrepeat-driver_config%nwarmup), ' seconds'
-    write(nulout, '(a,i0)') 'Columns/s : ', int((ncol*(driver_config%nrepeat-driver_config%nwarmup))/(total_dt))
-  end if
 
   ! --------------------------------------------------------
   ! Section 4c: Copy fluxes from blocked memory data

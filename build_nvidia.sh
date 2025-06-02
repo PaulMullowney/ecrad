@@ -128,11 +128,11 @@ fi
 
 if [[ $cmake == "YES" ]]; then
     if [[ $device == "A100" ]]; then
-	cmake -B build.nv.${hpctk_ver}.Release -S . -DENABLE_BITIDENTITY_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_ACC=ON -DENABLE_OMP=OFF -DENABLE_GPU=ON -DENABLE_NVTX=ON -DENABLE_SINGLE_PRECISION=OFF -DENABLE_DOUBLE_PRECISION=ON -DECBUILD_Fortran_FLAGS="-UDEBUG_CORRECTNESS_RADIATION" -DOpenACC_Fortran_FLAGS="-acc=gpu -gpu=cc80,fastmath" -DCMAKE_C_COMPILER=nvc -DCMAKE_CXX_COMPILER=nvc++ -DCMAKE_Fortran_COMPILER=nvfortran -DNETCDF_ROOT=$HOME/ecmwf/install/netcdf/${hpctk_ver} -Decbuild_ROOT=${ECBUILD_PATH} -Dfiat_ROOT=${FIAT_INSTALL_PATH}/nvhpc-${hpctk_ver}${mpi_ext}/
+	cmake -B build.nv.${hpctk_ver}.Release -S . -DENABLE_BITIDENTITY_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_ACC=ON -DENABLE_OMP=OFF -DENABLE_GPU=ON -DENABLE_NVTX=ON -DENABLE_SINGLE_PRECISION=ON -DENABLE_DOUBLE_PRECISION=ON -DECBUILD_Fortran_FLAGS="-UDEBUG_CORRECTNESS_RADIATION" -DOpenACC_Fortran_FLAGS="-acc=gpu -gpu=cc80,fastmath" -DCMAKE_C_COMPILER=nvc -DCMAKE_CXX_COMPILER=nvc++ -DCMAKE_Fortran_COMPILER=nvfortran -DNETCDF_ROOT=$HOME/ecmwf/install/netcdf/${hpctk_ver} -Decbuild_ROOT=${ECBUILD_PATH} -Dfiat_ROOT=${FIAT_INSTALL_PATH}/nvhpc-${hpctk_ver}${mpi_ext}/
     fi
 
     if [[ $device == "H100" ]]; then
-	cmake -B build.nv.${hpctk_ver}.Release -S . -DENABLE_BITIDENTITY_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_ACC=ON -DENABLE_OMP=OFF -DENABLE_GPU=ON -DENABLE_NVTX=ON -DENABLE_SINGLE_PRECISION=OFF -DENABLE_DOUBLE_PRECISION=ON -DECBUILD_Fortran_FLAGS="-UDEBUG_CORRECTNESS_RADIATION" -DOpenACC_Fortran_FLAGS="-acc=gpu -gpu=cc90,fastmath" -DCMAKE_C_COMPILER=nvc -DCMAKE_CXX_COMPILER=nvc++ -DCMAKE_Fortran_COMPILER=nvfortran -DNETCDF_ROOT=$HOME/ecmwf/install/netcdf/${hpctk_ver} -Decbuild_ROOT=${ECBUILD_PATH} -Dfiat_ROOT=${FIAT_INSTALL_PATH}/nvhpc-${hpctk_ver}${mpi_ext}/
+	cmake -B build.nv.${hpctk_ver}.Release -S . -DENABLE_BITIDENTITY_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_ACC=ON -DENABLE_OMP=OFF -DENABLE_GPU=ON -DENABLE_NVTX=ON -DENABLE_SINGLE_PRECISION=ON -DENABLE_DOUBLE_PRECISION=ON -DECBUILD_Fortran_FLAGS="-UDEBUG_CORRECTNESS_RADIATION" -DOpenACC_Fortran_FLAGS="-acc=gpu -gpu=cc90,fastmath" -DCMAKE_C_COMPILER=nvc -DCMAKE_CXX_COMPILER=nvc++ -DCMAKE_Fortran_COMPILER=nvfortran -DNETCDF_ROOT=$HOME/ecmwf/install/netcdf/${hpctk_ver} -Decbuild_ROOT=${ECBUILD_PATH} -Dfiat_ROOT=${FIAT_INSTALL_PATH}/nvhpc-${hpctk_ver}${mpi_ext}/
     fi
 fi
 cmake --build build.nv.${hpctk_ver}.Release -- -j ${ranks}

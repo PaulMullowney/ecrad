@@ -2,7 +2,7 @@
 SUBROUTINE RRTM_TAUMOL3 (KIDIA,KFDIA,KLEV,taug,&
  & P_TAUAERL,FAC00,FAC01,FAC10,FAC11,FORFAC,FORFRAC,INDFOR,JP,JT,jt1,ONEMINUS,&
  & COLH2O,COLCO2,COLN2O,COLDRY,LAYTROP,SELFFAC,SELFFRAC,INDSELF,FRACS, &
- & RAT_H2OCO2, RAT_H2OCO2_1,MINORFRAC,INDMINOR)  
+ & RAT_H2OCO2, RAT_H2OCO2_1,MINORFRAC,INDMINOR,laytrop_min,laytrop_max)  
 
 !     BAND 3:  500-630 cm-1 (low - H2O,CO2; high - H2O,CO2)
 
@@ -87,7 +87,7 @@ REAL(KIND=JPRB) :: TAUFOR,TAUSELF,N2OM1,N2OM2,ABSN2O,TAU_MAJOR(ng3),TAU_MAJOR1(n
 
 REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -101,7 +101,9 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !$OMP             JT, jt1, COLH2O, COLCO2, COLN2O, COLDRY, LAYTROP, &
     !$OMP             SELFFAC, SELFFRAC, INDSELF, FRACS, RAT_H2OCO2, &
     !$OMP             RAT_H2OCO2_1, INDFOR, FORFRAC, MINORFRAC, INDMINOR)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
@@ -138,7 +140,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
       ixc(lay) = icl
     enddo
 #endif
-
+    endif
 !     Compute the optical depth by interpolating in ln(pressure), 
 !     temperature, and appropriate species.  Below LAYTROP, the water
 !     vapor self-continuum is interpolated (in temperature) separately.  
@@ -762,6 +764,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
       !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL3

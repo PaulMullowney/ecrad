@@ -5,7 +5,7 @@ SUBROUTINE SRTM_TAUMOL27 &
  & P_COLMOL  , P_COLO3,&
  & K_LAYTROP,&
  & P_SFLUXZEN, P_TAUG   , P_TAUR    , PRMU0   &
- & )  
+ & , laytrop_min, laytrop_max)  
 
 !     Written by Eli J. Mlawer, Atmospheric & Environmental Research.
 
@@ -52,7 +52,7 @@ REAL(KIND=JPRB)   ,INTENT(IN)    :: PRMU0(KIDIA:KFDIA)
 !- from PROFDATA             
 !- from SELF             
 INTEGER(KIND=JPIM) :: IG, IND0, IND1, I_LAY, I_LAYSOLFR(KIDIA:KFDIA), I_NLAYERS, IPLON
-INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
 REAL(KIND=JPRB) ::  &
  & Z_TAURAY  
 REAL(KIND=JPRB) :: ZHOOK_HANDLE
@@ -69,6 +69,9 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !$OMP           P_COLMOL, P_COLO3, K_LAYTROP, P_SFLUXZEN, P_TAUG, P_TAUR, &
     !$OMP           PRMU0)
     
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min, laytrop_max)
+    
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
@@ -85,6 +88,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     laytrop_min = MINVAL(k_laytrop(KIDIA:KFDIA))
     laytrop_max = MAXVAL(k_laytrop(KIDIA:KFDIA))
 #endif
+    endif
 
     i_nlayers = klev
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
@@ -194,6 +198,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !$ACC END DATA
 
     !$OMP TARGET EXIT DATA MAP(DELETE: i_laysolfr)
+    !$OMP END TARGET DATA
     !$OMP END TARGET DATA
 
 #ifdef DEBUG

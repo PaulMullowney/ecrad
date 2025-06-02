@@ -2,7 +2,7 @@
 SUBROUTINE RRTM_TAUMOL16 (KIDIA,KFDIA,KLEV,taug,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,oneminus,&
  & colh2o,colch4,laytrop,selffac,selffrac,indself,fracs, &
- & rat_h2och4,rat_h2och4_1)  
+ & rat_h2och4,rat_h2och4_1,laytrop_min,laytrop_max)
 
 !     BAND 16:  2600-3000 cm-1 (low - H2O,CH4; high - nothing)
 
@@ -73,7 +73,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
 & fs1, specmult1, specparm1,speccomb1, &
 & fpl, specmult_planck, specparm_planck,speccomb_planck
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -85,6 +85,9 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
     !$OMP TARGET DATA MAP(PRESENT, ALLOC: taug, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, jt1, &
     !$OMP             colh2o, colch4, laytrop, selffac, selffrac, indself, &
     !$OMP             fracs, rat_h2och4, rat_h2och4_1, indfor, forfac, forfrac)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
+
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
@@ -121,7 +124,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
       ixc(lay) = icl
     enddo
 #endif
-
+    endif
 
       ! P = 387. mb (Level 6)
       refrat_planck_a = chi_mls(1,6)/chi_mls(6,6)
@@ -552,6 +555,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
       !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL16

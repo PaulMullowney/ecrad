@@ -2,7 +2,7 @@
 SUBROUTINE RRTM_TAUMOL13 (KIDIA,KFDIA,KLEV,taug,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,oneminus,&
  & colh2o,coln2o,colco2,colo3,coldry,laytrop,selffac,selffrac,indself,fracs, &
- & rat_h2on2o, rat_h2on2o_1,minorfrac,indminor)  
+ & rat_h2on2o, rat_h2on2o_1,minorfrac,indminor,laytrop_min,laytrop_max)
 
 !     BAND 13:  2080-2250 cm-1 (low - H2O,N2O; high - nothing)
 
@@ -90,7 +90,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,  &
 REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rrtm_gasbas1a
 
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -107,6 +107,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
     !$OMP             selffrac, indself, fracs, rat_h2on2o, rat_h2on2o_1, &
     !$OMP             indfor, forfac, forfrac, minorfrac, indminor)
     !$OMP TARGET ENTER DATA MAP(ALLOC: colco)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
@@ -119,6 +120,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
@@ -155,6 +157,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
       ixc(lay) = icl
     enddo
 #endif
+    endif
  
       ! P = 473.420 mb (Level 5)
       refrat_planck_a = chi_mls(1,5)/chi_mls(4,5)
@@ -672,5 +675,6 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
       !$ACC END DATA
       !$OMP END TARGET DATA
       !$OMP TARGET EXIT DATA MAP(DELETE:colco)
+      !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL13

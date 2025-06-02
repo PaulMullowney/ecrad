@@ -2,7 +2,7 @@
 SUBROUTINE RRTM_TAUMOL15 (KIDIA,KFDIA,KLEV,taug,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,oneminus,&
  & colh2o,colco2,coln2o,laytrop,selffac,selffrac,indself,fracs, &
- & rat_n2oco2, rat_n2oco2_1,minorfrac,indminor,scaleminor,colbrd)  
+ & rat_n2oco2, rat_n2oco2_1,minorfrac,indminor,scaleminor,colbrd,laytrop_min,laytrop_max)
 
 !     BAND 15:  2380-2600 cm-1 (low - N2O,CO2; high - nothing)
 
@@ -78,7 +78,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
 & fmn2, specmult_mn2, specparm_mn2,speccomb_mn2, &
 & fpl, specmult_planck, specparm_planck,speccomb_planck
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -92,6 +92,9 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
     !$OMP             colh2o,  colco2,  coln2o,  laytrop, selffac, selffrac, &
     !$OMP             indself, fracs, rat_n2oco2, rat_n2oco2_1, indfor, forfac, &
     !$OMP             forfrac, minorfrac, indminor, scaleminor, colbrd)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
+
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
@@ -128,7 +131,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
       ixc(lay) = icl
     enddo
 #endif
-
+    endif
       ! Minor gas mapping level :
       !     Lower - Nitrogen Continuum, P = 1053., T = 294.
 
@@ -603,6 +606,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,speccomb,  &
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
       !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL15
