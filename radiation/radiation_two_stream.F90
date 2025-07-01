@@ -52,7 +52,7 @@ module radiation_two_stream
   
   !$omp declare target(calc_no_scattering_transmittance_lw)
   !$omp declare target(calc_no_scattering_transmittance_lw_OMP)
-  !$omp declare target(calc_no_scattering_transmittance_lw_OMP_single_level)
+  !$omp declare target(calc_no_scattering_transmittance_lw_OMP_single_cell)
   !$omp declare target(calc_reflectance_transmittance_sw)
   !$omp declare target(calc_ref_trans_sw)
 
@@ -668,7 +668,6 @@ contains
 
   end subroutine calc_no_scattering_transmittance_lw
 
-
   !---------------------------------------------------------------------
   ! Compute the longwave transmittance to diffuse radiation in the
   ! no-scattering case, as well as the upward flux at the top and the
@@ -746,36 +745,34 @@ contains
 
   end subroutine calc_no_scattering_transmittance_lw_OMP
 
-    !---------------------------------------------------------------------
+  !---------------------------------------------------------------------
   ! Compute the longwave transmittance to diffuse radiation in the
   ! no-scattering case, as well as the upward flux at the top and the
   ! downward flux at the base of the layer due to emission from within
   ! the layer assuming a linear variation of Planck function within
   ! the layer.
-  subroutine calc_no_scattering_transmittance_lw_OMP_single_level(jg, ng, &
-       &    od, planck, transmittance, source_up, source_dn)
+  subroutine calc_no_scattering_transmittance_lw_OMP_single_cell( &
+       &    od, planck_top, planck_bot, transmittance, source_up, source_dn)
 
 #ifdef DO_DR_HOOK_TWO_STREAM
     use yomhook, only : lhook, dr_hook, jphook
 #endif
-
-    integer, intent(in) :: jg, ng
 
     ! Optical depth and single scattering albedo as scalar
     real(jprb), intent(in) :: od
 
     ! The Planck terms (functions of temperature) at the top and
     ! bottom of the layer
-    real(jprb), intent(in), dimension(ng,2) :: planck
+    real(jprb), intent(in) :: planck_top, planck_bot
 
     ! The diffuse transmittance, i.e. the fraction of diffuse
     ! radiation incident on a layer from either top or bottom that is
     ! reflected back or transmitted through
-    real(jprb), intent(out), dimension(ng) :: transmittance
+    real(jprb), intent(out) :: transmittance
 
     ! The upward emission at the top of the layer and the downward
     ! emission at its base, due to emission from within the layer
-    real(jprb), intent(out), dimension(ng) :: source_up, source_dn
+    real(jprb), intent(out) :: source_up, source_dn
 
     real(jprb) :: coeff, coeff_up_top, coeff_up_bot, coeff_dn_top, coeff_dn_bot !, planck_mean
 
@@ -785,39 +782,31 @@ contains
     if (lhook) call dr_hook('radiation_two_stream:calc_no_scattering_transmittance_lw',0,hook_handle)
 #endif
 
-! #ifndef DWD_TWO_STREAM_OPTIMIZATIONS
-!     do jlev = 1, nlev
-!        transmittance = exp(-LwDiffusivityWP*od(jg,jlev))
-!     end do
-! #endif
-
     ! Compute upward and downward emission assuming the Planck
     ! function to vary linearly with optical depth within the layer
     ! (e.g. Wiscombe , JQSRT 1976).
     coeff = LwDiffusivityWP*od
-!#ifdef DWD_TWO_STREAM_OPTIMIZATIONS
-    transmittance(jg) = exp(-coeff)
-!#endif
+    transmittance = exp(-coeff)
     if (od > 1.0e-3_jprb) then
        ! Simplified from calc_reflectance_transmittance_lw above
-       coeff = (planck(jg,2)-planck(jg,1)) / coeff
-       coeff_up_top  =  coeff + planck(jg,1)
-       coeff_up_bot  =  coeff + planck(jg,2)
-       coeff_dn_top  = -coeff + planck(jg,1)
-       coeff_dn_bot  = -coeff + planck(jg,2)
-       source_up(jg) =  coeff_up_top - transmittance(jg) * coeff_up_bot
-       source_dn(jg) =  coeff_dn_bot - transmittance(jg) * coeff_dn_top
+       coeff = (planck_bot-planck_top) / coeff
+       coeff_up_top  =  coeff + planck_top
+       coeff_up_bot  =  coeff + planck_bot
+       coeff_dn_top  = -coeff + planck_top
+       coeff_dn_bot  = -coeff + planck_bot
+       source_up =  coeff_up_top - transmittance * coeff_up_bot
+       source_dn =  coeff_dn_bot - transmittance * coeff_dn_top
     else
        ! Linear limit at low optical depth
-       source_up(jg) = coeff * 0.5_jprb * (planck(jg,1)+planck(jg,2))
-       source_dn(jg) = source_up(jg)
+       source_up = coeff * 0.5_jprb * (planck_top+planck_bot)
+       source_dn = source_up
     end if
 
 #ifdef DO_DR_HOOK_TWO_STREAM
     if (lhook) call dr_hook('radiation_two_stream:calc_no_scattering_transmittance_lw',1,hook_handle)
 #endif
 
-  end subroutine calc_no_scattering_transmittance_lw_OMP_single_level
+  end subroutine calc_no_scattering_transmittance_lw_OMP_single_cell
 
 
   !---------------------------------------------------------------------

@@ -146,8 +146,7 @@ contains
     real(jprb), dimension(config%n_g_sw,nlev,istartcol:iendcol) :: od_scaling
 
     ! Temporary working array
-    real(jprb), dimension(config%n_g_sw,nlev+1,istartcol:iendcol) :: tmp_work_albedo, tmp_work_source
-    real(jprb), dimension(config%n_g_sw,nlev,istartcol:iendcol) :: tmp_work_inv_denominator
+    real(jprb), dimension(config%n_g_sw,nlev+1,istartcol:iendcol) :: tmp_work_source
 
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     ! Local variables : Stack
@@ -196,7 +195,7 @@ contains
     end if
 
     !$OMP TARGET ENTER DATA MAP(ALLOC: ref_clear,  trans_clear, ref_dir_clear, &
-    !$OMP&   od_scaling,tmp_work_albedo, tmp_work_source,tmp_work_inv_denominator, &
+    !$OMP&   od_scaling, tmp_work_source,&
     !$OMP&   ref_dir, trans_dir_diff, trans_dir_dir, reflectance, transmittance)
     !$OMP TARGET ENTER DATA MAP(ALLOC: flux_up, flux_dn_diffuse, flux_dn_direct, &
     !$OMP             flux_up_clear, flux_dn_diffuse_clear, flux_dn_direct_clear, &
@@ -212,8 +211,8 @@ contains
 
     ng = config%n_g_sw
 
-    totalMem = 10*ng * nlev
-    totalMem = totalMem+8*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,tmp_work_albedo,source
+    totalMem = 9*ng * nlev
+    totalMem = totalMem+7*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,source
     totalmem = totalMem*(iendcol-istartcol)*SIZEOF((real(jprb)))/1.e9
     write(nulout,'(a,a,i0,a,g0.5)') __FILE__, " : LINE = ", __LINE__, " total_memory=",totalMem
 
@@ -317,7 +316,7 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) !THREAD_LIMIT(128)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) THREAD_LIMIT(1024)
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Do cloudy-sky calculation
@@ -336,7 +335,7 @@ contains
        enddo
     enddo
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) THREAD_LIMIT(256)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total) THREAD_LIMIT(1024)
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Only perform calculation if sun above the horizon
@@ -378,9 +377,7 @@ contains
                   &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
                   &  ref_clear(:,:,jcol), trans_clear(:,:,jcol), ref_dir_clear(:,:,jcol), trans_dir_diff(:,:,jcol), &
                   &  trans_dir_dir(:,:,jcol), flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), flux_dn_direct(:,:,jcol), &
-                  &  albedo=tmp_work_albedo(:,:,jcol), &
-                  &  source=tmp_work_source(:,:,jcol), &
-                  &  inv_denominator=tmp_work_inv_denominator(:,:,jcol))
+                  &  source=tmp_work_source(:,:,jcol))
 
              ! save temporarily clear-sky broadband fluxes
              do jlev = 1,nlev+1
@@ -448,9 +445,7 @@ contains
                      &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
                      &  reflectance(:,:,jcol), transmittance(:,:,jcol), ref_dir(:,:,jcol), trans_dir_diff(:,:,jcol), &
                      &  trans_dir_dir(:,:,jcol), flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), flux_dn_direct(:,:,jcol), &
-                     &  albedo=tmp_work_albedo(:,:,jcol), &
-                     &  source=tmp_work_source(:,:,jcol), &
-                     &  inv_denominator=tmp_work_inv_denominator(:,:,jcol))
+                     &  source=tmp_work_source(:,:,jcol))
                 
                 ! Likewise for surface spectral fluxes
                 flux%sw_dn_diffuse_surf_g(jg,jcol) = flux_dn_diffuse(jg,nlev+1,jcol)
@@ -487,8 +482,8 @@ contains
 #else
     !$OMP TARGET TEAMS DISTRIBUTE COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(128)
 #endif
-    do jlev = 1, nlev+1
-       do jcol = istartcol,iendcol
+    do jcol = istartcol,iendcol
+       do jlev = 1, nlev+1
 
         ! Only perform calculation if sun above the horizon
         if (single_level%cos_sza(jcol) > 0.0_jprb) then
@@ -602,7 +597,7 @@ contains
     !$OMP             cum_cloud_cover, pair_cloud_cover, cum_product, ibegin, iend)
 
     !$OMP TARGET EXIT DATA MAP(DELETE: ref_clear,  trans_clear, ref_dir_clear, &
-    !$OMP&   od_scaling,tmp_work_albedo, tmp_work_source,tmp_work_inv_denominator, &
+    !$OMP&   od_scaling, tmp_work_source,&
     !$OMP&   ref_dir, trans_dir_diff, trans_dir_dir, reflectance, transmittance)
 
     !$OMP END TARGET DATA

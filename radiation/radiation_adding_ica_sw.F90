@@ -170,7 +170,7 @@ contains
        &  albedo_surf_diffuse, albedo_surf_direct, cos_sza, &
        &  reflectance, transmittance, ref_dir, trans_dir_diff, trans_dir_dir, &
        &  flux_up, flux_dn_diffuse, flux_dn_direct, &
-       &  albedo, source, inv_denominator)
+       &  source)
 
     use parkind1, only           : jprb
     use yomhook,  only           : lhook, dr_hook, jphook
@@ -208,16 +208,9 @@ contains
     real(jprb), intent(out), dimension(ng, nlev+1) :: flux_up, flux_dn_diffuse, &
          &                                              flux_dn_direct
     
-    ! Albedo of the entire earth/atmosphere system below each half
-    ! level
-    real(jprb), intent(out), dimension(ng, nlev+1) :: albedo
-
     ! Upwelling radiation at each half-level due to scattering of the
     ! direct beam below that half-level (W m-2)
     real(jprb), intent(out), dimension(ng, nlev+1) :: source
-
-    ! Equal to 1/(1-albedo*reflectance)
-    real(jprb), intent(out), dimension(ng, nlev)   :: inv_denominator
 
     ! Loop index for model level and column
     integer :: jlev
@@ -229,8 +222,6 @@ contains
     if (lhook) call dr_hook('radiation_adding_ica_sw:adding_ica_sw',0,hook_handle)
 #endif
 
-    !$ACC ROUTINE WORKER
-
     ! Compute profile of direct (unscattered) solar fluxes at each
     ! half-level by working down through the atmosphere
     flux_dn_direct(jg,1) = incoming_toa(jg)
@@ -238,6 +229,7 @@ contains
       flux_dn_direct(jg,jlev+1) = flux_dn_direct(jg,jlev)*trans_dir_dir(jg,jlev)
     end do
 
+    associate(albedo=>flux_up, inv_denominator=>flux_dn_diffuse)
     albedo(jg,nlev+1) = albedo_surf_diffuse(jg)
 
     ! At the surface, the direct solar beam is reflected back into the
@@ -259,15 +251,15 @@ contains
       ! loop.
 
       ! Lacis and Hansen (1974) Eq 33, Shonk & Hogan (2008) Eq 10:
-       inv_denominator(jg,jlev) = 1.0_jprb / (1.0_jprb-albedo(jg,jlev+1)*reflectance(jg,jlev))
+       inv_denominator(jg,jlev+1) = 1.0_jprb / (1.0_jprb-albedo(jg,jlev+1)*reflectance(jg,jlev))
        ! Shonk & Hogan (2008) Eq 9, Petty (2006) Eq 13.81:
        albedo(jg,jlev) = reflectance(jg,jlev) + transmittance(jg,jlev) * transmittance(jg,jlev) &
-            &                                     * albedo(jg,jlev+1) * inv_denominator(jg,jlev)
+            &                                     * albedo(jg,jlev+1) * inv_denominator(jg,jlev+1)
        ! Shonk & Hogan (2008) Eq 11:
        source(jg,jlev) = ref_dir(jg,jlev)*flux_dn_direct(jg,jlev) &
             &  + transmittance(jg,jlev)*(source(jg,jlev+1) &
             &        + albedo(jg,jlev+1)*trans_dir_diff(jg,jlev)*flux_dn_direct(jg,jlev)) &
-            &  * inv_denominator(jg,jlev)
+            &  * inv_denominator(jg,jlev+1)
     end do
 
     ! At top-of-atmosphere there is no diffuse downwelling radiation
@@ -286,7 +278,7 @@ contains
        flux_dn_diffuse(jg,jlev+1) &
             &  = (transmittance(jg,jlev)*flux_dn_diffuse(jg,jlev) &
             &     + reflectance(jg,jlev)*source(jg,jlev+1) &
-            &     + trans_dir_diff(jg,jlev)*flux_dn_direct(jg,jlev)) * inv_denominator(jg,jlev)
+            &     + trans_dir_diff(jg,jlev)*flux_dn_direct(jg,jlev)) * inv_denominator(jg,jlev+1)
        ! Shonk & Hogan (2008) Eq 12:
        flux_up(jg,jlev+1) = albedo(jg,jlev+1)*flux_dn_diffuse(jg,jlev+1) &
             &            + source(jg,jlev+1)
@@ -294,7 +286,7 @@ contains
     end do
 
     flux_dn_direct(jg,nlev+1) = flux_dn_direct(jg,nlev+1)*cos_sza
-
+    end associate
 #if defined (_OPENACC) || defined(OMPGPU)
 #else
     if (lhook) call dr_hook('radiation_adding_ica_sw:adding_ica_sw_omp',1,hook_handle)

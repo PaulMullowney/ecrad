@@ -52,7 +52,7 @@ contains
     use radiation_cloud, only          : cloud_type
     use radiation_flux, only           : flux_type, debug_dump_lw
     use radiation_two_stream, only     : calc_no_scattering_transmittance_lw, calc_ref_trans_acc_lw, calc_ref_trans_lw_OMP_single_level, &
-         &                               calc_no_scattering_transmittance_lw_OMP, calc_no_scattering_transmittance_lw_OMP_single_level
+         &                               calc_no_scattering_transmittance_lw_OMP, calc_no_scattering_transmittance_lw_OMP_single_cell
     use radiation_adding_ica_lw, only  : adding_ica_lw, fast_adding_ica_lw, fast_adding_ica_lw_OMP, &
          &                               calc_fluxes_no_scattering_lw, calc_fluxes_no_scattering_lw_OMP
     
@@ -154,9 +154,7 @@ contains
     real(jprb), dimension(config%n_g_lw,nlev, istartcol:iendcol) :: od_scaling
     
         ! Temporary working array
-    real(jprb), dimension(config%n_g_lw,nlev+1, istartcol:iendcol) :: tmp_work_albedo, &
-      &                                            tmp_work_source
-    real(jprb), dimension(config%n_g_lw,nlev, istartcol:iendcol) :: tmp_work_inv_denominator
+    real(jprb), dimension(config%n_g_lw,nlev+1, istartcol:iendcol) :: tmp_work_source
     real(jprb), dimension(config%n_g_lw, istartcol:iendcol) :: tmp_derivatives
 
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -212,8 +210,8 @@ contains
 
     ng = config%n_g_lw
 
-    totalMem = 7*ng * nlev
-    totalMem = totalMem+6*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,tmp_work_albedo,source
+    totalMem = 6*ng * nlev
+    totalMem = totalMem+5*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,source
     totalmem = totalMem*(iendcol-istartcol)*SIZEOF((real(jprb)))/1.e9
     write(nulout,'(a,a,i0,a,g0.5)') __FILE__, " : LINE = ", __LINE__, " total_memory=",totalMem
 
@@ -229,8 +227,8 @@ contains
     !
 
     !$OMP TARGET ENTER DATA MAP(ALLOC: trans_clear, od_scaling, &
-    !$OMP   reflectance, transmittance, source_up, source_dn, tmp_work_albedo, tmp_work_source, &
-    !$OMP   tmp_work_inv_denominator, tmp_derivatives)
+    !$OMP   reflectance, transmittance, source_up, source_dn, tmp_work_source, &
+    !$OMP   tmp_derivatives)
 
 
 #ifdef DEBUG
@@ -351,7 +349,7 @@ contains
     !
     ! This kernel does band independent computations. Some computation is done across veritical levels
     !
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) !THREAD_LIMIT(128)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) THREAD_LIMIT(1024)
     do jcol = istartcol,iendcol
        do jg = 1, ng
           call cloud_generator_OMP(jg, ng, nlev, &
@@ -369,12 +367,10 @@ contains
        enddo
     enddo
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total) !THREAD_LIMIT(192)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total) THREAD_LIMIT(1024)
     do jcol = istartcol,iendcol
-       !!$OMP PARALLEL DO
        do jg = 1, ng
           ! Clear-sky calculation
-          
           ! Non-scattering case: use simpler functions for
           ! transmission and emission
           call calc_no_scattering_transmittance_lw_OMP(jg, ng, nlev, od(:,:,jcol), &
@@ -386,7 +382,7 @@ contains
                &  trans_clear(:,:,jcol), source_up(:,:,jcol), source_dn(:,:,jcol), &
                &  emission(:,jcol), albedo(:,jcol), &
                &  flux_up_clear(:,:,jcol), flux_dn_clear(:,:,jcol))
-          
+
           ! Store surface spectral downwelling fluxes
           flux%lw_dn_surf_clear_g(jg,jcol) = flux_dn_clear(jg,nlev+1,jcol)
           ! Do cloudy-sky calculation; add a prime number to the seed in
@@ -435,9 +431,9 @@ contains
                    else
                       ! No-scattering case: use simpler functions for
                       ! transmission and emission
-                      call calc_no_scattering_transmittance_lw_OMP_single_level(jg, ng, od_total, &
-                           &  planck_hl(:,jlev:jlev+1,jcol), transmittance(:,jlev,jcol), &
-                           &  source_up(:,jlev,jcol), source_dn(:,jlev,jcol))                      
+                      call calc_no_scattering_transmittance_lw_OMP_single_cell(od_total, &
+                           &  planck_hl(jg,jlev,jcol), planck_hl(jg,jlev+1,jcol), transmittance(jg,jlev,jcol), &
+                           &  source_up(jg,jlev,jcol), source_dn(jg,jlev,jcol))
                    end if
 
                 else
@@ -455,9 +451,7 @@ contains
                      &  emission(:,jcol), albedo(:,jcol), &
                      &  is_clear_sky_layer(:,jcol), i_cloud_top, flux_dn_clear(:,:,jcol), &
                      &  flux_up(:,:,jcol), flux_dn(:,:,jcol), &
-                     &  albedo=tmp_work_albedo(:,:,jcol), &
-                     &  source=tmp_work_source(:,:,jcol), &
-                     &  inv_denominator=tmp_work_inv_denominator(:,:,jcol))
+                     &  source=tmp_work_source(:,:,jcol))
              else
                 ! Simpler down-then-up method to compute fluxes
                 call calc_fluxes_no_scattering_lw_OMP(jg, ng, nlev, &
@@ -479,7 +473,7 @@ contains
        end do
        !!$OMP END PARALLEL DO
     end do
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !
     ! Separate out the derivative computation, which has reductions across spectral bands
@@ -521,8 +515,8 @@ contains
 #else
     !$OMP TARGET TEAMS DISTRIBUTE COLLAPSE(2) PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(128)
 #endif
-    do jlev = 1,nlev+1
-       do jcol = istartcol,iendcol
+    do jcol = istartcol,iendcol
+       do jlev = 1,nlev+1
 
         sum_up_clr = 0._jprb
         sum_dn_clr = 0._jprb
@@ -907,8 +901,8 @@ contains
     write(nulout,'(a)') "*******************************************************************"
 #endif
     !$OMP TARGET EXIT DATA MAP(DELETE: trans_clear, od_scaling, &
-    !$OMP   reflectance, transmittance, source_up, source_dn, tmp_work_albedo, tmp_work_source, &
-    !$OMP   tmp_work_inv_denominator, tmp_derivatives)
+    !$OMP   reflectance, transmittance, source_up, source_dn, tmp_work_source, &
+    !$OMP   tmp_derivatives)
 
     !$OMP TARGET EXIT DATA MAP(DELETE: flux_up, flux_dn, flux_up_clear, flux_dn_clear, &
     !$OMP             is_clear_sky_layer, &

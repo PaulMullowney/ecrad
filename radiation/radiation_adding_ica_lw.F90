@@ -292,7 +292,7 @@ contains
   subroutine fast_adding_ica_lw_OMP(jg, ng, nlev, &
        &  reflectance, transmittance, source_up, source_dn, emission_surf, albedo_surf, &
        &  is_clear_sky_layer, i_cloud_top, flux_dn_clear, &
-       &  flux_up, flux_dn, albedo, source, inv_denominator)
+       &  flux_up, flux_dn, source)
 
     use parkind1, only           : jprb
     use yomhook,  only           : lhook, dr_hook, jphook
@@ -326,36 +326,26 @@ contains
     ! downwelling
     real(jprb), intent(out), dimension(ng, nlev+1) :: flux_up, flux_dn
     
-    ! Albedo of the entire earth/atmosphere system below each half
-    ! level
-    real(jprb), intent(out), dimension(ng, nlev+1) :: albedo
-
     ! Upwelling radiation at each half-level due to emission below
     ! that half-level (W m-2)
     real(jprb), intent(out), dimension(ng, nlev+1) :: source
-
-    ! Equal to 1/(1-albedo*reflectance)
-    real(jprb), intent(out), dimension(ng, nlev)   :: inv_denominator
 
     ! Loop index for model level and column
     integer :: jlev
 
     real(jphook) :: hook_handle
 
-    !$ACC ROUTINE WORKER 
-
 #if defined(_OPENACC) || defined(OMPGPU)
 #else
     if (lhook) call dr_hook('radiation_adding_ica_lw:fast_adding_ica_lw',0,hook_handle)
 #endif
 
-    ! Copy over downwelling fluxes above cloud from clear sky
-    flux_dn(:,1:i_cloud_top) = flux_dn_clear(:,1:i_cloud_top)
+    associate(albedo=>flux_up, inv_denominator=>flux_dn)
 
-    albedo(:,nlev+1) = albedo_surf
+    albedo(jg,nlev+1) = albedo_surf(jg)
     
     ! At the surface, the source is thermal emission
-    source(:,nlev+1) = emission_surf
+    source(jg,nlev+1) = emission_surf(jg)
 
     ! Work back up through the atmosphere and compute the albedo of
     ! the entire earth/atmosphere system below that half-level, and
@@ -371,18 +361,23 @@ contains
       else
          ! Loop over columns; explicit loop seems to be faster
          ! Lacis and Hansen (1974) Eq 33, Shonk & Hogan (2008) Eq 10:
-         inv_denominator(jg,jlev) = 1.0_jprb &
+         inv_denominator(jg,jlev+1) = 1.0_jprb &
               &  / (1.0_jprb-albedo(jg,jlev+1)*reflectance(jg,jlev))
          ! Shonk & Hogan (2008) Eq 9, Petty (2006) Eq 13.81:
          albedo(jg,jlev) = reflectance(jg,jlev) + transmittance(jg,jlev)*transmittance(jg,jlev) &
-              &  * albedo(jg,jlev+1) * inv_denominator(jg,jlev)
+              &  * albedo(jg,jlev+1) * inv_denominator(jg,jlev+1)
          ! Shonk & Hogan (2008) Eq 11:
          source(jg,jlev) = source_up(jg,jlev) &
               &  + transmittance(jg,jlev) * (source(jg,jlev+1) &
               &                    + albedo(jg,jlev+1)*source_dn(jg,jlev)) &
-              &                   * inv_denominator(jg,jlev)
+              &                   * inv_denominator(jg,jlev+1)
       end if
     end do
+
+    ! Copy over downwelling fluxes above cloud from clear sky
+    do jlev = 1,i_cloud_top
+       flux_dn(jg,jlev) = flux_dn_clear(jg,jlev)
+    enddo
 
     ! Compute the fluxes above the highest cloud
     flux_up(jg,i_cloud_top) = source(jg,i_cloud_top) &
@@ -404,12 +399,13 @@ contains
          flux_dn(jg,jlev+1) &
               &  = (transmittance(jg,jlev)*flux_dn(jg,jlev) &
               &     + reflectance(jg,jlev)*source(jg,jlev+1) &
-              &     + source_dn(jg,jlev)) * inv_denominator(jg,jlev)
+              &     + source_dn(jg,jlev)) * inv_denominator(jg,jlev+1)
          ! Shonk & Hogan (2008) Eq 12:
          flux_up(jg,jlev+1) = albedo(jg,jlev+1)*flux_dn(jg,jlev+1) &
               &               + source(jg,jlev+1)
       end if
    end do
+   end associate
 
 #if defined(_OPENACC) || defined(OMPGPU)
 #else
