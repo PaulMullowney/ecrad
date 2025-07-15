@@ -95,6 +95,7 @@ INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
 !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
     if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
+       write(*,*) "HERE"
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
@@ -152,7 +153,7 @@ INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_planck, ind0, ind1, inds, indf, js, js1, &
       !$OMP   jpl, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, fac211, p, &
       !$OMP   p4, fk0, fk1, fk2, fs, specmult, specparm, fs1, specmult1, specparm1, fpl, specmult_PLANCK, &
-      !$OMP   specparm_PLANCK, tau_major, tau_major1, taufor, tauself) !THREAD_LIMIT(64)
+      !$OMP   specparm_PLANCK, tau_major, tau_major1, taufor, tauself) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_planck, ind0, ind1, inds, indf, js, js1, &

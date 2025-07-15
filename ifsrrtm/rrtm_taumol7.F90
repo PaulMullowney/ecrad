@@ -157,7 +157,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm,  &
       !$OMP   inds, indf, indm, js, js1, jpl, jmco2, chi_co2, ratco2, adjfac, adjcolco2, fac000, fac100, fac200, &
       !$OMP   fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, fac211, p, p4, fk0, fk1, fk2, fs, &
       !$OMP   specmult, specparm, fs1, specmult1, specparm1, fpl, specmult_PLANCK, specparm_PLANCK, fmco2, &
-      !$OMP   specmult_mco2, specparm_mco2, tau_major, tau_major1, taufor, tauself, co2m1, co2m2, absco2) !THREAD_LIMIT(64)
+      !$OMP   specmult_mco2, specparm_mco2, tau_major, tau_major1, taufor, tauself, co2m1, co2m2, absco2) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_mco2, speccomb_planck, ind0, ind1, &

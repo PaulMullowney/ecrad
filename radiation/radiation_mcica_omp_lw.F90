@@ -349,7 +349,7 @@ contains
     !
     ! This kernel does band independent computations. Some computation is done across veritical levels
     !
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) THREAD_LIMIT(1024)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024) 
     do jcol = istartcol,iendcol
        do jg = 1, ng
           call cloud_generator_OMP(jg, ng, nlev, &
@@ -367,7 +367,7 @@ contains
        enddo
     enddo
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total) THREAD_LIMIT(1024)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total, scat_od, jcol, jg, jlev, i_cloud_top) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024) 
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Clear-sky calculation

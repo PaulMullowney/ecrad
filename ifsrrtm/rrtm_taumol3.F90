@@ -104,6 +104,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
     !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
     if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
+       write(*,*) "HERE"
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
@@ -167,7 +168,7 @@ REAL(KIND=JPRB) :: ZHOOK_HANDLE
       !$OMP   js1, fs1, speccomb_mn2o, specparm_mn2o, specmult_mn2o, jmn2o, fmn2o, chi_n2o, ratn2o, adjfac, adjcoln2o, &
       !$OMP   speccomb_planck, specparm_planck, specmult_planck, jpl, fpl, ind0, ind1, inds, indf, indm, p, p4, fk0, &
       !$OMP   fk1, fk2, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, &
-      !$OMP   fac211, tau_major, tau_major1, tauself, taufor, n2om1, n2om2, absn2o) !THREAD_LIMIT(64)
+      !$OMP   fac211, tau_major, tau_major1, tauself, taufor, n2om1, n2om2, absn2o) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, specmult1, &

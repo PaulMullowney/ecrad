@@ -167,7 +167,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_mo3, speccomb_planck, ind0, ind1, inds, &
       !$OMP   indf, indm, js, js1, jpl, jmo3, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, &
       !$OMP   fac011, fac111, fac211, p, p4, fk0, fk1, fk2, fs, specmult, specparm, fs1, specmult1, specparm1, &
-      !$OMP   fpl, specmult_PLANCK, specparm_PLANCK, fmo3, specmult_MO3, specparm_MO3, tau_major, tau_major1, taufor,tauself, o3m1, o3m2, abso3) !THREAD_LIMIT(64)
+      !$OMP   fpl, specmult_PLANCK, specparm_PLANCK, fmo3, specmult_MO3, specparm_MO3, tau_major, tau_major1, taufor,tauself, o3m1, o3m2, abso3) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_mo3, speccomb_planck, ind0, ind1, inds, &

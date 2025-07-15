@@ -827,8 +827,20 @@ contains
           end if
         end do
       else
-        ! G points have not been reordered
+         ! G points have not been reordered
+#if defined(OMPGPU)
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+        do jlev = 1,nlev
+          do jcol = istartcol,iendcol
+            do jg = 1,config%n_g_sw
+              ! Check for negative optical depth
+              od_sw (jg,nlev+1-jlev,jcol) = max(config%min_gas_od_sw, ZOD_SW(jcol,jlev,jg))
+              ssa_sw(jg,nlev+1-jlev,jcol) = ZSSA_SW(jcol,jlev,jg)
+            end do
+          end do
+        end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR TILE(4,1,32)
         do jcol = istartcol,iendcol
@@ -841,8 +853,7 @@ contains
           end do
         end do
         !$ACC END PARALLEL
-        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
+#endif
         if (present(incoming_sw)) then
            !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)

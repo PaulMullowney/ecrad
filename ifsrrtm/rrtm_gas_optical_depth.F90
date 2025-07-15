@@ -122,8 +122,7 @@ ASSOCIATE(NFLEVG=>KLEV)
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
     laytrop_max = -HUGE(laytrop_max)
-    !!$OMP TARGET ENTER DATA MAP(TO: laytrop_min, laytrop_max)
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max) MAP(TOFROM: laytrop_min, laytrop_max)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
     do jc = KIDIA,KFDIA
@@ -253,7 +252,17 @@ write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " This ha
 !INDEX_RHS = JLON + (JI-1)*N1 + (JLEV-1)*N1*N2
 !INDEX_LHS = (JLON-1)*N2*N3 + JI + (JLEV-1)*N2
 
+#if defined(OMPGPU)
 !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+DO JLEV = 1, KLEV
+  DO JLON = KIDIA, KFDIA
+    DO JI = 1, JPGPT
+      POD(JI,JLEV,JLON) = ZTAU(JLON,JI,JLEV)
+    ENDDO
+  ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
 !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
 !$ACC LOOP GANG VECTOR TILE(1,8,32)
 DO JLEV = 1, KLEV
@@ -265,7 +274,7 @@ DO JLEV = 1, KLEV
   ENDDO
 ENDDO
 !$ACC END PARALLEL
-!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 !     -----------------------------------------------------------------
 
 !$ACC WAIT

@@ -316,7 +316,7 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) THREAD_LIMIT(1024)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024) 
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Do cloudy-sky calculation
@@ -335,7 +335,7 @@ contains
        enddo
     enddo
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total) THREAD_LIMIT(1024)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, gamma1, gamma2, gamma3, od_cloud_new, od_total, ssa_total, g_total, scat_od, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024) 
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Only perform calculation if sun above the horizon

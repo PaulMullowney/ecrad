@@ -160,7 +160,7 @@ REAL(KIND=JPRB) :: taufor,tauself,n2om1,n2om2,absn2o,tau_major(ng9),tau_major1(n
       !$OMP   speccomb1, speccomb_mn2o, speccomb_planck, fs, specmult, specparm, fs1, specmult1, specparm1, fmn2o, &
       !$OMP   specmult_mn2o, specparm_mn2o, fpl, specmult_planck, specparm_planck, adjfac, adjcoln2o, ratn2o, &
       !$OMP   chi_n2o, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, &
-      !$OMP   fac211, p, p4, fk0, fk1, fk2, tau_major, tau_major1, taufor, tauself, n2om1, n2om2, absn2o) !THREAD_LIMIT(64)
+      !$OMP   fac211, p, p4, fk0, fk1, fk2, tau_major, tau_major1, taufor, tauself, n2om1, n2om2, absn2o) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, indm, js, js1, jmn2o, jpl, speccomb, & 
