@@ -114,6 +114,9 @@ module radiation_random_numbers
 
   end type rng_type
 
+  !$omp declare target(initialize_acc)
+  !$omp declare target(uniform_distribution_acc)
+
 contains
 
   !---------------------------------------------------------------------

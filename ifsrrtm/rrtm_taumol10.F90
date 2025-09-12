@@ -1,7 +1,7 @@
 !*******************************************************************************
 SUBROUTINE RRTM_TAUMOL10 (KIDIA,KFDIA,KLEV,taug,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,&
- & colh2o,laytrop,selffac,selffrac,indself,fracs)
+ & colh2o,laytrop,selffac,selffrac,indself,fracs,laytrop_min,laytrop_max)
 
 !     BAND 10:  1390-1480 cm-1 (low - H2O; high - H2O)
 
@@ -56,15 +56,32 @@ INTEGER(KIND=JPIM) :: inds,indf
 INTEGER(KIND=JPIM) :: IG, lay
 REAL(KIND=JPRB) :: taufor,tauself
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
     !$ACC DATA PRESENT(taug, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, jt1, &
     !$ACC             colh2o, laytrop, fracs, selffac, selffrac, indself, &
     !$ACC             indfor, forfrac, forfac)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: taug, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, jt1, &
+    !$OMP             colh2o, laytrop, fracs, selffac, selffrac, indself, &
+    !$OMP             indfor, forfrac, forfac)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
-#ifndef _OPENACC
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
+#if defined(_OPENACC) || defined(OMPGPU)
+    laytrop_min = HUGE(laytrop_min) 
+    laytrop_max = -HUGE(laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    do jc = KIDIA,KFDIA
+      laytrop_min = MIN(laytrop_min, laytrop(jc))
+      laytrop_max = MAX(laytrop_max, laytrop(jc))
+    end do
+    !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     laytrop_min = MINVAL(laytrop)
     laytrop_max = MAXVAL(laytrop)
 
@@ -87,22 +104,11 @@ REAL(KIND=JPRB) :: taufor,tauself
       enddo
       ixc(lay) = icl
     enddo
-#else
-    laytrop_min = HUGE(laytrop_min)
-    laytrop_max = -HUGE(laytrop_max)
-    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
-    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
-    do jc = KIDIA,KFDIA
-      laytrop_min = MIN(laytrop_min, laytrop(jc))
-      laytrop_max = MAX(laytrop_max, laytrop(jc))
-    end do
-    !$ACC END PARALLEL
 #endif
-
-!     Compute the optical depth by interpolating in ln(pressure) and
-!     temperature.
+    endif
 
       ! Lower atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, tauself, taufor)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf)
@@ -132,8 +138,10 @@ REAL(KIND=JPRB) :: taufor,tauself
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ! Upper atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, indf, taufor)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, indf)
       do lay = laytrop_max+1, KLEV
@@ -159,14 +167,16 @@ REAL(KIND=JPRB) :: taufor,tauself
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       IF (laytrop_max /= laytrop_min) THEN
         ! Mixed loop
         ! Lower atmosphere part
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, tauself, taufor)
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf)
         do lay = laytrop_min+1, laytrop_max
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
           do jl = KIDIA, KFDIA
             if ( lay <= laytrop(jl) ) then
 #else
@@ -195,7 +205,7 @@ REAL(KIND=JPRB) :: taufor,tauself
                   + tauself + taufor
               fracs(jl,ngs9+ig,lay) = fracrefa(ig)
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
          else
 #else
           enddo
@@ -223,16 +233,19 @@ REAL(KIND=JPRB) :: taufor,tauself
                   + taufor
               fracs(jl,ngs9+ig,lay) = fracrefb(ig)
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
            endif
 #endif
           enddo
 
         enddo
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ENDIF
 
       !$ACC END DATA
+      !$OMP END TARGET DATA
+      !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL10

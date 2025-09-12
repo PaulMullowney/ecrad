@@ -270,6 +270,7 @@ contains
     if (lhook) call dr_hook('radiation_single_level:get_albedos',0,hook_handle)
 
     !$ACC DATA CREATE(sw_albedo_band, lw_albedo_band) ASYNC(1)
+    !$OMP TARGET ENTER DATA MAP(ALLOC: sw_albedo_band, lw_albedo_band)
 
     if (config%do_sw) then
       ! Albedos/emissivities are stored in single_level in their own
@@ -294,6 +295,7 @@ contains
           call radiation_abort()
         end if
 
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP SEQ
         do jband = 1,config%n_bands_sw
@@ -302,31 +304,51 @@ contains
             sw_albedo_band(jcol,jband) = 0.0_jprb
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+        !!$OMP TARGET DATA MAP(PRESENT, ALLOC: config, sw_albedo_band, this%sw_albedo, config%sw_albedo_weights)
+        do jalbedoband = 1,nalbedoband
+           !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+           do jband = 1,config%n_bands_sw
+              do jcol = istartcol,iendcol
+                sw_albedo_band(jcol,jband) &
+                     &  = sw_albedo_band(jcol,jband) &
+                     &  + config%sw_albedo_weights(jalbedoband,jband) &
+                     &    * this%sw_albedo(jcol, jalbedoband)
+             end do
+          end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        end do
+        !!$OMP END TARGET DATA
+#else
         !$ACC LOOP SEQ
         do jband = 1,config%n_bands_sw
           !$ACC LOOP SEQ
           do jalbedoband = 1,nalbedoband
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
             if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
 #endif
+
               !$ACC LOOP GANG(STATIC:1) VECTOR
               do jcol = istartcol,iendcol
                 sw_albedo_band(jcol,jband) &
                     &  = sw_albedo_band(jcol,jband) &
                     &  + config%sw_albedo_weights(jalbedoband,jband) &
                     &    * this%sw_albedo(jcol, jalbedoband)
-              end do
-#ifndef _OPENACC
+              end do              
+              
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
             end if
 #endif
           end do
         end do
-
-#ifndef _OPENACC
-        sw_albedo_diffuse = transpose(sw_albedo_band(istartcol:iendcol, &
-             &                              config%i_band_from_reordered_g_sw))
-#else
+#endif
+        
+#if defined(OMPGPU) || defined(_OPENACC)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC LOOP GANG(STATIC:1) VECTOR
         do jcol = istartcol,iendcol
           !$ACC LOOP SEQ
@@ -335,8 +357,14 @@ contains
                 &                             config%i_band_from_reordered_g_sw(jg))
           end do
         end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        sw_albedo_diffuse = transpose(sw_albedo_band(istartcol:iendcol, &
+             &                              config%i_band_from_reordered_g_sw))
 #endif
+
         if (allocated(this%sw_albedo_direct)) then
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           !$ACC LOOP SEQ
           do jband = 1,config%n_bands_sw
             !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -344,12 +372,28 @@ contains
               sw_albedo_band(jcol,jband) = 0.0_jprb
             end do
           end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+          do jalbedoband = 1,nalbedoband
+             !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+             do jband = 1,config%n_bands_sw
+                do jcol = istartcol,iendcol
+                   sw_albedo_band(jcol,jband) &
+                        &  = sw_albedo_band(jcol,jband) &
+                        &  + config%sw_albedo_weights(jalbedoband,jband) &
+                      &    * this%sw_albedo_direct(jcol, jalbedoband)
+                end do
+             end do
+             !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+          end do
+#else
           !$ACC LOOP SEQ
           do jband = 1,config%n_bands_sw
             !$ACC LOOP SEQ
             do jalbedoband = 1,nalbedoband
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
               if (config%sw_albedo_weights(jalbedoband,jband) /= 0.0_jprb) then
 #endif
                 !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -359,25 +403,31 @@ contains
                       &  + config%sw_albedo_weights(jalbedoband,jband) &
                       &    * this%sw_albedo_direct(jcol, jalbedoband)
                 end do
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
               end if
 #endif
             end do
           end do
-#ifndef _OPENACC
+#endif
+          
+#if defined(OMPGPU) || defined(_OPENACC)
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+          !$ACC LOOP GANG(STATIC:1) VECTOR
+          do jcol = istartcol,iendcol
+            !$ACC LOOP SEQ
+            do jg = 1,config%n_g_sw
+              sw_albedo_direct(jg,jcol) = sw_albedo_band(jcol, &
+                  &                         config%i_band_from_reordered_g_sw(jg))
+            end do
+          end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
           sw_albedo_direct = transpose(sw_albedo_band(istartcol:iendcol, &
                &                             config%i_band_from_reordered_g_sw))
-#else
-        !$ACC LOOP GANG(STATIC:1) VECTOR
-        do jcol = istartcol,iendcol
-          !$ACC LOOP SEQ
-          do jg = 1,config%n_g_sw
-            sw_albedo_direct(jg,jcol) = sw_albedo_band(jcol, &
-                &                         config%i_band_from_reordered_g_sw(jg))
-          end do
-        end do
 #endif
         else
+          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           !$ACC LOOP GANG(STATIC:1) VECTOR
           do jcol = istartcol,iendcol
             !$ACC LOOP SEQ
@@ -385,8 +435,9 @@ contains
               sw_albedo_direct(jg,jcol) = sw_albedo_diffuse(jg,jcol)
             end do
           end do
+          !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
         end if
-      !$ACC END PARALLEL
+        !$ACC END PARALLEL
       else
         ! Albedos mapped less accurately to ecRad spectral bands
         if (maxval(config%i_albedo_from_band_sw) > size(this%sw_albedo,2)) then
@@ -448,11 +499,9 @@ contains
           write(nulerr,'(a,i0,a)') '*** Error: single_level%lw_emissivity has fewer than required ', &
                &  maxval(config%i_emiss_from_band_lw), ' bands'
           call radiation_abort()
-        end if
-#ifndef _OPENACC
-        lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol, &
-             &  config%i_emiss_from_band_lw(config%i_band_from_reordered_g_lw)))
-#else
+       end if
+#if defined(_OPENACC) || defined(OMPGPU)
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
@@ -462,12 +511,17 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+        lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol, &
+             &  config%i_emiss_from_band_lw(config%i_band_from_reordered_g_lw)))
 #endif
       end if
     end if
 
     !$ACC WAIT
     !$ACC END DATA
+    !$OMP TARGET EXIT DATA MAP(DELETE: sw_albedo_band, lw_albedo_band)
 
     if (lhook) call dr_hook('radiation_single_level:get_albedos',1,hook_handle)
 

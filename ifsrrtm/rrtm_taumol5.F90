@@ -2,7 +2,7 @@
 SUBROUTINE RRTM_TAUMOL5 (KIDIA,KFDIA,KLEV,taug,wx,&
  & P_TAUAERL,fac00,fac01,fac10,fac11,forfac,forfrac,indfor,jp,jt,jt1,oneminus,&
  & colh2o,colco2, colo3,laytrop,selffac,selffrac,indself,fracs, &
- & rat_h2oco2, rat_h2oco2_1, rat_o3co2, rat_o3co2_1,minorfrac,indminor)
+ & rat_h2oco2, rat_h2oco2_1, rat_o3co2, rat_o3co2_1,minorfrac,indminor,laytrop_min,laytrop_max)  
 
 !     BAND 5:  700-820 cm-1 (low - H2O,CO2; high - O3,CO2)
 
@@ -85,7 +85,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
 & fpl, specmult_PLANCK, specparm_PLANCK, &
 & fmo3, specmult_MO3, specparm_MO3
     !     local integer arrays
-    INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
+    INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
     INTEGER(KIND=JPIM) :: ich, icl, ixc0, ixp, jc, jl
 
@@ -95,8 +95,26 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
     !$ACC             jt1, colh2o, colco2, colo3, laytrop, selffac, selffrac, &
     !$ACC             indself, fracs, rat_h2oco2, rat_h2oco2_1, rat_o3co2, &
     !$ACC             rat_o3co2_1, indfor, forfrac, forfac, minorfrac, indminor)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC:taug, wx, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, &
+    !$OMP             jt1, colh2o, colco2, colo3, laytrop, selffac, selffrac, &
+    !$OMP             indself, fracs, rat_h2oco2, rat_h2oco2_1, rat_o3co2, &
+    !$OMP             rat_o3co2_1, indfor, forfrac, forfac, minorfrac, indminor)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
-#ifndef _OPENACC
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
+#if defined(_OPENACC) || defined(OMPGPU)
+    laytrop_min = HUGE(laytrop_min) 
+    laytrop_max = -HUGE(laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
+    do jc = KIDIA,KFDIA
+      laytrop_min = MIN(laytrop_min, laytrop(jc))
+      laytrop_max = MAX(laytrop_max, laytrop(jc))
+    end do
+    !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO 
+#else
     laytrop_min = MINVAL(laytrop)
     laytrop_max = MAXVAL(laytrop)
 
@@ -119,18 +137,8 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
       enddo
       ixc(lay) = icl
     enddo
-#else
-    laytrop_min = HUGE(laytrop_min)
-    laytrop_max = -HUGE(laytrop_max)
-    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
-    !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
-    do jc = KIDIA,KFDIA
-      laytrop_min = MIN(laytrop_min, laytrop(jc))
-      laytrop_max = MAX(laytrop_max, laytrop(jc))
-    end do
-    !$ACC END PARALLEL
 #endif
-
+    endif
 ! Minor gas mapping level :
 !     lower - o3, p = 317.34 mbar, t = 240.77 k
 !     lower - ccl4
@@ -155,6 +163,10 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
       ! interpolated (in temperature) separately.
 
       ! Lower atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_mo3, speccomb_planck, ind0, ind1, inds, &
+      !$OMP   indf, indm, js, js1, jpl, jmo3, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, &
+      !$OMP   fac011, fac111, fac211, p, p4, fk0, fk1, fk2, fs, specmult, specparm, fs1, specmult1, specparm1, &
+      !$OMP   fpl, specmult_PLANCK, specparm_PLANCK, fmo3, specmult_MO3, specparm_MO3, tau_major, tau_major1, taufor,tauself, o3m1, o3m2, abso3) THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb,speccomb1, speccomb_mo3, speccomb_planck, ind0, ind1, inds, &
@@ -260,60 +272,61 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
             fac211 = 0._JPRB
           endif
 
+          do ig=1, ng5
           if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG5)
-            tau_major(1:ng5) = speccomb *    &
-             (fac000 * absa(ind0,1:ng5)    + &
-              fac100 * absa(ind0+1,1:ng5)  + &
-              fac200 * absa(ind0+2,1:ng5)  + &
-              fac010 * absa(ind0+9,1:ng5)  + &
-              fac110 * absa(ind0+10,1:ng5) + &
-              fac210 * absa(ind0+11,1:ng5))
+            tau_major(ig) = speccomb *    &
+             (fac000 * absa(ind0,ig)    + &
+              fac100 * absa(ind0+1,ig)  + &
+              fac200 * absa(ind0+2,ig)  + &
+              fac010 * absa(ind0+9,ig)  + &
+              fac110 * absa(ind0+10,ig) + &
+              fac210 * absa(ind0+11,ig))
           else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG5)
-            tau_major(1:ng5) = speccomb *   &
-             (fac200 * absa(ind0-1,1:ng5) + &
-              fac100 * absa(ind0,1:ng5)   + &
-              fac000 * absa(ind0+1,1:ng5) + &
-              fac210 * absa(ind0+8,1:ng5) + &
-              fac110 * absa(ind0+9,1:ng5) + &
-              fac010 * absa(ind0+10,1:ng5))
+            tau_major(ig) = speccomb *   &
+             (fac200 * absa(ind0-1,ig) + &
+              fac100 * absa(ind0,ig)   + &
+              fac000 * absa(ind0+1,ig) + &
+              fac210 * absa(ind0+8,ig) + &
+              fac110 * absa(ind0+9,ig) + &
+              fac010 * absa(ind0+10,ig))
           else
 !$NEC unroll(NG5)
-            tau_major(1:ng5) = speccomb *   &
-             (fac000 * absa(ind0,1:ng5)   + &
-              fac100 * absa(ind0+1,1:ng5) + &
-              fac010 * absa(ind0+9,1:ng5) + &
-              fac110 * absa(ind0+10,1:ng5))
+            tau_major(ig) = speccomb *   &
+             (fac000 * absa(ind0,ig)   + &
+              fac100 * absa(ind0+1,ig) + &
+              fac010 * absa(ind0+9,ig) + &
+              fac110 * absa(ind0+10,ig))
           endif
 
           if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG5)
-            tau_major1(1:ng5) = speccomb1 *  &
-             (fac001 * absa(ind1,1:ng5)    + &
-              fac101 * absa(ind1+1,1:ng5)  + &
-              fac201 * absa(ind1+2,1:ng5)  + &
-              fac011 * absa(ind1+9,1:ng5)  + &
-              fac111 * absa(ind1+10,1:ng5) + &
-              fac211 * absa(ind1+11,1:ng5))
+            tau_major1(ig) = speccomb1 *  &
+             (fac001 * absa(ind1,ig)    + &
+              fac101 * absa(ind1+1,ig)  + &
+              fac201 * absa(ind1+2,ig)  + &
+              fac011 * absa(ind1+9,ig)  + &
+              fac111 * absa(ind1+10,ig) + &
+              fac211 * absa(ind1+11,ig))
           else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG5)
-            tau_major1(1:ng5) = speccomb1 * &
-             (fac201 * absa(ind1-1,1:ng5) + &
-              fac101 * absa(ind1,1:ng5)   + &
-              fac001 * absa(ind1+1,1:ng5) + &
-              fac211 * absa(ind1+8,1:ng5) + &
-              fac111 * absa(ind1+9,1:ng5) + &
-              fac011 * absa(ind1+10,1:ng5))
+            tau_major1(ig) = speccomb1 * &
+             (fac201 * absa(ind1-1,ig) + &
+              fac101 * absa(ind1,ig)   + &
+              fac001 * absa(ind1+1,ig) + &
+              fac211 * absa(ind1+8,ig) + &
+              fac111 * absa(ind1+9,ig) + &
+              fac011 * absa(ind1+10,ig))
           else
 !$NEC unroll(NG5)
-            tau_major1(1:ng5) = speccomb1 * &
-             (fac001 * absa(ind1,1:ng5)   + &
-              fac101 * absa(ind1+1,1:ng5) + &
-              fac011 * absa(ind1+9,1:ng5) + &
-              fac111 * absa(ind1+10,1:ng5))
+            tau_major1(ig) = speccomb1 * &
+             (fac001 * absa(ind1,ig)   + &
+              fac101 * absa(ind1+1,ig) + &
+              fac011 * absa(ind1+9,ig) + &
+              fac111 * absa(ind1+10,ig))
           endif
-
+          enddo
           !$ACC LOOP SEQ PRIVATE(taufor,tauself, o3m1, o3m2, abso3)
 !$NEC unroll(NG5)
           do ig = 1, ng5
@@ -338,8 +351,12 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ! Upper atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_planck, ind0, ind1, indf, indm, js, &
+      !$OMP   js1, jpl, fac000, fac100, fac010, fac110, fac001, fac101, fac011, fac111, fs, specmult, specparm, fs1, &
+      !$OMP   specmult1, specparm1, fpl, specmult_PLANCK, specparm_PLANCK)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_planck, ind0, ind1, indf, indm, js, &
       !$ACC   js1, jpl, fac000, fac100, fac010, fac110, fac001, fac101, fac011, fac111, fs, specmult, specparm, fs1, &
@@ -397,17 +414,22 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       IF (laytrop_max /= laytrop_min) THEN
         ! Mixed loop
         ! Lower atmosphere part
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
+        !$OMP   specmult1, js1, fs1, speccomb_mo3, specparm_mo3, specmult_mo3, jmo3, fmo3, speccomb_planck, &
+        !$OMP   specparm_planck, specmult_planck, jpl, fpl, ind0, ind1, inds, indf, indm, p, p4, fk0, fac000, fac100, &
+        !$OMP   fac010, fac110, fac001, fac101, fac011, fac111, fac200, fac201, fac210, fac211, tau_major, tau_major1, tauself, taufor, o3m1, o3m2, abso3)
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
         !$ACC   specmult1, js1, fs1, speccomb_mo3, specparm_mo3, specmult_mo3, jmo3, fmo3, speccomb_planck, &
         !$ACC   specparm_planck, specmult_planck, jpl, fpl, ind0, ind1, inds, indf, indm, p, p4, fk0, fac000, fac100, &
         !$ACC   fac010, fac110, fac001, fac101, fac011, fac111, fac200, fac201, fac210, fac211, tau_major, tau_major1)
         do lay = laytrop_min+1, laytrop_max
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
           do jl = KIDIA, KFDIA
             if ( lay <= laytrop(jl) ) then
 #else
@@ -515,59 +537,61 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
               fac211 = 0._JPRB
             endif
 
+            do ig=1, ng5
             if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG5)
-              tau_major(1:ng5) = speccomb *    &
-              (fac000 * absa(ind0,1:ng5)    + &
-                fac100 * absa(ind0+1,1:ng5)  + &
-                fac200 * absa(ind0+2,1:ng5)  + &
-                fac010 * absa(ind0+9,1:ng5)  + &
-                fac110 * absa(ind0+10,1:ng5) + &
-                fac210 * absa(ind0+11,1:ng5))
+              tau_major(ig) = speccomb *    &
+              (fac000 * absa(ind0,ig)    + &
+                fac100 * absa(ind0+1,ig)  + &
+                fac200 * absa(ind0+2,ig)  + &
+                fac010 * absa(ind0+9,ig)  + &
+                fac110 * absa(ind0+10,ig) + &
+                fac210 * absa(ind0+11,ig))
             else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG5)
-              tau_major(1:ng5) = speccomb *   &
-              (fac200 * absa(ind0-1,1:ng5) + &
-                fac100 * absa(ind0,1:ng5)   + &
-                fac000 * absa(ind0+1,1:ng5) + &
-                fac210 * absa(ind0+8,1:ng5) + &
-                fac110 * absa(ind0+9,1:ng5) + &
-                fac010 * absa(ind0+10,1:ng5))
+              tau_major(ig) = speccomb *   &
+              (fac200 * absa(ind0-1,ig) + &
+                fac100 * absa(ind0,ig)   + &
+                fac000 * absa(ind0+1,ig) + &
+                fac210 * absa(ind0+8,ig) + &
+                fac110 * absa(ind0+9,ig) + &
+                fac010 * absa(ind0+10,ig))
             else
 !$NEC unroll(NG5)
-              tau_major(1:ng5) = speccomb *   &
-              (fac000 * absa(ind0,1:ng5)   + &
-                fac100 * absa(ind0+1,1:ng5) + &
-                fac010 * absa(ind0+9,1:ng5) + &
-                fac110 * absa(ind0+10,1:ng5))
+              tau_major(ig) = speccomb *   &
+              (fac000 * absa(ind0,ig)   + &
+                fac100 * absa(ind0+1,ig) + &
+                fac010 * absa(ind0+9,ig) + &
+                fac110 * absa(ind0+10,ig))
             endif
 
             if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG5)
-              tau_major1(1:ng5) = speccomb1 *  &
-              (fac001 * absa(ind1,1:ng5)    + &
-                fac101 * absa(ind1+1,1:ng5)  + &
-                fac201 * absa(ind1+2,1:ng5)  + &
-                fac011 * absa(ind1+9,1:ng5)  + &
-                fac111 * absa(ind1+10,1:ng5) + &
-                fac211 * absa(ind1+11,1:ng5))
+              tau_major1(ig) = speccomb1 *  &
+              (fac001 * absa(ind1,ig)    + &
+                fac101 * absa(ind1+1,ig)  + &
+                fac201 * absa(ind1+2,ig)  + &
+                fac011 * absa(ind1+9,ig)  + &
+                fac111 * absa(ind1+10,ig) + &
+                fac211 * absa(ind1+11,ig))
             else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG5)
-              tau_major1(1:ng5) = speccomb1 * &
-              (fac201 * absa(ind1-1,1:ng5) + &
-                fac101 * absa(ind1,1:ng5)   + &
-                fac001 * absa(ind1+1,1:ng5) + &
-                fac211 * absa(ind1+8,1:ng5) + &
-                fac111 * absa(ind1+9,1:ng5) + &
-                fac011 * absa(ind1+10,1:ng5))
+              tau_major1(ig) = speccomb1 * &
+              (fac201 * absa(ind1-1,ig) + &
+                fac101 * absa(ind1,ig)   + &
+                fac001 * absa(ind1+1,ig) + &
+                fac211 * absa(ind1+8,ig) + &
+                fac111 * absa(ind1+9,ig) + &
+                fac011 * absa(ind1+10,ig))
             else
 !$NEC unroll(NG5)
-              tau_major1(1:ng5) = speccomb1 * &
-              (fac001 * absa(ind1,1:ng5)   + &
-                fac101 * absa(ind1+1,1:ng5) + &
-                fac011 * absa(ind1+9,1:ng5) + &
-                fac111 * absa(ind1+10,1:ng5))
-            endif
+              tau_major1(ig) = speccomb1 * &
+              (fac001 * absa(ind1,ig)   + &
+                fac101 * absa(ind1+1,ig) + &
+                fac011 * absa(ind1+9,ig) + &
+                fac111 * absa(ind1+10,ig))
+           endif
+           enddo
 
 !$NEC unroll(NG5)
             !$ACC LOOP SEQ PRIVATE(tauself, taufor, o3m1, o3m2, abso3)
@@ -589,7 +613,7 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
               fracs(jl,ngs4+ig,lay) = fracrefa(ig,jpl) + fpl * &
                   (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
          else
 #else
           enddo
@@ -647,16 +671,19 @@ REAL(KIND=JPRB) :: fs, specmult, specparm, &
               fracs(jl,ngs4+ig,lay) = fracrefb(ig,jpl) + fpl * &
                   (fracrefb(ig,jpl+1)-fracrefb(ig,jpl))
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
            endif
 #endif
           enddo
 
         enddo
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     END IF
 
     !$ACC END DATA
+    !$OMP END TARGET DATA
+    !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL5

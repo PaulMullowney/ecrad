@@ -4,8 +4,8 @@ SUBROUTINE SRTM_TAUMOL29 &
  & K_JP      , K_JT     , K_JT1,&
  & P_COLH2O  , P_COLCO2 , P_COLMOL,&
  & K_LAYTROP , P_SELFFAC, P_SELFFRAC, K_INDSELF  , P_FORFAC, P_FORFRAC, K_INDFOR,&
- & P_SFLUXZEN, P_TAUG   , P_TAUR    , PRMU0   &
- & )
+ & P_SFLUXZEN, P_TAUG   , P_TAUR    , PRMU0,   &
+ & laytrop_min, laytrop_max)  
 
 !     Written by Eli J. Mlawer, Atmospheric & Environmental Research.
 
@@ -24,6 +24,7 @@ USE YOESRTM  , ONLY : NG29
 USE YOESRTA29, ONLY : ABSA, ABSB, FORREFC, SELFREFC, SFLUXREFC, &
  & ABSH2OC, ABSCO2C, RAYL, LAYREFFR
 USE YOESRTWN , ONLY : NSPA, NSPB
+use radiation_io, only : nulout
 
 IMPLICIT NONE
 
@@ -47,10 +48,10 @@ INTEGER(KIND=JPIM),INTENT(IN)    :: K_INDSELF(KIDIA:KFDIA,KLEV)
 REAL(KIND=JPRB)   ,INTENT(IN)    :: P_FORFAC(KIDIA:KFDIA,KLEV)
 REAL(KIND=JPRB)   ,INTENT(IN)    :: P_FORFRAC(KIDIA:KFDIA,KLEV)
 INTEGER(KIND=JPIM),INTENT(IN)    :: K_INDFOR(KIDIA:KFDIA,KLEV)
-INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max
-REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_SFLUXZEN(KIDIA:KFDIA,JPG)
-REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_TAUG(KIDIA:KFDIA,KLEV,JPG)
-REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_TAUR(KIDIA:KFDIA,KLEV,JPG)
+INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
+REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_SFLUXZEN(KIDIA:KFDIA,JPG) 
+REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_TAUG(KIDIA:KFDIA,KLEV,JPG) 
+REAL(KIND=JPRB)   ,INTENT(INOUT) :: P_TAUR(KIDIA:KFDIA,KLEV,JPG) 
 REAL(KIND=JPRB)   ,INTENT(IN)    :: PRMU0(KIDIA:KFDIA)
 !- from INTFAC
 !- from INTIND
@@ -63,17 +64,27 @@ INTEGER(KIND=JPIM) :: IG, IND0, IND1, INDS, INDF, I_LAY, I_LAYSOLFR(KIDIA:KFDIA)
 REAL(KIND=JPRB) ::  &
  & Z_TAURAY
 
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Begin"
+#endif
     !$ACC DATA CREATE(i_laysolfr) &
     !$ACC     PRESENT(P_FAC00, P_FAC01, P_FAC10, P_FAC11, K_JP, K_JT, K_JT1, &
     !$ACC             P_COLH2O, P_COLCO2, P_COLMOL, K_LAYTROP, P_SELFFAC, &
     !$ACC             P_SELFFRAC, K_INDSELF, P_FORFAC, P_FORFRAC, K_INDFOR, &
     !$ACC             P_SFLUXZEN, P_TAUG, P_TAUR, PRMU0)
-#ifndef _OPENACC
-    laytrop_min = MINVAL(k_laytrop(KIDIA:KFDIA))
-    laytrop_max = MAXVAL(k_laytrop(KIDIA:KFDIA))
-#else
-    laytrop_min = HUGE(laytrop_min)
+    !$OMP TARGET ENTER DATA MAP(ALLOC: i_laysolfr)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC:P_FAC00, P_FAC01, P_FAC10, P_FAC11, K_JP, K_JT, K_JT1, &
+    !$OMP             P_COLH2O, P_COLCO2, P_COLMOL, K_LAYTROP, P_SELFFAC, &
+    !$OMP             P_SELFFRAC, K_INDSELF, P_FORFAC, P_FORFRAC, K_INDFOR, &
+    !$OMP             P_SFLUXZEN, P_TAUG, P_TAUR, PRMU0)
+    
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min, laytrop_max)
+    
+    if (.not. present(laytrop_min) .and. .not. present(laytrop_max)) then
+#if defined(_OPENACC) || defined(OMPGPU)
+    laytrop_min = HUGE(laytrop_min) 
     laytrop_max = -HUGE(laytrop_max)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR REDUCTION(min:laytrop_min) REDUCTION(max:laytrop_max)
     do iplon = KIDIA,KFDIA
@@ -81,16 +92,24 @@ REAL(KIND=JPRB) ::  &
       laytrop_max = MAX(laytrop_max, k_laytrop(iplon))
     end do
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
+    laytrop_min = MINVAL(k_laytrop(KIDIA:KFDIA))
+    laytrop_max = MAXVAL(k_laytrop(KIDIA:KFDIA))
 #endif
+    endif
 
     i_nlayers = klev
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR
     DO iplon = KIDIA,KFDIA
       i_laysolfr(iplon) = i_nlayers
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, z_tauray)
     !$ACC WAIT
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, z_tauray)
@@ -121,8 +140,9 @@ REAL(KIND=JPRB) ::  &
        ENDDO
     ENDDO
     !$ACC END PARALLEL
-
-
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, z_tauray)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, z_tauray)
     DO i_lay = laytrop_min+1, laytrop_max
@@ -172,9 +192,9 @@ REAL(KIND=JPRB) ::  &
        ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-
-
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
     DO i_lay = laytrop_max+1, i_nlayers
@@ -199,8 +219,17 @@ REAL(KIND=JPRB) ::  &
        ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !$ACC WAIT
     !$ACC END DATA
+
+    !$OMP TARGET EXIT DATA MAP(DELETE: i_laysolfr)
+    !$OMP END TARGET DATA
+    !$OMP END TARGET DATA
+
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Done"
+#endif
 
 END SUBROUTINE SRTM_TAUMOL29
