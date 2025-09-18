@@ -68,7 +68,7 @@ end subroutine delta_eddington_extensive
 
 !---------------------------------------------------------------------
 ! Array version of delta_eddington_extensive, more likely to vectorize
- subroutine delta_eddington_extensive_vec(ng, od, scat_od, scat_od_g)
+subroutine delta_eddington_extensive_vec(ng, od, scat_od, scat_od_g)
 
   !$ACC ROUTINE VECTOR
 
@@ -119,6 +119,34 @@ elemental subroutine delta_eddington_scat_od(od, scat_od, g)
   g       = g / (1.0_jprb + g)
 
 end subroutine delta_eddington_scat_od
+
+!---------------------------------------------------------------------
+! Perform in-place delta-Eddington scaling of the phase function,
+! using the scattering optical depth rather than the single scattering
+! albedo
+subroutine delta_eddington_scat_od_vec(ng, od, scat_od, g)
+
+  use parkind1, only : jprb
+
+  ! Total optical depth, scattering optical depth and asymmetry factor
+  integer,                   intent(in)    :: ng
+  real(jprb), dimension(ng), intent(inout) :: od, scat_od, g
+
+  ! Fraction of the phase function deemed to be in the forward lobe
+  ! and therefore treated as if it is not scattered at all
+  real(jprb) :: f
+
+  !$ACC ROUTINE SEQ
+  integer :: j
+
+  !$ACC LOOP VECTOR PRIVATE(g, f)
+  do j = 1,ng
+     f          = g(j)*g(j)
+     od(j)      = od(j) - scat_od(j) * f
+     scat_od(j) = scat_od(j) * (1.0_jprb - f)
+     g(j)       = g(j) / (1.0_jprb + g(j))
+  enddo
+end subroutine delta_eddington_scat_od_vec
 
 
 !---------------------------------------------------------------------

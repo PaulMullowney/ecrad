@@ -22,6 +22,7 @@ SUBROUTINE SRTM_SETCOEF &
 USE PARKIND1 , ONLY : JPIM, JPRB
 USE YOMHOOK  , ONLY : LHOOK, DR_HOOK, JPHOOK
 USE YOESRTWN , ONLY : PREFLOG, TREF
+use radiation_io, only : nulout
 !!  USE YOESWN  , ONLY : NDBUG
 
 IMPLICIT NONE
@@ -61,6 +62,10 @@ REAL(KIND=JPRB)   ,INTENT(IN)    :: PRMU0(KIDIA:KFDIA)
 
 INTEGER(KIND=JPIM) :: I_NLAYERS, JK, JL, JP1
 
+#if defined(OMPGPU)
+INTEGER(KIND=JPIM) :: KLAYTROP_TMP(KIDIA:KFDIA,KLEV)
+#endif
+
 !-- local reals
 
 REAL(KIND=JPRB) :: Z_STPFAC, Z_PLOG
@@ -68,6 +73,9 @@ REAL(KIND=JPRB) :: Z_FP, Z_FT, Z_FT1, Z_WATER, Z_SCALEFAC
 REAL(KIND=JPRB) :: Z_FACTOR, Z_CO2REG, Z_COMPFP
 !REAL(KIND=JPRB) :: Z_TBNDFRAC, Z_T0FRAC
 REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    integer :: s1, s2
+#endif
 
 
 ASSOCIATE(NFLEVG=>KLEV)
@@ -76,6 +84,20 @@ IF (LHOOK) CALL DR_HOOK('SRTM_SETCOEF',0,ZHOOK_HANDLE)
 Z_STPFAC = 296._JPRB/1013._JPRB
 I_NLAYERS = KLEV
 
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(KLAYTROP,PRMU0)
+    !$ACC UPDATE HOST(KLAYTROP,PRMU0) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = size(KLAYTROP,1)/2
+    write(nulout,'(a,i0,a,i0)') "KLAYTROP=", KLAYTROP(s1), " at indices ", s1
+    s1 = size(PRMU0,1)/2
+    write(nulout,'(a,g0.5,a,i0)') "PRMU0=", PRMU0(s1), " at indices ", s1
+#endif
+
+!$OMP TARGET ENTER DATA MAP(ALLOC: KLAYTROP_TMP)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
 !$ACC PARALLEL DEFAULT(NONE) PRESENT(PAVEL, PTAVEL, PCOLDRY, PWKL, KLAYTROP, PCOLCH4, PCOLCO2, PCOLH2O, PCOLMOL, &
 !$ACC   PCOLO2,PCOLO3, PFORFAC, PFORFRAC, KINDFOR, PSELFFAC, PSELFFRAC, KINDSELF, PFAC00, PFAC01, PFAC10, PFAC11, &
 !$ACC   KJP, KJT,KJT1, PRMU0) ASYNC(1)
@@ -84,15 +106,23 @@ DO JK = 1, KLEV
   !$ACC LOOP GANG(STATIC:1) VECTOR
   DO JL = KIDIA, KFDIA
     PCOLMOL(JL,JK) = 0.0_JPRB
+#if defined(OMPGPU)
+    KLAYTROP_TMP(JL,JK) = 0
+#endif
   ENDDO
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC LOOP GANG(STATIC:1) VECTOR
 DO JL = KIDIA, KFDIA
   IF (PRMU0(JL) > 0.0_JPRB) THEN
     KLAYTROP(JL)  = 0
   ENDIF
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(Z_PLOG, Z_FP, Z_FT, Z_FT1, Z_WATER, Z_SCALEFAC, Z_FACTOR, Z_CO2REG, Z_COMPFP, JP1)
 !$ACC LOOP SEQ
 DO JK = 1, I_NLAYERS
   !$ACC LOOP GANG(STATIC:1) VECTOR &
@@ -144,7 +174,11 @@ DO JK = 1, I_NLAYERS
       !        set of species interpolations.
 
       IF (Z_PLOG <= 4.56_JPRB) GO TO 5300
+#if defined(OMPGPU)
+      KLAYTROP_TMP(JL,JK) =  KLAYTROP_TMP(JL,JK) + 1
+#else
       KLAYTROP(JL) =  KLAYTROP(JL) + 1
+#endif
 
       !        Set up factors needed to separately include the water vapor
       !        foreign-continuum in the calculation of absorption coefficient.
@@ -235,11 +269,93 @@ DO JK = 1, I_NLAYERS
       !      &,FORFAC(LAY),FORFRAC(LAY),INDSELF(LAY),INDFOR(LAY)
 9000  format(1x,2I3,3I4,F6.1,4F7.2,12E9.2,2I5)
       !  ENDIF
-
     ENDIF
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#if defined(OMPGPU)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+DO JL = KIDIA, KFDIA
+   DO JK = 1, KLEV
+     KLAYTROP(JL) = KLAYTROP(JL) + KLAYTROP_TMP(JL,JK)
+  ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
+
+!$OMP TARGET EXIT DATA MAP(DELETE: KLAYTROP_TMP)
+
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(KLAYTROP,KINDFOR,KINDSELF,KJP,KJT,KJT1)
+    !$OMP TARGET UPDATE FROM(PCOLCH4,PCOLCO2,PCOLH2O,PCOLMOL,PCOLO2,PCOLO3,PFORFAC,PFORFRAC,PSELFFAC,PSELFFRAC,PFAC00,PFAC01,PFAC10,PFAC11)
+    !$ACC UPDATE HOST(KLAYTROP,KINDFOR,KINDSELF,KJP,KJT,KJT1) ASYNC(1)
+    !$ACC UPDATE HOST(PCOLCH4,PCOLCO2,PCOLH2O,PCOLMOL,PCOLO2,PCOLO3,PFORFAC,PFORFRAC,PSELFFAC,PSELFFRAC,PFAC00,PFAC01,PFAC10,PFAC11) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = size(KLAYTROP,1)/2
+    write(nulout,'(a,i0,a,i0)') "KLAYTROP=", KLAYTROP(s1), " at indices ", s1
+    s1 = size(KINDFOR,1)/2
+    s2 = size(KINDFOR,2)/2
+    write(nulout,'(a,i0,a,i0,a,i0)') "KINDFOR=", KINDFOR(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(KINDSELF,1)/2
+    s2 = size(KINDSELF,2)/2
+    write(nulout,'(a,i0,a,i0,a,i0)') "KINDSELF=", KINDSELF(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(KJP,1)/2
+    s2 = size(KJP,2)/2
+    write(nulout,'(a,i0,a,i0,a,i0)') "KJP=", KJP(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(KJT,1)/2
+    s2 = size(KJT,2)/2
+    write(nulout,'(a,i0,a,i0,a,i0)') "KJT=", KJT(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(KJT1,1)/2
+    s2 = size(KJT1,2)/2
+    write(nulout,'(a,i0,a,i0,a,i0)') "KJT1=", KJT1(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLCH4,1)/2
+    s2 = size(PCOLCH4,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLCH4=", PCOLCH4(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLCO2,1)/2
+    s2 = size(PCOLCO2,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLCO2=", PCOLCO2(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLH2O,1)/2
+    s2 = size(PCOLH2O,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLH2O=", PCOLH2O(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLMOL,1)/2
+    s2 = size(PCOLMOL,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLMOL=", PCOLMOL(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLO2,1)/2
+    s2 = size(PCOLO2,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLO2=", PCOLO2(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PCOLO3,1)/2
+    s2 = size(PCOLO3,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLO3=", PCOLO3(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFORFAC,1)/2
+    s2 = size(PFORFAC,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFORFAC=", PFORFAC(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFORFRAC,1)/2
+    s2 = size(PFORFRAC,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFORFRAC=", PFORFRAC(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PSELFFAC,1)/2
+    s2 = size(PSELFFAC,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PSELFFAC=", PSELFFAC(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PSELFFRAC,1)/2
+    s2 = size(PSELFFRAC,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PSELFFRAC=", PSELFFRAC(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFAC00,1)/2
+    s2 = size(PFAC00,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFAC00=", PFAC00(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFAC01,1)/2
+    s2 = size(PFAC01,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFAC01=", PFAC01(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFAC10,1)/2
+    s2 = size(PFAC10,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFAC10=", PFAC10(s1,s2), " at indices ", s1, " ", s2
+    s1 = size(PFAC11,1)/2
+    s2 = size(PFAC11,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PFAC11=", PFAC11(s1,s2), " at indices ", s1, " ", s2
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
 !----------------------------------------------------------------------- 
 IF (LHOOK) CALL DR_HOOK('SRTM_SETCOEF',1,ZHOOK_HANDLE)

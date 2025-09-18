@@ -82,6 +82,7 @@ module radiation_random_numbers
   ! The constants used in the main random number generator
   RNG_STATE_TYPE , parameter :: IMinstdA  = 48271
   RNG_STATE_TYPE , parameter :: IMinstdM  = 2147483647
+  RNG_STATE_TYPE , parameter :: IMinstdMInv  = 4.656612875245797e-10
 
   ! An alternative value of A that can be used to initialize the
   ! members of the state from a single seed
@@ -114,6 +115,10 @@ module radiation_random_numbers
 
   end type rng_type
 
+  !$omp declare target(my_mod)
+  !$omp declare target(initialize_acc)
+  !$omp declare target(uniform_distribution_acc)
+
 contains
 
   !---------------------------------------------------------------------
@@ -125,6 +130,7 @@ contains
   ! will be requested in blocks of this length. The generator is
   ! seeded with "iseed".
   subroutine initialize(this, itype, iseed, nmaxstreams)
+    implicit none
 
     class(rng_type), intent(inout) :: this
     integer(kind=jpim), intent(in), optional :: itype
@@ -197,6 +203,7 @@ contains
   ! was initialized) then only the first nmaxstreams elements will be
   ! assigned.
   subroutine uniform_distribution_1d(this, randnum)
+    implicit none
 
     class(rng_type), intent(inout) :: this
     real(kind=jprb), intent(out)   :: randnum(:)
@@ -232,6 +239,7 @@ contains
   ! (specified when the generator was initialized) then only the first
   ! nmaxstreams elements along this dimension will be assigned.
   subroutine uniform_distribution_2d(this, randnum)
+    implicit none
 
     class(rng_type), intent(inout) :: this
     real(kind=jprb), intent(out)   :: randnum(:,:)
@@ -266,6 +274,7 @@ contains
   ! nmaxstreams elements along this dimension will be assigned. This
   ! version only operates on outer dimensions for which "mask" is true.
   subroutine uniform_distribution_2d_masked(this, randnum, mask)
+    implicit none
 
     class(rng_type), intent(inout) :: this
     real(kind=jprb), intent(inout) :: randnum(:,:)
@@ -300,6 +309,13 @@ contains
 
   end subroutine uniform_distribution_2d_masked
 
+  pure RNG_STATE_TYPE function my_mod(x, y, yinv)
+    implicit none
+    RNG_STATE_TYPE, intent(in) :: x, y, yinv
+    !my_mod = mod(x, y)
+    my_mod = x - (floor(x/y)*y)
+  end function my_mod
+
   !---------------------------------------------------------------------
   ! Initialize a random number generator, using the MINSTD
   ! linear congruential generator (LCG). The generator is
@@ -308,6 +324,7 @@ contains
   ! The seperate function stays in the code, so that hopefully, when the
   ! compiler issue is fixed, it can be used instead of the manual inline.
   pure function initialize_acc(iseed, jseed) result(istate)
+    implicit none
 
     integer(kind=jpim), intent(in)      :: iseed
     integer,            intent(in)      :: jseed
@@ -318,10 +335,10 @@ contains
 
     istate = REAL(ABS(iseed),jprb)
     ! Use a modified (and vectorized) C++ minstd_rand0 algorithm to populate the state
-    istate = nint(mod( istate*jseed*(1._jprb-0.05_jprb*jseed+0.005_jprb*jseed**2)*IMinstdA0, IMinstdM))
+    istate = nint(my_mod( istate*jseed*(1._jprb-0.05_jprb*jseed+0.005_jprb*jseed**2)*IMinstdA0, IMinstdM, IMinstdMinv))
 
     ! One warmup of the C++ minstd_rand algorithm
-    istate = mod(IMinstdA * istate, IMinstdM)
+    istate = nint(my_mod(IMinstdA * istate, IMinstdM, IMinstdMinv))
 
   end function initialize_acc
 
@@ -331,14 +348,14 @@ contains
   ! was initialized) then only the first nmaxstreams elements will be
   ! assigned.
   function uniform_distribution_acc(istate) result(randnum)
-
+    implicit none
     integer(kind=jpib), intent(inout) :: istate
     real(kind=jprb)   :: randnum
 
     !$ACC ROUTINE SEQ
 
     ! C++ minstd_rand algorithm
-    istate = mod(IMinstdA * istate, IMinstdM)
+    istate = my_mod(IMinstdA * istate, IMinstdM, IMinstdMinv)
     randnum = IMinstdScale * istate
 
   end function uniform_distribution_acc

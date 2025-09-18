@@ -23,6 +23,7 @@ USE YOMHOOK  , ONLY : LHOOK, DR_HOOK, JPHOOK
 USE YOMCST   , ONLY : RG
 USE PARRRTM  , ONLY : JPXSEC, JPINPX
 USE YOMDYNCORE_ECRAD,ONLY : RPLRG
+use radiation_io, only : nulout
 
 !------------------------------Arguments--------------------------------
 
@@ -101,6 +102,10 @@ REAL(KIND=JPRB) :: ZAMM
 
 REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    integer :: s1, s2, s3
+#endif
+
 ! ***
 
 ! *** mji
@@ -133,16 +138,24 @@ IF (LHOOK) CALL DR_HOOK('RRTM_PREPARE_GASES',0,ZHOOK_HANDLE)
 !$ACC              PQ, PCO2, PCH4, PN2O, PNO2, PC11, PC12, PC22, PCL4, POZN, &
 !$ACC              PCOLDRY, PWBRODL, PWKL, PWX , &
 !$ACC              PAVEL, PTAVEL, PZ, PTZ , KREFLECT)
+!$OMP TARGET DATA MAP(PRESENT, ALLOC: PAPH, PAP, &
+!$OMP              PTH, PT, &
+!$OMP              PQ, PCO2, PCH4, PN2O, PNO2, PC11, PC12, PC22, PCL4, POZN, &
+!$OMP              PCOLDRY, PWBRODL, PWKL, PWX , &
+!$OMP              PAVEL, PTAVEL, PZ, PTZ , KREFLECT)
 
 ZGRAVIT=(RG/RPLRG)*1.E2_JPRB
 
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
 !$ACC LOOP GANG VECTOR
 DO JL = KIDIA, KFDIA
   KREFLECT(JL)=0
 ENDDO
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
 !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
 !DO J1=1,35
 ! IXINDX(J1)=0
@@ -157,6 +170,7 @@ ENDDO
 !IXINDX(2)=2
 !IXINDX(3)=3
 !$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
 !     Set parameters needed for RRTM execution:
 IATM    = 0
@@ -165,6 +179,22 @@ IATM    = 0
 !      IOUT    = -1
 IXMAX   = 4
 
+
+
+
+
+
+
+
+
+
+
+
+
+#if 1
+
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
 !$ACC LOOP GANG(STATIC:1) VECTOR
 DO JL = KIDIA, KFDIA
@@ -183,7 +213,91 @@ DO JL = KIDIA, KFDIA
   PZ(JL,0) = PAPH(JL,KLEV+1)/100._JPRB
   PTZ(JL,0) = PTH(JL,KLEV+1)
 ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      PAVEL(JL,JK) = PAP(JL,KLEV-JK+1)/100._JPRB
+      PTAVEL(JL,JK) = PT(JL,KLEV-JK+1)
+      PZ(JL,JK) = PAPH(JL,KLEV-JK+1)/100._JPRB
+      PTZ(JL,JK) = PTH(JL,KLEV-JK+1)
+      ! RRTMG cannot cope with zero or negative water vapour
+      PWKL(JL,1,JK) = MAX(PQ(JL,KLEV-JK+1),1.0E-15)*ZAMD/ZAMW
+      PWKL(JL,2,JK) = PCO2(JL,KLEV-JK+1)*ZAMD/ZAMCO2
+      PWKL(JL,3,JK) = POZN(JL,KLEV-JK+1)*ZAMD/ZAMO
+      PWKL(JL,4,JK) = PN2O(JL,KLEV-JK+1)*ZAMD/ZAMN2O
+      PWKL(JL,6,JK) = PCH4(JL,KLEV-JK+1)*ZAMD/ZAMCH4
+      PWKL(JL,7,JK) = 0.209488_JPRB
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      ZAMM = (1.0_JPRB-PWKL(JL,1,JK))*ZAMD + PWKL(JL,1,JK)*ZAMW
+      PCOLDRY(JL,JK) = (PZ(JL,JK-1)-PZ(JL,JK))*1.E3_JPRB*ZAVGDRO/(ZGRAVIT*ZAMM*(1.0_JPRB+PWKL(JL,1,JK)))
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+   DO J2=1,KLEV
+    DO J1=1,JPXSEC
+      DO JL = KIDIA, KFDIA
+        PWX(JL,J1,J2)=0.0_JPRB
+      ENDDO
+    ENDDO
+  ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      !- Set cross section molecule amounts from ECRT; convert to vmr
+      PWX(JL,1,JK) = PCOLDRY(JL,JK) * (PCL4(JL,KLEV-JK+1) * ZAMD/ZAMCL4) * 1.E-20_JPRB
+      PWX(JL,2,JK) = PCOLDRY(JL,JK) * (PC11(JL,KLEV-JK+1) * ZAMD/ZAMC11) * 1.E-20_JPRB
+      PWX(JL,3,JK) = PCOLDRY(JL,JK) * (PC12(JL,KLEV-JK+1) * ZAMD/ZAMC12) * 1.E-20_JPRB
+      PWX(JL,4,JK) = PCOLDRY(JL,JK) * (PC22(JL,KLEV-JK+1) * ZAMD/ZAMC22) * 1.E-20_JPRB
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ZSUMMOL)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      !- Here, all molecules in WKL and WX are in volume mixing ratio; convert to
+      !  molec/cm2 based on COLDRY for use in RRTM
+
+      !CDIR UNROLL=6
+      ZSUMMOL = 0.0_JPRB
+      !AB broadening gases
+      DO JMOL = 2, ITMOL
+         ZSUMMOL = ZSUMMOL + PWKL(JL,JMOL,JK)
+      ENDDO
+      PWBRODL(JL,JK) = PCOLDRY(JL,JK) * (1._JPRB - ZSUMMOL)
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+DO JK = 1, KLEV
+   DO JMOL = 1, ITMOL
+      DO JL = KIDIA, KFDIA      
+         PWKL(JL,JMOL,JK) = PCOLDRY(JL,JK) * PWKL(JL,JMOL,JK)
+      ENDDO
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+!$OMP END TARGET DATA
+
+#endif
+
+#if defined (_OPENACC)
   !$ACC LOOP SEQ
   DO JK = 1, KLEV
     !$ACC LOOP GANG(STATIC:1) VECTOR PRIVATE(ZAMM)
@@ -253,7 +367,239 @@ ENDDO
 !$ACC WAIT
 !$ACC END DATA
 
+#endif
+
+#else
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+!$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+!$ACC LOOP GANG(STATIC:1) VECTOR
+DO JL = KIDIA, KFDIA
+!     Install ECRT arrays into RRTM arrays for pressure, temperature,
+!     and molecular amounts.  Pressures are converted from Pascals
+!     (ECRT) to mb (RRTM).  H2O, CO2, O3 and trace gas amounts are
+!     converted from mass mixing ratio to volume mixing ratio.  CO2
+!     converted with same dry air and CO2 molecular weights used in
+!     ECRT to assure correct conversion back to the proper CO2 vmr.
+!     The dry air column COLDRY (in molec/cm2) is calculated from
+!     the level pressures PZ (in mb) based on the hydrostatic equation
+!     and includes a correction to account for H2O in the layer.  The
+!     molecular weight of moist air (amm) is calculated for each layer.
+!     Note: RRTM levels count from bottom to top, while the ECRT input
+!     variables count from the top down and must be reversed
+  PZ(JL,0) = PAPH(JL,KLEV+1)/100._JPRB
+  PTZ(JL,0) = PTH(JL,KLEV+1)
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#if defined(OMPGPU)
+
+#ifdef DEBUG_WARNING
+  write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " WARNING: The code below needs to made consistent with the OpenACC code. The OpenACC code between in master-acc."
+#endif
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      PAVEL(JL,JK) = PAP(JL,KLEV-JK+1)/100._JPRB
+      PTAVEL(JL,JK) = PT(JL,KLEV-JK+1)
+      PZ(JL,JK) = PAPH(JL,KLEV-JK+1)/100._JPRB
+      PTZ(JL,JK) = PTH(JL,KLEV-JK+1)
+      ! RRTMG cannot cope with zero or negative water vapour
+      PWKL(JL,1,JK) = MAX(PQ(JL,KLEV-JK+1),1.0E-15)*ZAMD/ZAMW
+      PWKL(JL,2,JK) = PCO2(JL,KLEV-JK+1)*ZAMD/ZAMCO2
+      PWKL(JL,3,JK) = POZN(JL,KLEV-JK+1)*ZAMD/ZAMO
+      PWKL(JL,4,JK) = PN2O(JL,KLEV-JK+1)*ZAMD/ZAMN2O
+      PWKL(JL,6,JK) = PCH4(JL,KLEV-JK+1)*ZAMD/ZAMCH4
+      PWKL(JL,7,JK) = 0.209488_JPRB
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      ZAMM = (1.0_JPRB-PWKL(JL,1,JK))*ZAMD + PWKL(JL,1,JK)*ZAMW
+      PCOLDRY(JL,JK) = (PZ(JL,JK-1)-PZ(JL,JK))*1.E3_JPRB*ZAVGDRO/(ZGRAVIT*ZAMM*(1.0_JPRB+PWKL(JL,1,JK)))
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#endif
+
+#if defined(_OPENACC)
+
+  !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+  !$ACC LOOP SEQ
+  DO JK = 1, KLEV
+!$ACC LOOP GANG VECTOR PRIVATE (ZSUMMOL)
+DO JL = KIDIA, KFDIA
+!- Set cross section molecule amounts from ECRT; convert to vmr
+    PWX(JL,1,JK) = PCL4(JL,KLEV-JK+1) * ZAMD/ZAMCL4
+    PWX(JL,2,JK) = PC11(JL,KLEV-JK+1) * ZAMD/ZAMC11
+    PWX(JL,3,JK) = PC12(JL,KLEV-JK+1) * ZAMD/ZAMC12
+    PWX(JL,4,JK) = PC22(JL,KLEV-JK+1) * ZAMD/ZAMC22
+    PWX(JL,1,JK) = PCOLDRY(JL,JK) * PWX(JL,1,JK) * 1.E-20_JPRB
+    PWX(JL,2,JK) = PCOLDRY(JL,JK) * PWX(JL,2,JK) * 1.E-20_JPRB
+    PWX(JL,3,JK) = PCOLDRY(JL,JK) * PWX(JL,3,JK) * 1.E-20_JPRB
+    PWX(JL,4,JK) = PCOLDRY(JL,JK) * PWX(JL,4,JK) * 1.E-20_JPRB
+
+!- Here, all molecules in WKL and WX are in volume mixing ratio; convert to
+!  molec/cm2 based on COLDRY for use in RRTM
+
+!CDIR UNROLL=6
+ZSUMMOL = 0.0_JPRB
+!AB broadening gases
+    !$ACC LOOP SEQ
+    DO JMOL = 2, ITMOL
+      ZSUMMOL = ZSUMMOL + PWKL(JL,JMOL,JK)
+    ENDDO
+    PWBRODL(JL,JK) = PCOLDRY(JL,JK) * (1._JPRB - ZSUMMOL)
+    !$ACC LOOP SEQ
+    DO JMOL = 1, ITMOL
+      PWKL(JL,JMOL,JK) = PCOLDRY(JL,JK) * PWKL(JL,JMOL,JK)
+    ENDDO
+  ENDDO
+ENDDO
+!$ACC END PARALLEL
+
+#endif
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+!$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+!$ACC LOOP GANG VECTOR COLLAPSE(3)
+DO J2=1,KLEV
+   DO J1=1,JPXSEC
+      DO JL = KIDIA, KFDIA
+         PWX(JL,J1,J2)=0.0_JPRB
+      ENDDO
+   ENDDO
+ENDDO
+!$ACC END PARALLEL
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#if defined(OMPGPU)
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      !- Set cross section molecule amounts from ECRT; convert to vmr
+      PWX(JL,1,JK) = PCOLDRY(JL,JK) * (PCL4(JL,KLEV-JK+1) * ZAMD/ZAMCL4) * 1.E-20_JPRB
+      PWX(JL,2,JK) = PCOLDRY(JL,JK) * (PC11(JL,KLEV-JK+1) * ZAMD/ZAMC11) * 1.E-20_JPRB
+      PWX(JL,3,JK) = PCOLDRY(JL,JK) * (PC12(JL,KLEV-JK+1) * ZAMD/ZAMC12) * 1.E-20_JPRB
+      PWX(JL,4,JK) = PCOLDRY(JL,JK) * (PC22(JL,KLEV-JK+1) * ZAMD/ZAMC22) * 1.E-20_JPRB
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ZSUMMOL)
+DO JK = 1, KLEV
+   DO JL = KIDIA, KFDIA
+      !- Here, all molecules in WKL and WX are in volume mixing ratio; convert to
+      !  molec/cm2 based on COLDRY for use in RRTM
+
+      !CDIR UNROLL=6
+      ZSUMMOL = 0.0_JPRB
+      !AB broadening gases
+      DO JMOL = 2, ITMOL
+         ZSUMMOL = ZSUMMOL + PWKL(JL,JMOL,JK)
+      ENDDO
+      PWBRODL(JL,JK) = PCOLDRY(JL,JK) * (1._JPRB - ZSUMMOL)
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+DO JK = 1, KLEV
+   DO JMOL = 1, ITMOL
+      DO JL = KIDIA, KFDIA      
+         PWKL(JL,JMOL,JK) = PCOLDRY(JL,JK) * PWKL(JL,JMOL,JK)
+      ENDDO
+   ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#else
+
+!$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+!$ACC LOOP SEQ
+DO JK = 1, KLEV
+   !$ACC LOOP GANG VECTOR PRIVATE (ZSUMMOL) 
+   DO JL = KIDIA, KFDIA
+      !- Set cross section molecule amounts from ECRT; convert to vmr
+      PWX(JL,1,JK) = PCL4(JL,KLEV-JK+1) * ZAMD/ZAMCL4
+      PWX(JL,2,JK) = PC11(JL,KLEV-JK+1) * ZAMD/ZAMC11
+      PWX(JL,3,JK) = PC12(JL,KLEV-JK+1) * ZAMD/ZAMC12
+      PWX(JL,4,JK) = PC22(JL,KLEV-JK+1) * ZAMD/ZAMC22
+      PWX(JL,1,JK) = PCOLDRY(JL,JK) * PWX(JL,1,JK) * 1.E-20_JPRB
+      PWX(JL,2,JK) = PCOLDRY(JL,JK) * PWX(JL,2,JK) * 1.E-20_JPRB
+      PWX(JL,3,JK) = PCOLDRY(JL,JK) * PWX(JL,3,JK) * 1.E-20_JPRB
+      PWX(JL,4,JK) = PCOLDRY(JL,JK) * PWX(JL,4,JK) * 1.E-20_JPRB
+      
+      !- Here, all molecules in WKL and WX are in volume mixing ratio; convert to
+      !  molec/cm2 based on COLDRY for use in RRTM
+
+      !CDIR UNROLL=6
+      ZSUMMOL = 0.0_JPRB
+      !AB broadening gases
+      !$ACC LOOP SEQ
+      DO JMOL = 2, ITMOL
+         ZSUMMOL = ZSUMMOL + PWKL(JL,JMOL,JK)
+      ENDDO
+      PWBRODL(JL,JK) = PCOLDRY(JL,JK) * (1._JPRB - ZSUMMOL)
+      !$ACC LOOP SEQ
+      DO JMOL = 1, ITMOL
+         PWKL(JL,JMOL,JK) = PCOLDRY(JL,JK) * PWKL(JL,JMOL,JK)
+      ENDDO
+   ENDDO
+ENDDO
+!$ACC END PARALLEL
+
+#endif
+
+!$ACC WAIT
+!$ACC END DATA
+!$OMP END TARGET DATA
+
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+write(nulout,'(a)') "*******************************************************************"
+write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+!$OMP TARGET UPDATE FROM(PCOLDRY,PWBRODL,PWKL,PWX,PAVEL,PTAVEL,PZ,PTZ,KREFLECT)
+!$ACC UPDATE HOST(PCOLDRY,PWBRODL,PWKL,PWX,PAVEL,PTAVEL,PZ,PTZ,KREFLECT) ASYNC(1)
+!$ACC WAIT(1)
+s1 = size(PCOLDRY,1)/2
+s2 = size(PCOLDRY,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PCOLDRY=", PCOLDRY(s1,s2), " at indices ", s1, " ", s2
+s1 = size(PWBRODL,1)/2
+s2 = size(PWBRODL,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PWBRODL=", PWBRODL(s1,s2), " at indices ", s1, " ", s2
+s1 = size(PWKL,1)/2
+s2 = size(PWKL,2)/2
+s3 = size(PWKL,3)/2
+write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "PWKL=", PWKL(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+s1 = size(PWX,1)/2
+s2 = size(PWX,2)/2
+s3 = size(PWX,3)/2
+write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "PWX=", PWX(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+s1 = size(PAVEL,1)/2
+s2 = size(PAVEL,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PAVEL=", PAVEL(s1,s2), " at indices ", s1, " ", s2
+s1 = size(PTAVEL,1)/2
+s2 = size(PTAVEL,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PTAVEL=", PTAVEL(s1,s2), " at indices ", s1, " ", s2
+s1 = size(PZ,1)/2
+s2 = size(PZ,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PZ=", PZ(s1,s2), " at indices ", s1, " ", s2
+s1 = size(PTZ,1)/2
+s2 = size(PTZ,2)/2
+write(nulout,'(a,g0.5,a,i0,a,i0)') "PTZ=", PTZ(s1,s2), " at indices ", s1, " ", s2
+s1 = size(KREFLECT,1)/2
+write(nulout,'(a,i0,a,i0)') "KREFLECT=", KREFLECT(s1), " at indices ", s1
+#endif
 !     ------------------------------------------------------------------
+
+#endif
+
 IF (LHOOK) CALL DR_HOOK('RRTM_PREPARE_GASES',1,ZHOOK_HANDLE)
 
 END SUBROUTINE RRTM_PREPARE_GASES

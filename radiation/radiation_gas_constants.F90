@@ -38,6 +38,8 @@ module radiation_gas_constants
   integer, parameter :: INO2   = 12
   integer, parameter :: NMaxGases = 12
   !$ACC DECLARE COPYIN(NMaxGases)
+  #warning "I don't know if this is correct"
+  !!$OMP TARGET UPDATE TO(NMaxGases)
 
   ! Molar masses (g mol-1) of dry air and the various gases above
   real(jprb), parameter :: AirMolarMass = 28.970_jprb
