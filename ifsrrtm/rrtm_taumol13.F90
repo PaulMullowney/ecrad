@@ -289,60 +289,61 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
             fac211 = 0._JPRB
           endif
 
+          do ig = 1, ng13
           if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *    &
-             (fac000 * absa(ind0,1:ng13)    + &
-              fac100 * absa(ind0+1,1:ng13)  + &
-              fac200 * absa(ind0+2,1:ng13)  + &
-              fac010 * absa(ind0+9,1:ng13)  + &
-              fac110 * absa(ind0+10,1:ng13) + &
-              fac210 * absa(ind0+11,1:ng13))
+            tau_major(ig) = speccomb *    &
+             (fac000 * absa(ind0,ig)    + &
+              fac100 * absa(ind0+1,ig)  + &
+              fac200 * absa(ind0+2,ig)  + &
+              fac010 * absa(ind0+9,ig)  + &
+              fac110 * absa(ind0+10,ig) + &
+              fac210 * absa(ind0+11,ig))
           else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *   &
-             (fac200 * absa(ind0-1,1:ng13) + &
-              fac100 * absa(ind0,1:ng13)   + &
-              fac000 * absa(ind0+1,1:ng13) + &
-              fac210 * absa(ind0+8,1:ng13) + &
-              fac110 * absa(ind0+9,1:ng13) + &
-              fac010 * absa(ind0+10,1:ng13))
+            tau_major(ig) = speccomb *   &
+             (fac200 * absa(ind0-1,ig) + &
+              fac100 * absa(ind0,ig)   + &
+              fac000 * absa(ind0+1,ig) + &
+              fac210 * absa(ind0+8,ig) + &
+              fac110 * absa(ind0+9,ig) + &
+              fac010 * absa(ind0+10,ig))
           else
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *   &
-             (fac000 * absa(ind0,1:ng13)   + &
-              fac100 * absa(ind0+1,1:ng13) + &
-              fac010 * absa(ind0+9,1:ng13) + &
-              fac110 * absa(ind0+10,1:ng13))
+            tau_major(ig) = speccomb *   &
+             (fac000 * absa(ind0,ig)   + &
+              fac100 * absa(ind0+1,ig) + &
+              fac010 * absa(ind0+9,ig) + &
+              fac110 * absa(ind0+10,ig))
           endif
 
           if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 *  &
-             (fac001 * absa(ind1,1:ng13)    + &
-              fac101 * absa(ind1+1,1:ng13)  + &
-              fac201 * absa(ind1+2,1:ng13)  + &
-              fac011 * absa(ind1+9,1:ng13)  + &
-              fac111 * absa(ind1+10,1:ng13) + &
-              fac211 * absa(ind1+11,1:ng13))
+            tau_major1(ig) = speccomb1 *  &
+             (fac001 * absa(ind1,ig)    + &
+              fac101 * absa(ind1+1,ig)  + &
+              fac201 * absa(ind1+2,ig)  + &
+              fac011 * absa(ind1+9,ig)  + &
+              fac111 * absa(ind1+10,ig) + &
+              fac211 * absa(ind1+11,ig))
           else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 * &
-             (fac201 * absa(ind1-1,1:ng13) + &
-              fac101 * absa(ind1,1:ng13)   + &
-              fac001 * absa(ind1+1,1:ng13) + &
-              fac211 * absa(ind1+8,1:ng13) + &
-              fac111 * absa(ind1+9,1:ng13) + &
-              fac011 * absa(ind1+10,1:ng13))
+            tau_major1(ig) = speccomb1 * &
+             (fac201 * absa(ind1-1,ig) + &
+              fac101 * absa(ind1,ig)   + &
+              fac001 * absa(ind1+1,ig) + &
+              fac211 * absa(ind1+8,ig) + &
+              fac111 * absa(ind1+9,ig) + &
+              fac011 * absa(ind1+10,ig))
           else
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 * &
-             (fac001 * absa(ind1,1:ng13)   + &
-              fac101 * absa(ind1+1,1:ng13) + &
-              fac011 * absa(ind1+9,1:ng13) + &
-              fac111 * absa(ind1+10,1:ng13))
+            tau_major1(ig) = speccomb1 * &
+             (fac001 * absa(ind1,ig)   + &
+              fac101 * absa(ind1+1,ig) + &
+              fac011 * absa(ind1+9,ig) + &
+              fac111 * absa(ind1+10,ig))
           endif
-
+          enddo
           !$ACC LOOP SEQ PRIVATE(taufor, tauself, co2m1, co2m2, absco2, &
           !$ACC   com1, com2, absco)
 !$NEC unroll(NG13)
@@ -538,59 +539,61 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
               fac211 = 0._JPRB
             endif
 
+            do ig = 1, ng13
             if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *    &
-              (fac000 * absa(ind0,1:ng13)    + &
-                fac100 * absa(ind0+1,1:ng13)  + &
-                fac200 * absa(ind0+2,1:ng13)  + &
-                fac010 * absa(ind0+9,1:ng13)  + &
-                fac110 * absa(ind0+10,1:ng13) + &
-                fac210 * absa(ind0+11,1:ng13))
+              tau_major(ig) = speccomb *    &
+              (fac000 * absa(ind0,ig)    + &
+                fac100 * absa(ind0+1,ig)  + &
+                fac200 * absa(ind0+2,ig)  + &
+                fac010 * absa(ind0+9,ig)  + &
+                fac110 * absa(ind0+10,ig) + &
+                fac210 * absa(ind0+11,ig))
             else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *   &
-              (fac200 * absa(ind0-1,1:ng13) + &
-                fac100 * absa(ind0,1:ng13)   + &
-                fac000 * absa(ind0+1,1:ng13) + &
-                fac210 * absa(ind0+8,1:ng13) + &
-                fac110 * absa(ind0+9,1:ng13) + &
-                fac010 * absa(ind0+10,1:ng13))
+              tau_major(ig) = speccomb *   &
+              (fac200 * absa(ind0-1,ig) + &
+                fac100 * absa(ind0,ig)   + &
+                fac000 * absa(ind0+1,ig) + &
+                fac210 * absa(ind0+8,ig) + &
+                fac110 * absa(ind0+9,ig) + &
+                fac010 * absa(ind0+10,ig))
             else
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *   &
-              (fac000 * absa(ind0,1:ng13)   + &
-                fac100 * absa(ind0+1,1:ng13) + &
-                fac010 * absa(ind0+9,1:ng13) + &
-                fac110 * absa(ind0+10,1:ng13))
+              tau_major(ig) = speccomb *   &
+              (fac000 * absa(ind0,ig)   + &
+                fac100 * absa(ind0+1,ig) + &
+                fac010 * absa(ind0+9,ig) + &
+                fac110 * absa(ind0+10,ig))
             endif
 
             if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 *  &
-              (fac001 * absa(ind1,1:ng13)    + &
-                fac101 * absa(ind1+1,1:ng13)  + &
-                fac201 * absa(ind1+2,1:ng13)  + &
-                fac011 * absa(ind1+9,1:ng13)  + &
-                fac111 * absa(ind1+10,1:ng13) + &
-                fac211 * absa(ind1+11,1:ng13))
+              tau_major1(ig) = speccomb1 *  &
+              (fac001 * absa(ind1,ig)    + &
+                fac101 * absa(ind1+1,ig)  + &
+                fac201 * absa(ind1+2,ig)  + &
+                fac011 * absa(ind1+9,ig)  + &
+                fac111 * absa(ind1+10,ig) + &
+                fac211 * absa(ind1+11,ig))
             else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 * &
-              (fac201 * absa(ind1-1,1:ng13) + &
-                fac101 * absa(ind1,1:ng13)   + &
-                fac001 * absa(ind1+1,1:ng13) + &
-                fac211 * absa(ind1+8,1:ng13) + &
-                fac111 * absa(ind1+9,1:ng13) + &
-                fac011 * absa(ind1+10,1:ng13))
+              tau_major1(ig) = speccomb1 * &
+              (fac201 * absa(ind1-1,ig) + &
+                fac101 * absa(ind1,ig)   + &
+                fac001 * absa(ind1+1,ig) + &
+                fac211 * absa(ind1+8,ig) + &
+                fac111 * absa(ind1+9,ig) + &
+                fac011 * absa(ind1+10,ig))
             else
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 * &
-              (fac001 * absa(ind1,1:ng13)   + &
-                fac101 * absa(ind1+1,1:ng13) + &
-                fac011 * absa(ind1+9,1:ng13) + &
-                fac111 * absa(ind1+10,1:ng13))
+              tau_major1(ig) = speccomb1 * &
+              (fac001 * absa(ind1,ig)   + &
+                fac101 * absa(ind1+1,ig) + &
+                fac011 * absa(ind1+9,ig) + &
+                fac111 * absa(ind1+10,ig))
             endif
+            enddo
 
 !$NEC unroll(NG13)
             !$ACC LOOP SEQ PRIVATE(tauself, taufor, co2m1, absco2, com1, com2, absco)

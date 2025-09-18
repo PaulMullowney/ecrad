@@ -58,7 +58,7 @@ USE YOMHOOK  , ONLY : LHOOK, DR_HOOK, JPHOOK
 USE PARSRTM  , ONLY : JPB1, JPB2
 USE YOESRTM  , ONLY : JPGPT
 USE YOESRTWN , ONLY : NGC
-
+use radiation_io, only : nulout
 IMPLICIT NONE
 
 !     ------------------------------------------------------------------
@@ -108,6 +108,9 @@ REAL(KIND=JPRB) :: ZSFLXZEN(KIDIA:KFDIA,16) ! Incoming solar flux
 
 REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    integer :: s1, s2, s3
+#endif
 
 #include "srtm_taumol16.intfb.h"
 #include "srtm_taumol17.intfb.h"
@@ -173,7 +176,7 @@ ENDDO
     laytrop_min = MINVAL(klaytrop(KIDIA:KFDIA))
     laytrop_max = MAXVAL(klaytrop(KIDIA:KFDIA))
 #endif
-
+!$OMP TARGET ENTER DATA MAP(TO:laytrop_min,laytrop_max)
 IF (ICOUNT/=0) THEN
 
   DO JB = IB1, IB2
@@ -369,6 +372,28 @@ ENDIF
 !$OMP END TARGET DATA
 
 !     ------------------------------------------------------------------
+
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(PSSA,POD,PINCSOL)
+    !$ACC UPDATE HOST(PINCSOL) ASYNC(1)
+    !$ACC UPDATE HOST(PSSA) ASYNC(1)
+    !$ACC UPDATE HOST(POD) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = size(POD,1)/2
+    s2 = size(POD,2)/2
+    s3 = size(POD,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "POD=", POD(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(PSSA,1)/2
+    s2 = size(PSSA,2)/2
+    s3 = size(PSSA,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "PSSA=", PSSA(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(PINCSOL,1)/2
+    s2 = size(PINCSOL,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PINCSOL=", PINCSOL(s1,s2), " at indices ", s1, " ", s2
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
 IF (LHOOK) CALL DR_HOOK('SRTM_GAS_OPTICAL_DEPTH',1,ZHOOK_HANDLE)
 
