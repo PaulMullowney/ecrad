@@ -23,7 +23,7 @@ USE PARSRTM  , ONLY : JPG
 USE YOESRTM  , ONLY : NG23
 USE YOESRTA23, ONLY : ABSA, FORREFC, SELFREFC, SFLUXREFC, RAYLC, LAYREFFR, GIVFAC
 USE YOESRTWN , ONLY : NSPA
-
+use radiation_io, only : nulout
 IMPLICIT NONE
 
 !-- Output
@@ -62,24 +62,76 @@ INTEGER(KIND=JPIM) :: I_LAY_NEXT
 REAL(KIND=JPRB) ::  &
  & Z_TAURAY
 
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Begin"
+#endif
     !$ACC DATA CREATE(i_laysolfr) &
     !$ACC     PRESENT(p_fac00, p_fac01, p_fac10, p_fac11, k_jp, k_jt, k_jt1, &
     !$ACC             p_colh2o, p_colmol, k_laytrop, p_selffac, p_selffrac, &
     !$ACC             k_indself, p_forfac, p_forfrac, k_indfor, p_sfluxzen, &
     !$ACC             p_taug, p_taur , prmu0)
-
+    !$OMP TARGET ENTER DATA MAP(ALLOC: i_laysolfr)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: p_fac00, p_fac01, p_fac10, p_fac11, k_jp, k_jt, k_jt1, &
+    !$OMP             p_colh2o, p_colmol, k_laytrop, p_selffac, p_selffrac, &
+    !$OMP             k_indself, p_forfac, p_forfrac, k_indfor, p_sfluxzen, &
+    !$OMP             p_taug, p_taur , prmu0)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min, laytrop_max)
+    
     i_nlayers = klev
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC WAIT
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG(STATIC:1) VECTOR
     DO iplon = KIDIA, KFDIA
       i_laysolfr(iplon) = k_laytrop(iplon)
     ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(OMPGPU)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    DO iplon = KIDIA, KFDIA
+       DO i_lay = 1, laytrop_min
+         IF (k_jp(iplon,i_lay) < layreffr                            &
+              &    .AND. k_jp(iplon,i_lay+1) >= layreffr)            &
+              &    i_laysolfr(iplon) = MIN(i_lay+1,k_laytrop(iplon))
+       ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, z_tauray)
+    DO i_lay = 1, laytrop_min
+      DO iplon = KIDIA, KFDIA
+         ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(23) + 1
+         ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(23) + 1
+         inds = k_indself(iplon,i_lay)
+         indf = k_indfor(iplon,i_lay)
+
+!$NEC unroll(NG23)
+         DO ig = 1 , ng23
+           z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
+           p_taug(iplon,i_lay,ig) = p_colh2o(iplon,i_lay) *         &
+                & (givfac * (p_fac00(iplon,i_lay) * absa(ind0,ig) + &
+                & p_fac10(iplon,i_lay) * absa(ind0+1,ig) +          &
+                & p_fac01(iplon,i_lay) * absa(ind1,ig) +            &
+                & p_fac11(iplon,i_lay) * absa(ind1+1,ig)) +         &
+                & p_selffac(iplon,i_lay) * (selfrefc(inds,ig) +     &
+                & p_selffrac(iplon,i_lay) *                         &
+                & (selfrefc(inds+1,ig) - selfrefc(inds,ig))) +      &
+                & p_forfac(iplon,i_lay) * (forrefc(indf,ig) +       &
+                & p_forfrac(iplon,i_lay) *                          &
+                & (forrefc(indf+1,ig) - forrefc(indf,ig))))
+           IF (i_lay == i_laysolfr(iplon)) &
+                p_sfluxzen(iplon,ig) = sfluxrefc(ig)
+           p_taur(iplon,i_lay,ig) = z_tauray
+         ENDDO
+      ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     !$ACC LOOP SEQ
     DO i_lay = 1, laytrop_min
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(ind0, ind1, inds, indf, z_tauray)
       !$ACC LOOP GANG(STATIC:1) VECTOR PRIVATE(ind0, ind1, inds, indf)
-       DO iplon = KIDIA, KFDIA
+      DO iplon = KIDIA, KFDIA
          IF (k_jp(iplon,i_lay) < layreffr                            &
               &    .AND. k_jp(iplon,i_lay+1) >= layreffr)            &
               &    i_laysolfr(iplon) = MIN(i_lay+1,k_laytrop(iplon))
@@ -107,13 +159,16 @@ REAL(KIND=JPRB) ::  &
                 p_sfluxzen(iplon,ig) = sfluxrefc(ig)
            p_taur(iplon,i_lay,ig) = z_tauray
          ENDDO
-       ENDDO
+      ENDDO
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDDO
+#endif
 
     !$ACC LOOP SEQ
     DO i_lay = laytrop_min+1, laytrop_max
-       !$ACC LOOP GANG(STATIC:1) VECTOR PRIVATE(ind0, ind1, inds, indf)
-       DO iplon = KIDIA, KFDIA
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(ind0, ind1, inds, indf, z_tauray)
+      !$ACC LOOP GANG(STATIC:1) VECTOR PRIVATE(ind0, ind1, inds, indf)
+      DO iplon = KIDIA, KFDIA
           IF (i_lay <= k_laytrop(iplon)) THEN
             IF (k_jp(iplon,i_lay) < layreffr                            &
                  &    .AND. k_jp(iplon,i_lay+1) >= layreffr)            &
@@ -150,9 +205,11 @@ REAL(KIND=JPRB) ::  &
               p_taur(iplon,i_lay,ig) = p_colmol(iplon,i_lay) * raylc(ig)
             ENDDO
           ENDIF
-       ENDDO
+      ENDDO
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDDO
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
     !$ACC LOOP SEQ
     DO ig = 1 , ng23
       !$ACC LOOP SEQ
@@ -165,8 +222,17 @@ REAL(KIND=JPRB) ::  &
       ENDDO
     ENDDO
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !$ACC WAIT
     !$ACC END DATA
+
+    !$OMP TARGET EXIT DATA MAP(DELETE: i_laysolfr)
+    !$OMP END TARGET DATA
+    !$OMP END TARGET DATA
+
+#ifdef DEBUG
+    write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " Done"
+#endif
 
 END SUBROUTINE SRTM_TAUMOL23

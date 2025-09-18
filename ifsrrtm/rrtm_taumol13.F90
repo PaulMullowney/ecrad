@@ -101,7 +101,14 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
     !$ACC             selffrac, indself, fracs, rat_h2on2o, rat_h2on2o_1, &
     !$ACC             indfor, forfac, forfrac, minorfrac, indminor) &
     !$ACC       CREATE(colco)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: taug, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, jt1, &
+    !$OMP             colh2o, coln2o, colco2, colo3, coldry, laytrop, selffac, &
+    !$OMP             selffrac, indself, fracs, rat_h2on2o, rat_h2on2o_1, &
+    !$OMP             indfor, forfac, forfrac, minorfrac, indminor)
+    !$OMP TARGET ENTER DATA MAP(ALLOC: colco)
+    !$OMP TARGET DATA MAP(PRESENT, ALLOC: laytrop_min,laytrop_max)
 
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR COLLAPSE(2)
     do lay = 1,KLEV
@@ -110,6 +117,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
       end do
     end do
     !$ACC END PARALLEL
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
 #if !defined(_OPENACC) && !defined(OMPGPU)
     ixlow  = 0
@@ -132,7 +140,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
       ixc(lay) = icl
     enddo
 #endif
-
+ 
       ! P = 473.420 mb (Level 5)
       refrat_planck_a = chi_mls(1,5)/chi_mls(4,5)
 
@@ -148,6 +156,14 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
       ! (in temperature) separately.
 
       ! Lower atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_planck, speccomb_mco2, speccomb_mco, &
+      !$OMP   ind0, ind1, &
+      !$OMP   inds, indf, indm, js, js1, jpl, jmco2, jmco, fac000, fac100, fac200, fac010, &
+      !$OMP   fac110, fac210, fac001, fac101, fac201, fac011, fac111, fac211, p, p4, fk0, fk1, fk2, chi_co2, ratco2, &
+      !$OMP   adjfac, adjcolco2, fs, specmult, specparm, fs1, specmult1, specparm1, fmco2, specmult_mco2, &
+      !$OMP   specparm_mco2, fmco, specmult_mco, specparm_mco, fpl, specmult_planck, specparm_planck, tau_major, &
+      !$OMP   tau_major1, taufor, tauself, co2m1, co2m2, absco2, &
+      !$OMP   com1, com2, absco) !THREAD_LIMIT(128)
       !$ACC WAIT
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_planck, speccomb_mco2, speccomb_mco, &
@@ -274,60 +290,61 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
             fac211 = 0._JPRB
           endif
 
+          do ig = 1, ng13
           if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *    &
-             (fac000 * absa(ind0,1:ng13)    + &
-              fac100 * absa(ind0+1,1:ng13)  + &
-              fac200 * absa(ind0+2,1:ng13)  + &
-              fac010 * absa(ind0+9,1:ng13)  + &
-              fac110 * absa(ind0+10,1:ng13) + &
-              fac210 * absa(ind0+11,1:ng13))
+            tau_major(ig) = speccomb *    &
+             (fac000 * absa(ind0,ig)    + &
+              fac100 * absa(ind0+1,ig)  + &
+              fac200 * absa(ind0+2,ig)  + &
+              fac010 * absa(ind0+9,ig)  + &
+              fac110 * absa(ind0+10,ig) + &
+              fac210 * absa(ind0+11,ig))
           else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *   &
-             (fac200 * absa(ind0-1,1:ng13) + &
-              fac100 * absa(ind0,1:ng13)   + &
-              fac000 * absa(ind0+1,1:ng13) + &
-              fac210 * absa(ind0+8,1:ng13) + &
-              fac110 * absa(ind0+9,1:ng13) + &
-              fac010 * absa(ind0+10,1:ng13))
+            tau_major(ig) = speccomb *   &
+             (fac200 * absa(ind0-1,ig) + &
+              fac100 * absa(ind0,ig)   + &
+              fac000 * absa(ind0+1,ig) + &
+              fac210 * absa(ind0+8,ig) + &
+              fac110 * absa(ind0+9,ig) + &
+              fac010 * absa(ind0+10,ig))
           else
 !$NEC unroll(NG13)
-            tau_major(1:ng13) = speccomb *   &
-             (fac000 * absa(ind0,1:ng13)   + &
-              fac100 * absa(ind0+1,1:ng13) + &
-              fac010 * absa(ind0+9,1:ng13) + &
-              fac110 * absa(ind0+10,1:ng13))
+            tau_major(ig) = speccomb *   &
+             (fac000 * absa(ind0,ig)   + &
+              fac100 * absa(ind0+1,ig) + &
+              fac010 * absa(ind0+9,ig) + &
+              fac110 * absa(ind0+10,ig))
           endif
 
           if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 *  &
-             (fac001 * absa(ind1,1:ng13)    + &
-              fac101 * absa(ind1+1,1:ng13)  + &
-              fac201 * absa(ind1+2,1:ng13)  + &
-              fac011 * absa(ind1+9,1:ng13)  + &
-              fac111 * absa(ind1+10,1:ng13) + &
-              fac211 * absa(ind1+11,1:ng13))
+            tau_major1(ig) = speccomb1 *  &
+             (fac001 * absa(ind1,ig)    + &
+              fac101 * absa(ind1+1,ig)  + &
+              fac201 * absa(ind1+2,ig)  + &
+              fac011 * absa(ind1+9,ig)  + &
+              fac111 * absa(ind1+10,ig) + &
+              fac211 * absa(ind1+11,ig))
           else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 * &
-             (fac201 * absa(ind1-1,1:ng13) + &
-              fac101 * absa(ind1,1:ng13)   + &
-              fac001 * absa(ind1+1,1:ng13) + &
-              fac211 * absa(ind1+8,1:ng13) + &
-              fac111 * absa(ind1+9,1:ng13) + &
-              fac011 * absa(ind1+10,1:ng13))
+            tau_major1(ig) = speccomb1 * &
+             (fac201 * absa(ind1-1,ig) + &
+              fac101 * absa(ind1,ig)   + &
+              fac001 * absa(ind1+1,ig) + &
+              fac211 * absa(ind1+8,ig) + &
+              fac111 * absa(ind1+9,ig) + &
+              fac011 * absa(ind1+10,ig))
           else
 !$NEC unroll(NG13)
-            tau_major1(1:ng13) = speccomb1 * &
-             (fac001 * absa(ind1,1:ng13)   + &
-              fac101 * absa(ind1+1,1:ng13) + &
-              fac011 * absa(ind1+9,1:ng13) + &
-              fac111 * absa(ind1+10,1:ng13))
+            tau_major1(ig) = speccomb1 * &
+             (fac001 * absa(ind1,ig)   + &
+              fac101 * absa(ind1+1,ig) + &
+              fac011 * absa(ind1+9,ig) + &
+              fac111 * absa(ind1+10,ig))
           endif
-
+          enddo
           !$ACC LOOP SEQ PRIVATE(taufor, tauself, co2m1, co2m2, absco2, &
           !$ACC   com1, com2, absco)
 !$NEC unroll(NG13)
@@ -358,8 +375,10 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ! Upper atmosphere loop
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(indm, abso3)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(indm)
       do lay = laytrop_max+1, KLEV
@@ -378,10 +397,17 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
 
       enddo
       !$ACC END PARALLEL
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       IF (laytrop_max /= laytrop_min) THEN
         ! Mixed loop
         ! Lower atmosphere part
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
+        !$OMP   specmult1, js1, fs1, speccomb_mco2, specparm_mco2, specmult_mco2, jmco2, fmco2, chi_co2, ratco2, adjfac, &
+        !$OMP   adjcolco2, speccomb_mco, specparm_mco, specmult_mco, jmco, fmco, speccomb_planck, specparm_planck, &
+        !$OMP   specmult_planck, jpl, fpl, ind0, ind1, inds, indf, indm, p, p4, fk0, fk1, fk2, fac000, fac100, fac200, &
+        !$OMP   fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, fac211, tau_major, tau_major1, &
+        !$OMP tauself, taufor, co2m1, absco2, com1, com2, absco, abso3)
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
         !$ACC   specmult1, js1, fs1, speccomb_mco2, specparm_mco2, specmult_mco2, jmco2, fmco2, chi_co2, ratco2, adjfac, &
@@ -389,7 +415,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
         !$ACC   specmult_planck, jpl, fpl, ind0, ind1, inds, indf, indm, p, p4, fk0, fk1, fk2, fac000, fac100, fac200, &
         !$ACC   fac010, fac110, fac210, fac001, fac101, fac201, fac011, fac111, fac211, tau_major, tau_major1)
         do lay = laytrop_min+1, laytrop_max
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
           do jl = KIDIA, KFDIA
             if ( lay <= laytrop(jl) ) then
 #else
@@ -514,60 +540,62 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
               fac211 = 0._JPRB
             endif
 
+            do ig = 1, ng13
             if (specparm .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *    &
-              (fac000 * absa(ind0,1:ng13)    + &
-                fac100 * absa(ind0+1,1:ng13)  + &
-                fac200 * absa(ind0+2,1:ng13)  + &
-                fac010 * absa(ind0+9,1:ng13)  + &
-                fac110 * absa(ind0+10,1:ng13) + &
-                fac210 * absa(ind0+11,1:ng13))
+              tau_major(ig) = speccomb *    &
+              (fac000 * absa(ind0,ig)    + &
+                fac100 * absa(ind0+1,ig)  + &
+                fac200 * absa(ind0+2,ig)  + &
+                fac010 * absa(ind0+9,ig)  + &
+                fac110 * absa(ind0+10,ig) + &
+                fac210 * absa(ind0+11,ig))
             else if (specparm .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *   &
-              (fac200 * absa(ind0-1,1:ng13) + &
-                fac100 * absa(ind0,1:ng13)   + &
-                fac000 * absa(ind0+1,1:ng13) + &
-                fac210 * absa(ind0+8,1:ng13) + &
-                fac110 * absa(ind0+9,1:ng13) + &
-                fac010 * absa(ind0+10,1:ng13))
+              tau_major(ig) = speccomb *   &
+              (fac200 * absa(ind0-1,ig) + &
+                fac100 * absa(ind0,ig)   + &
+                fac000 * absa(ind0+1,ig) + &
+                fac210 * absa(ind0+8,ig) + &
+                fac110 * absa(ind0+9,ig) + &
+                fac010 * absa(ind0+10,ig))
             else
 !$NEC unroll(NG13)
-              tau_major(1:ng13) = speccomb *   &
-              (fac000 * absa(ind0,1:ng13)   + &
-                fac100 * absa(ind0+1,1:ng13) + &
-                fac010 * absa(ind0+9,1:ng13) + &
-                fac110 * absa(ind0+10,1:ng13))
+              tau_major(ig) = speccomb *   &
+              (fac000 * absa(ind0,ig)   + &
+                fac100 * absa(ind0+1,ig) + &
+                fac010 * absa(ind0+9,ig) + &
+                fac110 * absa(ind0+10,ig))
             endif
 
             if (specparm1 .lt. 0.125_JPRB) then
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 *  &
-              (fac001 * absa(ind1,1:ng13)    + &
-                fac101 * absa(ind1+1,1:ng13)  + &
-                fac201 * absa(ind1+2,1:ng13)  + &
-                fac011 * absa(ind1+9,1:ng13)  + &
-                fac111 * absa(ind1+10,1:ng13) + &
-                fac211 * absa(ind1+11,1:ng13))
+              tau_major1(ig) = speccomb1 *  &
+              (fac001 * absa(ind1,ig)    + &
+                fac101 * absa(ind1+1,ig)  + &
+                fac201 * absa(ind1+2,ig)  + &
+                fac011 * absa(ind1+9,ig)  + &
+                fac111 * absa(ind1+10,ig) + &
+                fac211 * absa(ind1+11,ig))
             else if (specparm1 .gt. 0.875_JPRB) then
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 * &
-              (fac201 * absa(ind1-1,1:ng13) + &
-                fac101 * absa(ind1,1:ng13)   + &
-                fac001 * absa(ind1+1,1:ng13) + &
-                fac211 * absa(ind1+8,1:ng13) + &
-                fac111 * absa(ind1+9,1:ng13) + &
-                fac011 * absa(ind1+10,1:ng13))
+              tau_major1(ig) = speccomb1 * &
+              (fac201 * absa(ind1-1,ig) + &
+                fac101 * absa(ind1,ig)   + &
+                fac001 * absa(ind1+1,ig) + &
+                fac211 * absa(ind1+8,ig) + &
+                fac111 * absa(ind1+9,ig) + &
+                fac011 * absa(ind1+10,ig))
             else
 !$NEC unroll(NG13)
-              tau_major1(1:ng13) = speccomb1 * &
-              (fac001 * absa(ind1,1:ng13)   + &
-                fac101 * absa(ind1+1,1:ng13) + &
-                fac011 * absa(ind1+9,1:ng13) + &
-                fac111 * absa(ind1+10,1:ng13))
+              tau_major1(ig) = speccomb1 * &
+              (fac001 * absa(ind1,ig)   + &
+                fac101 * absa(ind1+1,ig) + &
+                fac011 * absa(ind1+9,ig) + &
+                fac111 * absa(ind1+10,ig))
             endif
-
+            enddo
+         
 !$NEC unroll(NG13)
             !$ACC LOOP SEQ PRIVATE(tauself, taufor, co2m1, absco2, com1, com2, absco)
             do ig = 1, ng13
@@ -593,7 +621,7 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
               fracs(jl,ngs12+ig,lay) = fracrefa(ig,jpl) + fpl * &
                   (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
          else
 #else
           enddo
@@ -614,17 +642,21 @@ REAL(KIND=JPRB)   :: colco(KIDIA:KFDIA,KLEV) !left =0 for now,not passed from rr
               taug(jl,ngs12+ig,lay) = colo3(jl,lay)*abso3
               fracs(jl,ngs12+ig,lay) =  fracrefb(ig)
             enddo
-#ifdef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
            endif
 #endif
           enddo
 
         enddo
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       ENDIF
 
       !$ACC WAIT
       !$ACC END DATA
+      !$OMP END TARGET DATA
+      !$OMP TARGET EXIT DATA MAP(DELETE:colco)
+      !$OMP END TARGET DATA
 
 END SUBROUTINE RRTM_TAUMOL13

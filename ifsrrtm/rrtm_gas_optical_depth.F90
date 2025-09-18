@@ -16,9 +16,8 @@ USE YOMHOOK   ,ONLY : LHOOK, DR_HOOK, JPHOOK
 
 USE PARRRTM  , ONLY : JPBAND   ,JPXSEC
 USE YOERRTM  , ONLY : JPGPT
-
+use radiation_io, only : nulout
 IMPLICIT NONE
-
 INTEGER(KIND=JPIM),INTENT(IN)    :: KIDIA
 INTEGER(KIND=JPIM),INTENT(IN)    :: KFDIA
 INTEGER(KIND=JPIM),INTENT(IN)    :: KLEV
@@ -71,7 +70,13 @@ REAL(KIND=JPRB) :: ZTAU   (KIDIA:KFDIA,JPGPT,KLEV)
 INTEGER(KIND=JPIM) :: JI, JLEV
 INTEGER(KIND=JPIM) :: JLON
 INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max, iplon
+#if defined(OMPGPU)
+INTEGER(KIND=JPIM) :: I,J,K
+#endif
 REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    integer :: s1, s2, s3
+#endif
 
 #include "rrtm_taumol1.intfb.h"
 #include "rrtm_taumol10.intfb.h"
@@ -92,12 +97,29 @@ REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
 IF (LHOOK) CALL DR_HOOK('RRTM_GAS_OPTICAL_DEPTH',0,ZHOOK_HANDLE)
 
+#if defined(OMPGPU)
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+do k=1,SIZE(PFRAC,3)
+   do j=1,SIZE(PFRAC,2)
+      do i=1,SIZE(PFRAC,1)
+         PFRAC(i,j,k) = 0.0_jprb
+      end do
+   end do
+end do
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+#else
+
 !$ACC KERNELS DEFAULT(NONE) PRESENT(PFRAC) ASYNC(1)
 PFRAC(:,:,:) = 0.0_jprb
 !$ACC END KERNELS
 
-ASSOCIATE(NFLEVG=>KLEV)
+#endif
 
+ASSOCIATE(NFLEVG=>KLEV)
+!$OMP TARGET ENTER DATA MAP(ALLOC: ZTAU)
+!$OMP TARGET DATA MAP(PRESENT, ALLOC: POD)
 !$ACC DATA CREATE(ZTAU) PRESENT(POD)
 
 #if defined(_OPENACC) || defined(OMPGPU)
@@ -116,7 +138,7 @@ end do
 laytrop_min = MINVAL(klaytrop(KIDIA:KFDIA))
 laytrop_max = MAXVAL(klaytrop(KIDIA:KFDIA))
 #endif
-
+!$OMP TARGET ENTER DATA MAP(TO:laytrop_min,laytrop_max)
 CALL RRTM_TAUMOL1  (KIDIA,KFDIA,KLEV,ZTAU,PAVEL,&
  & PTAUAERL,PFAC00,PFAC01,PFAC10,PFAC11,PFORFAC,PFORFRAC,KINDFOR,KJP,KJT,KJT1,&
  & PCOLH2O,KLAYTROP,PSELFFAC,PSELFFRAC,KINDSELF,PFRAC, PMINORFRAC, &
@@ -194,8 +216,31 @@ CALL RRTM_TAUMOL16 (KIDIA,KFDIA,KLEV,ZTAU,&
     ! print*,'ZTAU15= ',sum(ZTAU(:,137:138,:),2)
     ! print*,'ZTAU16= ',sum(ZTAU(:,139:140,:),2)
 
+#ifdef DEBUG
+write(nulout,'(a,a,a,i0,a)') "    ", __FILE__, " : LINE = ", __LINE__, " This has poor performance probably because of the indexing into ZTAU"
+#endif
 
 !- Loop over g-channels.
+!
+! POD(JPGPT,KLEV,KIDIA:KFDIA)
+! ZTAU(KIDIA:KFDIA,JPGPT,KLEV)
+!N1=(KFDIA-KIDIA)
+!N2=JPGPT
+!N3=KLEV
+!INDEX_RHS = JLON + (JI-1)*N1 + (JLEV-1)*N1*N2
+!INDEX_LHS = (JLON-1)*N2*N3 + JI + (JLEV-1)*N2
+
+#if defined(OMPGPU)
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+DO JLEV = 1, KLEV
+  DO JLON = KIDIA, KFDIA
+    DO JI = 1, JPGPT
+      POD(JI,JLEV,JLON) = ZTAU(JLON,JI,JLEV)
+    ENDDO
+  ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
 !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
 !$ACC LOOP GANG VECTOR TILE(1,8,32)
 DO JLEV = 1, KLEV
@@ -207,12 +252,34 @@ DO JLEV = 1, KLEV
   ENDDO
 ENDDO
 !$ACC END PARALLEL
+#endif
 !     -----------------------------------------------------------------
 
 !$ACC WAIT
 !$ACC END DATA
+!$OMP TARGET EXIT DATA MAP(DELETE: ZTAU)
+!$OMP TARGET EXIT DATA MAP(DELETE:laytrop_min,laytrop_max)
+!$OMP END TARGET DATA
 
 END ASSOCIATE
+
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(PFRAC,POD)
+    !$ACC UPDATE HOST(PFRAC) ASYNC(1)
+    !$ACC UPDATE HOST(POD) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = size(PFRAC,1)/2
+    s2 = size(PFRAC,2)/2
+    s3 = size(PFRAC,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "PFRAC=", PFRAC(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(POD,1)/2
+    s2 = size(POD,2)/2
+    s3 = size(POD,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "POD=", POD(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
 IF (LHOOK) CALL DR_HOOK('RRTM_GAS_OPTICAL_DEPTH',1,ZHOOK_HANDLE)
 

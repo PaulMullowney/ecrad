@@ -58,7 +58,7 @@ USE YOMHOOK  , ONLY : LHOOK, DR_HOOK, JPHOOK
 USE PARSRTM  , ONLY : JPB1, JPB2
 USE YOESRTM  , ONLY : JPGPT
 USE YOESRTWN , ONLY : NGC
-
+use radiation_io, only : nulout
 IMPLICIT NONE
 
 !     ------------------------------------------------------------------
@@ -108,6 +108,9 @@ REAL(KIND=JPRB) :: ZSFLXZEN(KIDIA:KFDIA,16) ! Incoming solar flux
 
 REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    integer :: s1, s2, s3
+#endif
 
 #include "srtm_taumol16.intfb.h"
 #include "srtm_taumol17.intfb.h"
@@ -128,6 +131,12 @@ REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
 IF (LHOOK) CALL DR_HOOK('SRTM_GAS_OPTICAL_DEPTH',0,ZHOOK_HANDLE)
 
+!$OMP TARGET ENTER DATA MAP(ALLOC:IW, ZTAUG, ZTAUR, ZSFLXZEN)
+!$OMP TARGET DATA MAP(PRESENT, ALLOC:PONEMINUS, PRMU0, KLAYTROP, PCOLCH4, PCOLCO2, PCOLH2O, &
+!$OMP             PCOLMOL, PCOLO2, PCOLO3, PFORFAC, PFORFRAC, KINDFOR, PSELFFAC, &
+!$OMP             PSELFFRAC, KINDSELF, PFAC00, PFAC01, PFAC10, PFAC11, KJP, &
+!$OMP             KJT, KJT1, POD, PSSA, PINCSOL)
+
 !$ACC DATA CREATE(IW, ZTAUG, ZTAUR, ZSFLXZEN) &
 !$ACC     PRESENT(PONEMINUS, PRMU0, KLAYTROP, PCOLCH4, PCOLCO2, PCOLH2O, &
 !$ACC             PCOLMOL, PCOLO2, PCOLO3, PFORFAC, PFORFRAC, KINDFOR, PSELFFAC, &
@@ -138,6 +147,8 @@ IB1=JPB1
 IB2=JPB2
 
 ICOUNT=0
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO REDUCTION(+:ICOUNT)
 !$ACC WAIT
 !$ACC PARALLEL LOOP GANG VECTOR DEFAULT(NONE) REDUCTION(+:ICOUNT)
 DO JL = KIDIA, KFDIA
@@ -147,6 +158,7 @@ DO JL = KIDIA, KFDIA
   ENDIF
 ENDDO
 !$ACC END PARALLEL LOOP
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
 #if defined(_OPENACC) || defined(OMPGPU)
     laytrop_min = HUGE(laytrop_min)
@@ -164,7 +176,7 @@ ENDDO
     laytrop_min = MINVAL(klaytrop(KIDIA:KFDIA))
     laytrop_max = MAXVAL(klaytrop(KIDIA:KFDIA))
 #endif
-
+!$OMP TARGET ENTER DATA MAP(TO:laytrop_min,laytrop_max)
 IF (ICOUNT/=0) THEN
 
   DO JB = IB1, IB2
@@ -182,7 +194,7 @@ IF (ICOUNT/=0) THEN
       &   PCOLH2O , PCOLCH4  , PCOLMOL  ,&
       &   KLAYTROP, PSELFFAC , PSELFFRAC, KINDSELF, PFORFAC  , PFORFRAC, KINDFOR ,&
       &   ZSFLXZEN, ZTAUG    , ZTAUR    , PRMU0,     &
-      &   laytrop_min=laytrop_min, laytrop_max=laytrop_max)
+      &   laytrop_min, laytrop_max)
 
     ELSEIF (JB == 17) THEN
       CALL SRTM_TAUMOL17 &
@@ -322,6 +334,7 @@ IF (ICOUNT/=0) THEN
     DO JG=1,IGT
 ! Added for DWD (2020)
 !NEC$ ivdep
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
       !$ACC LOOP GANG(STATIC:1) VECTOR
       DO JL = KIDIA, KFDIA
         IF (PRMU0(JL) > 0.0_JPRB) THEN
@@ -330,7 +343,9 @@ IF (ICOUNT/=0) THEN
           PINCSOL(JL,IW(JL)) = ZSFLXZEN(JL,JG)
         ENDIF
       ENDDO
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
       !$ACC LOOP SEQ
       DO JK=1,KLEV
         !$ACC LOOP GANG(STATIC:1) VECTOR PRIVATE(JL)
@@ -341,7 +356,7 @@ IF (ICOUNT/=0) THEN
           ENDIF
         ENDDO
       ENDDO
-
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDDO   !-- end loop on JG (g point)
     !$ACC END PARALLEL
 
@@ -352,7 +367,33 @@ ENDIF
 !$ACC WAIT
 !$ACC END DATA
 
+!$OMP TARGET EXIT DATA MAP(DELETE:laytrop_min,laytrop_max)
+!$OMP TARGET EXIT DATA MAP(DELETE: IW, ZTAUG, ZTAUR, ZSFLXZEN)
+!$OMP END TARGET DATA
+
 !     ------------------------------------------------------------------
+
+#ifdef DEBUG_CORRECTNESS_IFSRRTM
+    write(nulout,'(a)') "*******************************************************************"
+    write(nulout,'(a,a,a,i0)') "Correctness Check : ", __FILE__, " : LINE = ", __LINE__
+    !$OMP TARGET UPDATE FROM(PSSA,POD,PINCSOL)
+    !$ACC UPDATE HOST(PINCSOL) ASYNC(1)
+    !$ACC UPDATE HOST(PSSA) ASYNC(1)
+    !$ACC UPDATE HOST(POD) ASYNC(1)
+    !$ACC WAIT(1)
+    s1 = size(POD,1)/2
+    s2 = size(POD,2)/2
+    s3 = size(POD,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "POD=", POD(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(PSSA,1)/2
+    s2 = size(PSSA,2)/2
+    s3 = size(PSSA,3)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0,a,i0)') "PSSA=", PSSA(s1,s2,s3), " at indices ", s1, " ", s2, " ", s3
+    s1 = size(PINCSOL,1)/2
+    s2 = size(PINCSOL,2)/2
+    write(nulout,'(a,g0.5,a,i0,a,i0)') "PINCSOL=", PINCSOL(s1,s2), " at indices ", s1, " ", s2
+    write(nulout,'(a)') "*******************************************************************"
+#endif
 
 IF (LHOOK) CALL DR_HOOK('SRTM_GAS_OPTICAL_DEPTH',1,ZHOOK_HANDLE)
 
