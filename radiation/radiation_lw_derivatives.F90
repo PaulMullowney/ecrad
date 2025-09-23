@@ -36,6 +36,15 @@ module radiation_lw_derivatives
 
   public
 
+  !$omp declare target(calc_lw_derivatives_ica)
+  !$omp declare target(modify_lw_derivatives_ica)
+#if defined(OMPGPU)
+  !$omp declare target(calc_lw_derivatives_ica_omp)
+  !$omp declare target(modify_lw_derivatives_ica_omp)
+  !$omp declare target(calc_lw_derivatives_ica_omp_gm)
+  !$omp declare target(modify_lw_derivatives_ica_omp_gm)
+#endif
+
 contains
 
   !---------------------------------------------------------------------
@@ -43,7 +52,8 @@ contains
   subroutine calc_lw_derivatives_ica(ng, nlev, icol, transmittance, flux_up_surf, lw_derivatives)
 
     use parkind1, only           : jprb
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     use yomhook,  only           : lhook, dr_hook, jphook
 #endif
 
@@ -67,13 +77,15 @@ contains
 
     integer    :: jlev, jg
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     real(jphook) :: hook_handle
 #endif
 
     !$ACC ROUTINE WORKER
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica',0,hook_handle)
 #endif
 
@@ -103,13 +115,191 @@ contains
       lw_derivatives(icol,jlev) = sum_lw_derivatives_g
     end do
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica',1,hook_handle)
 #endif
 
   end subroutine calc_lw_derivatives_ica
 
+#if defined(OMPGPU)
+  !---------------------------------------------------------------------
+  ! Calculation for the Independent Column Approximation
+  subroutine calc_lw_derivatives_ica_omp(ng, nlev, icol, transmittance, flux_up_surf, lw_derivatives)
 
+    use parkind1, only           : jprb
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    use yomhook,  only           : lhook, dr_hook, jphook
+#endif
+
+    implicit none
+
+    ! Inputs
+    integer,    intent(in) :: ng   ! number of spectral intervals
+    integer,    intent(in) :: nlev ! number of levels
+    integer,    intent(in) :: icol ! Index of column for output
+    real(jprb), intent(in) :: transmittance(ng,nlev)
+    real(jprb), intent(in) :: flux_up_surf(ng) ! Upwelling surface spectral flux (W m-2)
+    
+    ! Output
+    real(jprb), intent(out) :: lw_derivatives(:,:) ! dimensioned (ncol,nlev+1)
+
+    ! Rate of change of spectral flux at a given height with respect
+    ! to the surface value
+    real(jprb) :: lw_derivatives_g(ng)
+
+    real(jprb) :: sum_flux_up_surf, sum_lw_derivatives_g
+
+    integer    :: jlev, jg
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    real(jphook) :: hook_handle
+#endif
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica_omp',0,hook_handle)
+#endif
+
+    sum_flux_up_surf = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO REDUCTION(+: sum_flux_up_surf)
+#endif
+    do jg = 1,ng
+       sum_flux_up_surf = sum_flux_up_surf + flux_up_surf(jg)
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    ! Initialize the derivatives at the surface
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO
+#endif
+    do jg = 1,ng
+      lw_derivatives_g(jg) = flux_up_surf(jg) / sum_flux_up_surf
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    lw_derivatives(icol, nlev+1) = 1.0_jprb
+
+    ! Move up through the atmosphere computing the derivatives at each
+    ! half-level
+    do jlev = nlev,1,-1
+      sum_lw_derivatives_g = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP PARALLEL DO REDUCTION(+:sum_lw_derivatives_g)
+#endif
+      do jg = 1,ng
+        lw_derivatives_g(jg) = lw_derivatives_g(jg) * transmittance(jg,jlev)
+        sum_lw_derivatives_g = sum_lw_derivatives_g + lw_derivatives_g(jg)
+      end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP END PARALLEL DO
+#endif
+      lw_derivatives(icol,jlev) = sum_lw_derivatives_g
+    end do
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica_omp',1,hook_handle)
+#endif
+
+  end subroutine calc_lw_derivatives_ica_omp
+
+  
+  !---------------------------------------------------------------------
+  ! Calculation for the Independent Column Approximation
+  ! uses global memory to for writing out the results of the reduction
+  subroutine calc_lw_derivatives_ica_omp_gm(ng, nlev, icol, transmittance, flux_up_surf, lw_derivatives, lw_derivatives_g)
+
+    use parkind1, only           : jprb
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    use yomhook,  only           : lhook, dr_hook, jphook
+#endif
+
+    implicit none
+
+    ! Inputs
+    integer,    intent(in) :: ng   ! number of spectral intervals
+    integer,    intent(in) :: nlev ! number of levels
+    integer,    intent(in) :: icol ! Index of column for output
+    real(jprb), intent(in) :: transmittance(ng,nlev)
+    real(jprb), intent(in) :: flux_up_surf(ng) ! Upwelling surface spectral flux (W m-2)
+    
+    ! Output
+    real(jprb), intent(out) :: lw_derivatives(:,:) ! dimensioned (ncol,nlev+1)
+
+    ! Rate of change of spectral flux at a given height with respect
+    ! to the surface value
+    real(jprb), intent(inout) :: lw_derivatives_g(ng)
+
+    real(jprb) :: sum_flux_up_surf, sum_lw_derivatives_g
+
+    integer    :: jlev, jg
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    real(jphook) :: hook_handle
+#endif
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica_omp',0,hook_handle)
+#endif
+
+    sum_flux_up_surf = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO REDUCTION(+: sum_flux_up_surf)
+#endif
+    do jg = 1,ng
+       sum_flux_up_surf = sum_flux_up_surf + flux_up_surf(jg)
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    ! Initialize the derivatives at the surface
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO
+
+#endif
+    do jg = 1,ng
+      lw_derivatives_g(jg) = flux_up_surf(jg) / sum_flux_up_surf
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    lw_derivatives(icol, nlev+1) = 1.0_jprb
+
+    ! Move up through the atmosphere computing the derivatives at each
+    ! half-level
+    do jlev = nlev,1,-1
+      sum_lw_derivatives_g = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP PARALLEL DO REDUCTION(+:sum_lw_derivatives_g)
+#endif
+      do jg = 1,ng
+        lw_derivatives_g(jg) = lw_derivatives_g(jg) * transmittance(jg,jlev)
+        sum_lw_derivatives_g = sum_lw_derivatives_g + lw_derivatives_g(jg)
+      end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP END PARALLEL DO
+#endif
+      lw_derivatives(icol,jlev) = sum_lw_derivatives_g
+    end do
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:calc_lw_derivatives_ica_omp_gm',1,hook_handle)
+#endif
+
+  end subroutine calc_lw_derivatives_ica_omp_gm
+
+#endif ! OMPGPU
+  
   !---------------------------------------------------------------------
   ! Calculation for the Independent Column Approximation
   subroutine modify_lw_derivatives_ica(ng, nlev, icol, transmittance, &
@@ -139,13 +329,15 @@ contains
 
     integer    :: jlev, jg
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     real(jphook) :: hook_handle
 #endif
 
     !$ACC ROUTINE WORKER
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica',0,hook_handle)
 #endif
 
@@ -178,14 +370,198 @@ contains
            &                    + weight * sum_lw_derivatives_g
     end do
 
-#ifndef _OPENACC
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
     if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica',1,hook_handle)
 #endif
 
   end subroutine modify_lw_derivatives_ica
 
+#if defined(OMPGPU)
+  
+  !---------------------------------------------------------------------
+  ! Calculation for the Independent Column Approximation
+  subroutine modify_lw_derivatives_ica_omp(ng, nlev, icol, transmittance, &
+       &                               flux_up_surf, weight, lw_derivatives)
 
+    use parkind1, only           : jprb
+    use yomhook,  only           : lhook, dr_hook, jphook
 
+    implicit none
+
+    ! Inputs
+    integer,    intent(in) :: ng   ! number of spectral intervals
+    integer,    intent(in) :: nlev ! number of levels
+    integer,    intent(in) :: icol ! Index of column for output
+    real(jprb), intent(in) :: transmittance(ng,nlev)
+    real(jprb), intent(in) :: flux_up_surf(ng) ! Upwelling surface spectral flux (W m-2)
+    real(jprb), intent(in) :: weight ! Weight new values against existing
+    
+    ! Output
+    real(jprb), intent(inout) :: lw_derivatives(:,:) ! dimensioned (ncol,nlev+1)
+
+    ! Rate of change of spectral flux at a given height with respect
+    ! to the surface value
+    real(jprb) :: lw_derivatives_g(ng)
+
+    real(jprb) :: sum_flux_up_surf, sum_lw_derivatives_g
+
+    integer    :: jlev, jg
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    real(jphook) :: hook_handle
+#endif
+
+    !$ACC ROUTINE WORKER
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica_omp',0,hook_handle)
+#endif
+
+    sum_flux_up_surf = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO REDUCTION(+:sum_flux_up_surf)
+#endif
+    do jg = 1,ng
+      sum_flux_up_surf = sum_flux_up_surf + flux_up_surf(jg)
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    ! Initialize the derivatives at the surface
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO
+#endif
+    do jg = 1,ng
+      lw_derivatives_g(jg) = flux_up_surf(jg) / sum_flux_up_surf
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+
+    ! This value must be 1 so no weighting applied
+    lw_derivatives(icol, nlev+1) = 1.0_jprb
+
+    ! Move up through the atmosphere computing the derivatives at each
+    ! half-level
+    do jlev = nlev,1,-1
+      sum_lw_derivatives_g = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP PARALLEL DO REDUCTION(+:sum_lw_derivatives_g)
+#endif
+      do jg = 1,ng
+        lw_derivatives_g(jg) = lw_derivatives_g(jg) * transmittance(jg,jlev)
+        sum_lw_derivatives_g = sum_lw_derivatives_g + lw_derivatives_g(jg)
+      end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP END PARALLEL DO
+#endif
+      lw_derivatives(icol,jlev) = (1.0_jprb - weight) * lw_derivatives(icol,jlev) &
+           &                    + weight * sum_lw_derivatives_g
+    end do
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica_omp',1,hook_handle)
+#endif
+
+  end subroutine modify_lw_derivatives_ica_omp
+
+  !---------------------------------------------------------------------
+  ! Calculation for the Independent Column Approximation
+  ! uses global memory to for writing out the results of the reduction
+  subroutine modify_lw_derivatives_ica_omp_gm(ng, nlev, icol, transmittance, &
+       &                               flux_up_surf, weight, lw_derivatives, lw_derivatives_g)
+
+    use parkind1, only           : jprb
+    use yomhook,  only           : lhook, dr_hook, jphook
+
+    implicit none
+
+    ! Inputs
+    integer,    intent(in) :: ng   ! number of spectral intervals
+    integer,    intent(in) :: nlev ! number of levels
+    integer,    intent(in) :: icol ! Index of column for output
+    real(jprb), intent(in) :: transmittance(ng,nlev)
+    real(jprb), intent(in) :: flux_up_surf(ng) ! Upwelling surface spectral flux (W m-2)
+    real(jprb), intent(in) :: weight ! Weight new values against existing
+    
+    ! Output
+    real(jprb), intent(inout) :: lw_derivatives(:,:) ! dimensioned (ncol,nlev+1)
+
+    ! Rate of change of spectral flux at a given height with respect
+    ! to the surface value
+    real(jprb), intent(inout) :: lw_derivatives_g(ng)
+
+    real(jprb) :: sum_flux_up_surf, sum_lw_derivatives_g
+
+    integer    :: jlev, jg
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    real(jphook) :: hook_handle
+#endif
+
+    !$ACC ROUTINE WORKER
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica_omp_gm',0,hook_handle)
+#endif
+
+    sum_flux_up_surf = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO REDUCTION(+:sum_flux_up_surf)
+#endif
+    do jg = 1,ng
+      sum_flux_up_surf = sum_flux_up_surf + flux_up_surf(jg)
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+    ! Initialize the derivatives at the surface
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP PARALLEL DO
+#endif
+    do jg = 1,ng
+      lw_derivatives_g(jg) = flux_up_surf(jg) / sum_flux_up_surf
+    end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+    !$OMP END PARALLEL DO
+#endif
+
+    ! This value must be 1 so no weighting applied
+    lw_derivatives(icol, nlev+1) = 1.0_jprb
+
+    ! Move up through the atmosphere computing the derivatives at each
+    ! half-level
+    do jlev = nlev,1,-1
+      sum_lw_derivatives_g = 0.0_jprb
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP PARALLEL DO REDUCTION(+:sum_lw_derivatives_g)
+#endif
+      do jg = 1,ng
+        lw_derivatives_g(jg) = lw_derivatives_g(jg) * transmittance(jg,jlev)
+        sum_lw_derivatives_g = sum_lw_derivatives_g + lw_derivatives_g(jg)
+      end do
+#ifndef WORKAROUND_NESTED_PARALLEL_LW_DERIVATIVES
+      !$OMP END PARALLEL DO
+#endif
+      lw_derivatives(icol,jlev) = (1.0_jprb - weight) * lw_derivatives(icol,jlev) &
+           &                    + weight * sum_lw_derivatives_g
+    end do
+
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_lw_derivatives:modify_lw_derivatives_ica_omp_gm',1,hook_handle)
+#endif
+
+  end subroutine modify_lw_derivatives_ica_omp_gm
+
+#endif !OMPGPU
+  
   !---------------------------------------------------------------------
   ! Calculation for solvers involving multiple regions and matrices
   subroutine calc_lw_derivatives_matrix(ng, nlev, nreg, icol, transmittance, &

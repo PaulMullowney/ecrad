@@ -225,6 +225,8 @@ contains
     use radiation_mcica_lw,       only : solver_mcica_lw
     use radiation_mcica_acc_sw,   only : solver_mcica_acc_sw
     use radiation_mcica_acc_lw,   only : solver_mcica_acc_lw
+    use radiation_mcica_omp_sw,   only : solver_mcica_omp_sw
+    use radiation_mcica_omp_lw,   only : solver_mcica_omp_lw
     use radiation_cloudless_sw,   only : solver_cloudless_sw
     use radiation_cloudless_lw,   only : solver_cloudless_lw
     use radiation_homogeneous_sw, only : solver_homogeneous_sw
@@ -241,6 +243,14 @@ contains
     use radiation_cloud_optics,   only : cloud_optics
     use radiation_general_cloud_optics, only : general_cloud_optics
     use radiation_aerosol_optics, only : add_aerosol_optics
+
+#ifdef HAVE_NVTX
+    use nvtx
+#endif
+#ifdef HAVE_ROCTX
+    use roctx_profiling, only: roctxstartrange, roctxendrange
+    use iso_c_binding, only: c_null_char
+#endif
 
     ! Inputs
     integer, intent(in) :: ncol               ! number of columns
@@ -305,6 +315,8 @@ contains
     ! g-points
     real(jprb), dimension(config%n_g_sw,istartcol:iendcol) :: incoming_sw
 
+    real(jprb)  totalMem
+
     character(len=100) :: rad_prop_file_name
     character(*), parameter :: rad_prop_base_file_name = "radiative_properties"
 
@@ -314,11 +326,25 @@ contains
 
     if (lhook) call dr_hook('radiation_interface:radiation',0,hook_handle)
 
+    write(nulout,'(a,a,i0,a,i0,a,i0)') __FILE__, " : LINE = ", __LINE__, " n_g_lw=", config%n_g_lw, " n_g_lw_if_scattering=", config%n_g_lw_if_scattering
+    write(nulout,'(a,a,i0,a,i0,a,i0)') __FILE__, " : LINE = ", __LINE__, " n_bands_lw=", config%n_bands_lw, " n_bands_lw_if_scattering=", config%n_bands_lw_if_scattering
+
+    write(nulout,'(a,a,i0,a,i0)') __FILE__, " : LINE = ", __LINE__, " n_g_sw=", config%n_g_sw
+    write(nulout,'(a,a,i0,a,i0)') __FILE__, " : LINE = ", __LINE__, " n_bands_sw=", config%n_bands_sw
+    totalMem=(config%n_g_lw + config%n_g_lw_if_scattering*2 + config%n_bands_lw + config%n_bands_lw_if_scattering*2 + config%n_g_sw*3  + config%n_bands_sw*3 ) * nlev
+    totalMem = totalMem+(config%n_g_lw)*(nlev+1)
+    totalmem = totalMem*(iendcol-istartcol)*SIZEOF((real(jprb)))/1.e9
+    write(nulout,'(a,a,i0,a,g0.5)') __FILE__, " : LINE = ", __LINE__, " total_memory=",totalMem
+
     !$ACC DATA CREATE(od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, &
     !$ACC             od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud, &
     !$ACC             planck_hl, lw_emission, lw_albedo, sw_albedo_direct, &
     !$ACC             sw_albedo_diffuse, incoming_sw)
 
+    !$OMP TARGET ENTER DATA MAP(ALLOC: od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, &
+    !$OMP                       od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud, &
+    !$OMP                       planck_hl, lw_emission, lw_albedo, sw_albedo_direct, &
+    !$OMP                       sw_albedo_diffuse, incoming_sw)
     if (thermodynamics%pressure_hl(istartcol,2) &
          &  < thermodynamics%pressure_hl(istartcol,1)) then
       ! Input arrays are arranged in order of decreasing pressure /
@@ -331,6 +357,12 @@ contains
 
       ! Input arrays arranged in order of increasing pressure /
       ! decreasing height: progress normally
+#ifdef HAVE_NVTX
+      call nvtxStartRange("radiation::get_albedos")
+#endif
+#ifdef HAVE_ROCTX
+      call roctxStartRange("radiation::get_albedos"//c_null_char)
+#endif
 
       ! Extract surface albedos at each gridpoint
       call single_level%get_albedos(single_level, &
@@ -338,6 +370,15 @@ contains
            &                        sw_albedo_direct, sw_albedo_diffuse, &
            &                        lw_albedo)
 
+#ifdef HAVE_NVTX
+      !$ACC WAIT(1)
+      call nvtxEndRange
+      call nvtxStartRange("radiation::gas_optics")
+#endif
+#ifdef HAVE_ROCTX
+      call roctxEndRange
+      call roctxStartRange("radiation::gas_optics"//c_null_char)
+#endif
       ! Compute gas absorption optical depth in shortwave and
       ! longwave, shortwave single scattering albedo (i.e. fraction of
       ! extinction due to Rayleigh scattering), Planck functions and
@@ -366,6 +407,15 @@ contains
                &  incoming_sw=incoming_sw)
         end if
       end if
+#ifdef HAVE_NVTX
+      !$ACC WAIT(1)
+      call nvtxEndRange
+      call nvtxStartRange("radiation::cloud_optics")
+#endif
+#ifdef HAVE_ROCTX
+      call roctxEndRange
+      call roctxStartRange("radiation::cloud_optics"//c_null_char)
+#endif
 
       if (config%do_clouds) then
         ! Crop the cloud fraction to remove clouds that have too small
@@ -396,6 +446,15 @@ contains
         end if
       end if ! do_clouds
 
+#ifdef HAVE_NVTX
+      !$ACC WAIT(1)
+      call nvtxEndRange
+      call nvtxStartRange("radiation::aerosol_optics")
+#endif
+#ifdef HAVE_ROCTX
+      call roctxEndRange
+      call roctxStartRange("radiation::aerosol_optics"//c_null_char)
+#endif
       if (config%use_aerosols) then
         if (config%i_gas_model_sw == IGasModelMonochromatic) then
 !          call add_aerosol_optics_mono(nlev,istartcol,iendcol, &
@@ -407,6 +466,7 @@ contains
                &  od_lw, ssa_lw, g_lw, od_sw, ssa_sw, g_sw)
         end if
       else
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
         !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2)
         do jcol = istartcol,iendcol
@@ -425,7 +485,16 @@ contains
           end do
         end do
         !$ACC END PARALLEL
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
       end if
+
+#ifdef HAVE_NVTX
+      !$ACC WAIT(1)
+      call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+      call roctxEndRange
+#endif
 
       ! For diagnostic purposes, save these intermediate variables to
       ! a NetCDF file
@@ -436,14 +505,15 @@ contains
           write(rad_prop_file_name,'(a,a,i4.4,a,i4.4,a)') &
                &  rad_prop_base_file_name, '_', istartcol, '-',iendcol,'.nc'
         end if
-#ifdef _OPENACC
+          !$OMP TARGET UPDATE FROM(od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, &
+          !$OMP             planck_hl, lw_emission, lw_albedo, sw_albedo_direct, sw_albedo_diffuse, &
+          !$OMP             incoming_sw, od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud)
           !$ACC UPDATE HOST(od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, &
           !$ACC             planck_hl, lw_emission, lw_albedo, sw_albedo_direct, sw_albedo_diffuse, &
           !$ACC             incoming_sw, od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud)
           call cloud%update_host(cloud)
           call flux%update_host(flux)
-#endif
-        call save_radiative_properties(trim(rad_prop_file_name), &
+          call save_radiative_properties(trim(rad_prop_file_name), &
              &  nlev, istartcol, iendcol, &
              &  config, single_level, thermodynamics, cloud, &
              &  planck_hl, lw_emission, lw_albedo, &
@@ -460,29 +530,34 @@ contains
 
         !$ACC WAIT
         if (config%i_solver_lw == ISolverMcICA) then
-#ifdef _OPENACC
+          !$OMP TARGET UPDATE FROM(od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, planck_hl, lw_emission, lw_albedo)
           !$ACC UPDATE HOST(od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, planck_hl, lw_emission, lw_albedo)
           !$ACC WAIT(1)
           call cloud%update_host(cloud)
           call flux%update_host(flux)
           !$ACC WAIT(1)
-#endif
           ! Compute fluxes using the McICA longwave solver
           call solver_mcica_lw(nlev,istartcol,iendcol, &
                &  config, single_level, cloud, &
                &  od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, &
                &  g_lw_cloud, planck_hl, lw_emission, lw_albedo, flux)
-#ifdef _OPENACC
           !$ACC WAIT(1)
           call flux%update_device(flux)
           !$ACC WAIT(1)
-#endif
         else if (config%i_solver_lw == ISolverMcICAACC) then
-          ! Compute fluxes using the McICA ACC longwave solver
+           ! Compute fluxes using the McICA ACC longwave solver
+#if defined(_OPENACC)
           call solver_mcica_acc_lw(nlev,istartcol,iendcol, &
                &  config, single_level, cloud, &
                &  od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, &
                &  g_lw_cloud, planck_hl, lw_emission, lw_albedo, flux)
+#endif
+#if defined(OMPGPU)
+          call solver_mcica_omp_lw(nlev,istartcol,iendcol, &
+               &  config, single_level, cloud, &
+               &  od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, &
+               &  g_lw_cloud, planck_hl, lw_emission, lw_albedo, flux)
+#endif
         else if (config%i_solver_lw == ISolverSPARTACUS) then
           ! Compute fluxes using the SPARTACUS longwave solver
           call solver_spartacus_lw(nlev,istartcol,iendcol, &
@@ -516,31 +591,37 @@ contains
 
         !$ACC WAIT
         if (config%i_solver_sw == ISolverMcICA) then
-#ifdef _OPENACC
+          !$OMP TARGET UPDATE FROM(od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud, sw_albedo_direct, sw_albedo_diffuse, incoming_sw)
           !$ACC UPDATE HOST(od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud, sw_albedo_direct, sw_albedo_diffuse, incoming_sw)
           !$ACC WAIT(1)
           call cloud%update_host(cloud)
           call flux%update_host(flux)
           !$ACC WAIT(1)
-#endif
           ! Compute fluxes using the McICA shortwave solver
           call solver_mcica_sw(nlev,istartcol,iendcol, &
                &  config, single_level, cloud, &
                &  od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, &
                &  g_sw_cloud, sw_albedo_direct, sw_albedo_diffuse, &
                &  incoming_sw, flux)
-#ifdef _OPENACC
           !$ACC WAIT(1)
           call flux%update_device(flux)
           !$ACC WAIT(1)
-#endif
         else if (config%i_solver_sw == ISolverMcICAACC) then
           ! Compute fluxes using the McICA ACC shortwave solver
+#if defined(_OPENACC)
           call solver_mcica_acc_sw(nlev,istartcol,iendcol, &
                &  config, single_level, cloud, &
                &  od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, &
                &  g_sw_cloud, sw_albedo_direct, sw_albedo_diffuse, &
                &  incoming_sw, flux)
+#endif
+#if defined(OMPGPU)
+          call solver_mcica_omp_sw(nlev,istartcol,iendcol, &
+               &  config, single_level, cloud, &
+               &  od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, &
+               &  g_sw_cloud, sw_albedo_direct, sw_albedo_diffuse, &
+               &  incoming_sw, flux)
+#endif
         else if (config%i_solver_sw == ISolverSPARTACUS) then
           ! Compute fluxes using the SPARTACUS shortwave solver
           call solver_spartacus_sw(nlev,istartcol,iendcol, &
@@ -581,6 +662,10 @@ contains
     !$ACC WAIT
     !$ACC END DATA
 
+    !$OMP TARGET EXIT DATA MAP(DELETE:od_lw, ssa_lw, g_lw, od_lw_cloud, ssa_lw_cloud, g_lw_cloud, &
+    !$OMP                      od_sw, ssa_sw, g_sw, od_sw_cloud, ssa_sw_cloud, g_sw_cloud, &
+    !$OMP                      planck_hl, lw_emission, lw_albedo, sw_albedo_direct, &
+    !$OMP                      sw_albedo_diffuse, incoming_sw)
     if (lhook) call dr_hook('radiation_interface:radiation',1,hook_handle)
 
   end subroutine radiation
