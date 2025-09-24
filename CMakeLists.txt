@@ -85,6 +85,24 @@ ecbuild_add_option(
     CONDITION CMAKE_Fortran_COMPILER_ID MATCHES "PGI|NVHPC"
 )
 
+ecbuild_add_option( FEATURE GPU
+                    DEFAULT OFF
+                    DESCRIPTION "Compile GPU version of ECRad (Requires OpenACC or sufficient OpenMP offloading support)"
+                    CONDITION (HAVE_ACC OR HAVE_OMP) )
+
+if( HAVE_GPU )
+  if( HAVE_ACC )
+    set( GPU_OFFLOAD "ACC" )
+        ecbuild_warn( "OpenACC enabled" )
+  elseif( HAVE_OMP )
+    set( GPU_OFFLOAD "OMP" )
+        ecbuild_warn( "OpenMP offload enabled" )
+  else()
+    ecbuild_error("Could not enable GPU as OMP or ACC were not enabled")
+  endif()
+endif()
+
+
 if( CMAKE_VERSION VERSION_LESS 3.25 )
     set( NVTX_TARGET CUDA::nvToolsExt )
 else()
