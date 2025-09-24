@@ -70,6 +70,10 @@ program ecrad_ifs_driver
 #ifdef HAVE_NVTX
   use nvtx
 #endif
+#ifdef HAVE_ROCTX
+  use roctx_profiling, only: roctxstartrange, roctxendrange
+  use iso_c_binding, only: c_null_char
+#endif
 
   implicit none
 
@@ -379,7 +383,10 @@ program ecrad_ifs_driver
 #endif
 
 #ifdef HAVE_NVTX
-     call nvtxStartRange("ecrad_offload")
+  call nvtxStartRange("ecrad_offload")
+#endif
+#ifdef HAVE_ROCTX
+  call roctxStartRange("ecrad_offload"//c_null_char)
 #endif
 
 #if defined(_OPENACC) 
@@ -418,7 +425,10 @@ program ecrad_ifs_driver
   call flux%update_device(flux)
 
 #ifdef HAVE_NVTX
-     call nvtxEndRange
+  call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+  call roctxEndRange
 #endif
 
   ! --------------------------------------------------------
@@ -434,13 +444,16 @@ program ecrad_ifs_driver
   do jrepeat = 1,driver_config%nrepeat
 
 #ifndef NO_OPENMP
-    if (jrepeat == driver_config%nwarmup + 1) then
-      tstart = omp_get_wtime()
-    end if
+      if (jrepeat == driver_config%nwarmup + 1) then
+        tstart = omp_get_wtime()
+      end if
 #endif
 
 #ifdef HAVE_NVTX
-    call nvtxStartRange("ecrad_it")
+      call nvtxStartRange("ecrad_it")
+#endif
+#ifdef HAVE_ROCTX
+      call roctxStartRange("ecrad_it"//c_null_char)
 #endif
 
       ! Compute number of blocks to process
@@ -493,6 +506,12 @@ program ecrad_ifs_driver
              & )
       end do
       !$OMP END PARALLEL DO
+#ifdef HAVE_NVTX
+      call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+      call roctxEndRange
+#endif
 
   end do
 #ifdef DEBUG
@@ -535,7 +554,10 @@ program ecrad_ifs_driver
 #endif
 
 #ifdef HAVE_NVTX
-     call nvtxEndRange
+  call nvtxEndRange
+#endif
+#ifdef HAVE_ROCTX
+  call roctxEndRange
 #endif
 
 #ifndef NO_OPENMP
