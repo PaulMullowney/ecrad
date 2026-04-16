@@ -16,6 +16,7 @@
 module radiation_pdf_sampler
 
   use parkind1, only : jprb
+  use radiation_io, only : radiation_abort
 
   implicit none
   public
@@ -47,10 +48,10 @@ module radiation_pdf_sampler
     procedure :: masked_block_sample => sample_from_pdf_masked_block
     procedure :: deallocate => deallocate_pdf_sampler
 
-    procedure, nopass :: create_device
-    procedure, nopass :: update_host
-    procedure, nopass :: update_device
-    procedure, nopass :: delete_device
+    procedure :: create_device
+    procedure :: update_host
+    procedure :: update_device
+    procedure :: delete_device
 
   end type pdf_sampler_type
 
@@ -328,6 +329,16 @@ contains
   !---------------------------------------------------------------------
   ! creates fields on device
   subroutine create_device(this)
+    class(pdf_sampler_type), intent(inout) :: this
+    select type (this)
+    type is (pdf_sampler_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
+
+  subroutine create_device_impl(this)
 
     type(pdf_sampler_type), intent(inout) :: this
 
@@ -336,11 +347,21 @@ contains
 
     !$ACC ENTER DATA COPYIN(this%val) IF(allocated(this%val)) ASYNC(1)
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(pdf_sampler_type), intent(inout) :: this
+    select type (this)
+    type is (pdf_sampler_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
+
+  subroutine update_host_impl(this)
 
     type(pdf_sampler_type), intent(inout) :: this
 
@@ -349,11 +370,21 @@ contains
 
     !$ACC UPDATE HOST(this%val) IF(allocated(this%val)) ASYNC(1)
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(pdf_sampler_type), intent(inout) :: this
+    select type (this)
+    type is (pdf_sampler_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
+
+  subroutine update_device_impl(this)
 
     type(pdf_sampler_type), intent(inout) :: this
 
@@ -362,11 +393,21 @@ contains
 
     !$ACC UPDATE DEVICE(this%val) IF(allocated(this%val)) ASYNC(1)
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
   subroutine delete_device(this)
+    class(pdf_sampler_type), intent(inout) :: this
+    select type (this)
+    type is (pdf_sampler_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
+
+  subroutine delete_device_impl(this)
 
     type(pdf_sampler_type), intent(inout) :: this
 
@@ -375,6 +416,6 @@ contains
 
     !$ACC EXIT DATA DELETE(this%val) IF(allocated(this%val)) ASYNC(1)
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 end module radiation_pdf_sampler

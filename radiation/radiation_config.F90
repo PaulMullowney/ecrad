@@ -46,6 +46,7 @@ module radiation_config
   use radiation_cloud_cover,         only : OverlapName, &
        & IOverlapMaximumRandom, IOverlapExponentialRandom, IOverlapExponential
   use radiation_ecckd,               only : ckd_model_type
+  use radiation_io, only : radiation_abort, nulerr, nulout, nulrad
 
   implicit none
   public
@@ -656,10 +657,10 @@ module radiation_config
      procedure :: consolidate_sw_albedo_intervals
      procedure :: consolidate_lw_emiss_intervals
 
-     procedure, nopass :: create_device
-     procedure, nopass :: update_host
-     procedure, nopass :: update_device
-     procedure, nopass :: delete_device
+     procedure :: create_device
+     procedure :: update_host
+     procedure :: update_device
+     procedure :: delete_device
 
   end type config_type
 
@@ -679,7 +680,6 @@ contains
   subroutine read_config_from_namelist(this, file_name, unit, is_success)
 
     use yomhook,      only : lhook, dr_hook, jphook
-    use radiation_io, only : nulout, nulerr, nulrad, radiation_abort
 
     class(config_type), intent(inout)         :: this
     character(*),       intent(in),  optional :: file_name
@@ -1135,7 +1135,6 @@ contains
 
     use parkind1,     only : jprd
     use yomhook,      only : lhook, dr_hook, jphook
-    use radiation_io, only : nulout, nulerr, radiation_abort
 
     class(config_type), intent(inout)         :: this
 
@@ -1659,7 +1658,6 @@ contains
   subroutine get_sw_weights(this, wavelength1, wavelength2, &
        &                    nweights, iband, weight, weighting_name)
 
-    use radiation_io, only : nulout, nulerr, radiation_abort
     use radiation_spectral_definition, only : SolarReferenceTemperature
 
     class(config_type), intent(in) :: this
@@ -1779,7 +1777,6 @@ contains
   ! provided on nulout.
   subroutine get_sw_mapping(this, wavelength_bound, mapping, weighting_name)
 
-    use radiation_io, only : nulout, nulerr, radiation_abort
     use radiation_spectral_definition, only : SolarReferenceTemperature
 
     class(config_type), intent(in) :: this
@@ -1843,7 +1840,6 @@ contains
   subroutine define_sw_albedo_intervals(this, ninterval, wavelength_bound, &
        &                                i_intervals, do_nearest)
 
-    use radiation_io, only : nulerr, radiation_abort
     use radiation_spectral_definition, only : SolarReferenceTemperature
 
     class(config_type),   intent(inout) :: this
@@ -1891,7 +1887,6 @@ contains
   subroutine define_lw_emiss_intervals(this, ninterval, wavelength_bound, &
        &                                i_intervals, do_nearest)
 
-    use radiation_io, only : nulerr, radiation_abort
     use radiation_spectral_definition, only : TerrestrialReferenceTemperature
 
     class(config_type),   intent(inout) :: this
@@ -1936,7 +1931,6 @@ contains
   ! settings.
   subroutine set_aerosol_wavelength_mono(this, wavelength_mono)
 
-    use radiation_io, only : nulerr, radiation_abort
 
     class(config_type), intent(inout) :: this
     real(jprb),         intent(in)    :: wavelength_mono(:)
@@ -2116,7 +2110,6 @@ contains
   ! not found
   subroutine get_enum_code(str, enum_str, var_name, icode)
 
-    use radiation_io, only : nulerr, radiation_abort
 
     character(len=*), intent(in)  :: str
     character(len=*), intent(in)  :: enum_str(0:)
@@ -2213,6 +2206,16 @@ contains
   !---------------------------------------------------------------------
   ! creates fields on device
   subroutine create_device(this)
+    class(config_type), intent(inout) :: this
+    select type (this)
+    type is (config_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
+
+  subroutine create_device_impl(this)
 
     type(config_type), intent(inout) :: this
 
@@ -2247,23 +2250,33 @@ contains
 
     !$OMP TARGET ENTER DATA MAP(TO:this%cloud_optics)
     !$ACC ENTER DATA COPYIN(this%cloud_optics) ASYNC(1)
-    call this%cloud_optics%create_device(this%cloud_optics)
+    call this%cloud_optics%create_device()
 
     ! NB: general_cloud_optics_type not yet implemented
 
     !$OMP TARGET ENTER DATA MAP(TO:this%aerosol_optics)
     !$ACC ENTER DATA COPYIN(this%aerosol_optics) ASYNC(1)
-    call this%aerosol_optics%create_device(this%aerosol_optics)
+    call this%aerosol_optics%create_device()
 
     !$OMP TARGET ENTER DATA MAP(TO:this%pdf_sampler)
     !$ACC ENTER DATA COPYIN(this%pdf_sampler) ASYNC(1)
-    call this%pdf_sampler%create_device(this%pdf_sampler)
+    call this%pdf_sampler%create_device()
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(config_type), intent(inout) :: this
+    select type (this)
+    type is (config_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
+
+  subroutine update_host_impl(this)
 
     type(config_type), intent(inout) :: this
 
@@ -2298,23 +2311,33 @@ contains
 
     !$OMP TARGET UPDATE FROM(this%cloud_optics)
     !$ACC UPDATE HOST(this%cloud_optics) ASYNC(1)
-    call this%cloud_optics%update_host(this%cloud_optics)
+    call this%cloud_optics%update_host()
 
     ! NB: general_cloud_optics_type not yet implemented
 
     !$OMP TARGET UPDATE FROM(this%aerosol_optics)
     !$ACC UPDATE HOST(this%aerosol_optics) ASYNC(1)
-    call this%aerosol_optics%update_host(this%aerosol_optics)
+    call this%aerosol_optics%update_host()
 
     !$OMP TARGET UPDATE FROM(this%pdf_sampler)
     !$ACC UPDATE HOST(this%pdf_sampler) ASYNC(1)
-    call this%pdf_sampler%update_host(this%pdf_sampler)
+    call this%pdf_sampler%update_host()
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(config_type), intent(inout) :: this
+    select type (this)
+    type is (config_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
+
+  subroutine update_device_impl(this)
 
     type(config_type), intent(inout) :: this
 
@@ -2349,23 +2372,33 @@ contains
 
     !$OMP TARGET UPDATE TO(this%cloud_optics)
     !$ACC UPDATE DEVICE(this%cloud_optics) ASYNC(1)
-    call this%cloud_optics%update_device(this%cloud_optics)
+    call this%cloud_optics%update_device()
 
     ! NB: general_cloud_optics_type not yet implemented
 
     !$OMP TARGET UPDATE TO(this%aerosol_optics)
     !$ACC UPDATE DEVICE(this%aerosol_optics) ASYNC(1)
-    call this%aerosol_optics%update_device(this%aerosol_optics)
+    call this%aerosol_optics%update_device()
 
     !$OMP TARGET UPDATE TO(this%pdf_sampler)
     !$ACC UPDATE DEVICE(this%pdf_sampler) ASYNC(1)
-    call this%pdf_sampler%update_device(this%pdf_sampler)
+    call this%pdf_sampler%update_device()
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
   subroutine delete_device(this)
+    class(config_type), intent(inout) :: this
+    select type (this)
+    type is (config_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
+
+  subroutine delete_device_impl(this)
 
     type(config_type), intent(inout) :: this
 
@@ -2400,19 +2433,19 @@ contains
 
     !$OMP TARGET EXIT DATA MAP(DELETE:this%cloud_optics)
     !$ACC EXIT DATA DELETE(this%cloud_optics) ASYNC(1)
-    call this%cloud_optics%delete_device(this%cloud_optics)
+    call this%cloud_optics%delete_device()
 
     ! NB: general_cloud_optics_type not yet implemented
 
     !$OMP TARGET EXIT DATA MAP(DELETE:this%aerosol_optics)
     !$ACC EXIT DATA DELETE(this%aerosol_optics) ASYNC(1)
-    call this%aerosol_optics%delete_device(this%aerosol_optics)
+    call this%aerosol_optics%delete_device()
 
     !$OMP TARGET EXIT DATA MAP(DELETE:this%pdf_sampler)
     !$ACC EXIT DATA DELETE(this%pdf_sampler) ASYNC(1)
-    call this%pdf_sampler%delete_device(this%pdf_sampler)
+    call this%pdf_sampler%delete_device()
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 
 end module radiation_config

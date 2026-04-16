@@ -18,6 +18,7 @@
 module radiation_cloud_optics_data
 
   use parkind1, only : jprb
+  use radiation_io, only : radiation_abort
 
   implicit none
   public
@@ -40,10 +41,10 @@ module radiation_cloud_optics_data
 
    contains
      procedure :: setup => setup_cloud_optics
-     procedure, nopass :: create_device
-     procedure, nopass :: update_host
-     procedure, nopass :: update_device
-     procedure, nopass :: delete_device
+     procedure :: create_device
+     procedure :: update_host
+     procedure :: update_device
+     procedure :: delete_device
 
   end type cloud_optics_type
 
@@ -118,6 +119,16 @@ contains
   !---------------------------------------------------------------------
   ! creates fields on device
   subroutine create_device(this)
+    class(cloud_optics_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_optics_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
+
+  subroutine create_device_impl(this)
 
     type(cloud_optics_type), intent(inout) :: this
 
@@ -136,11 +147,21 @@ contains
     !$ACC ENTER DATA COPYIN(this%liq_coeff_gen) IF(allocated(this%liq_coeff_gen)) ASYNC(1)
     !$ACC ENTER DATA COPYIN(this%ice_coeff_gen) IF(allocated(this%ice_coeff_gen)) ASYNC(1)
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(cloud_optics_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_optics_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
+
+  subroutine update_host_impl(this)
 
     type(cloud_optics_type), intent(inout) :: this
 
@@ -159,11 +180,21 @@ contains
     !$ACC UPDATE HOST(this%liq_coeff_gen) IF(allocated(this%liq_coeff_gen)) ASYNC(1)
     !$ACC UPDATE HOST(this%ice_coeff_gen) IF(allocated(this%ice_coeff_gen)) ASYNC(1)
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(cloud_optics_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_optics_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
+
+  subroutine update_device_impl(this)
 
     type(cloud_optics_type), intent(inout) :: this
 
@@ -182,11 +213,21 @@ contains
     !$ACC UPDATE DEVICE(this%liq_coeff_gen) IF(allocated(this%liq_coeff_gen)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%ice_coeff_gen) IF(allocated(this%ice_coeff_gen)) ASYNC(1)
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
   subroutine delete_device(this)
+    class(cloud_optics_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_optics_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
+
+  subroutine delete_device_impl(this)
 
     type(cloud_optics_type), intent(inout) :: this
 
@@ -205,6 +246,6 @@ contains
     !$ACC EXIT DATA DELETE(this%liq_coeff_gen) IF(allocated(this%liq_coeff_gen)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%ice_coeff_gen) IF(allocated(this%ice_coeff_gen)) ASYNC(1)
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 end module radiation_cloud_optics_data

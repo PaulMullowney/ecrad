@@ -20,6 +20,7 @@
 module radiation_cloud
 
   use parkind1, only : jprb
+  use radiation_io, only : nulout, radiation_abort
 
   implicit none
   public
@@ -81,20 +82,20 @@ module radiation_cloud
   contains
     procedure :: allocate   => allocate_cloud_arrays
     procedure :: deallocate => deallocate_cloud_arrays
-    procedure, nopass :: set_overlap_param_fix
-    procedure, nopass :: set_overlap_param_var
+    procedure :: set_overlap_param_fix
+    procedure :: set_overlap_param_var
     generic   :: set_overlap_param => set_overlap_param_fix, set_overlap_param_var
     procedure :: set_overlap_param_approx
-    procedure, nopass :: create_fractional_std
+    procedure :: create_fractional_std
     procedure :: create_inv_cloud_effective_size
     procedure :: create_inv_cloud_effective_size_eta
-    procedure, nopass :: param_cloud_effective_separation_eta
-    procedure, nopass :: crop_cloud_fraction
+    procedure :: param_cloud_effective_separation_eta
+    procedure :: crop_cloud_fraction
     procedure :: out_of_physical_bounds
-    procedure, nopass :: create_device => create_device_cloud
-    procedure, nopass :: update_host   => update_host_cloud
-    procedure, nopass :: update_device => update_device_cloud
-    procedure, nopass :: delete_device => delete_device_cloud
+    procedure :: create_device
+    procedure :: update_host
+    procedure :: update_device
+    procedure :: delete_device
 
   end type cloud_type
 
@@ -202,12 +203,33 @@ contains
   ! columns.
   subroutine set_overlap_param_fix(this, thermodynamics, decorrelation_length, &
        &  istartcol, iendcol, lacc)
+    use yomhook,                  only : lhook, dr_hook, jphook
+    use radiation_thermodynamics, only : thermodynamics_type
+    use radiation_constants,      only : GasConstantDryAir, AccelDueToGravity
+    class(cloud_type), intent(inout) :: this
+    type(thermodynamics_type), intent(in)    :: thermodynamics
+    real(jprb),                intent(in)    :: decorrelation_length ! m
+    integer,         optional, intent(in)    :: istartcol, iendcol
+    logical, optional, intent(in) :: lacc
+    ! Process only columns i1 to i2, which will be istartcol to
+    ! iendcol if they were provided
+    select type (this)
+    type is (cloud_type)
+      call set_overlap_param_fix_impl(this, thermodynamics, decorrelation_length, &
+       &  istartcol, iendcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine set_overlap_param_fix
+
+  subroutine set_overlap_param_fix_impl(this, thermodynamics, decorrelation_length, &
+       &  istartcol, iendcol, lacc)
 
     use yomhook,                  only : lhook, dr_hook, jphook
     use radiation_thermodynamics, only : thermodynamics_type
     use radiation_constants,      only : GasConstantDryAir, AccelDueToGravity
 
-    type(cloud_type),          intent(inout) :: this
+    type(cloud_type), intent(inout) :: this
     type(thermodynamics_type), intent(in)    :: thermodynamics
     real(jprb),                intent(in)    :: decorrelation_length ! m
     integer,         optional, intent(in)    :: istartcol, iendcol
@@ -333,7 +355,7 @@ contains
 
     if (lhook) call dr_hook('radiation_cloud:set_overlap_param_fix',1,hook_handle)
 
-  end subroutine set_overlap_param_fix
+  end subroutine set_overlap_param_fix_impl
 
 
   !---------------------------------------------------------------------
@@ -345,15 +367,33 @@ contains
   ! field.
   subroutine set_overlap_param_var(this, thermodynamics, decorrelation_length, &
        &                           istartcol, iendcol, lacc)
+    use yomhook,                  only : lhook, dr_hook, jphook
+    use radiation_thermodynamics, only : thermodynamics_type
+    use radiation_constants,      only : GasConstantDryAir, AccelDueToGravity
+    class(cloud_type), intent(inout) :: this
+    type(thermodynamics_type), intent(in)    :: thermodynamics
+    integer,                   intent(in)    :: istartcol, iendcol
+    real(jprb),                intent(in)    :: decorrelation_length(istartcol:iendcol) ! m
+    logical, optional, intent(in) :: lacc
+    select type (this)
+    type is (cloud_type)
+      call set_overlap_param_var_impl(this, thermodynamics, decorrelation_length, &
+       &                           istartcol, iendcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine set_overlap_param_var
+
+  subroutine set_overlap_param_var_impl(this, thermodynamics, decorrelation_length, &
+       &                           istartcol, iendcol, lacc)
 
     use yomhook,                  only : lhook, dr_hook, jphook
     use radiation_thermodynamics, only : thermodynamics_type
     use radiation_constants,      only : GasConstantDryAir, AccelDueToGravity
 #ifdef _OPENACC
-    use radiation_io,             only : nulerr, radiation_abort
 #endif
 
-    type(cloud_type),          intent(inout) :: this
+    type(cloud_type), intent(inout) :: this
     type(thermodynamics_type), intent(in)    :: thermodynamics
     integer,                   intent(in)    :: istartcol, iendcol
     real(jprb),                intent(in)    :: decorrelation_length(istartcol:iendcol) ! m
@@ -457,7 +497,7 @@ contains
 
     if (lhook) call dr_hook('radiation_cloud:set_overlap_param_var',1,hook_handle)
 
-  end subroutine set_overlap_param_var
+  end subroutine set_overlap_param_var_impl
 
 
   !---------------------------------------------------------------------
@@ -548,10 +588,24 @@ contains
   ! Create a matrix of constant fractional standard deviations
   ! (dimensionless)
   subroutine create_fractional_std(this, ncol, nlev, frac_std, lacc)
+    use yomhook,                  only : lhook, dr_hook, jphook
+    class(cloud_type), intent(inout) :: this
+    integer,           intent(in)    :: ncol, nlev
+    real(jprb),        intent(in)    :: frac_std
+    logical, optional, intent(in) :: lacc
+    select type (this)
+    type is (cloud_type)
+      call create_fractional_std_impl(this, ncol, nlev, frac_std, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_fractional_std
+
+  subroutine create_fractional_std_impl(this, ncol, nlev, frac_std, lacc)
 
     use yomhook,                  only : lhook, dr_hook, jphook
 
-    type(cloud_type),  intent(inout) :: this
+    type(cloud_type), intent(inout) :: this
     integer,           intent(in)    :: ncol, nlev
     real(jprb),        intent(in)    :: frac_std
     logical, optional, intent(in) :: lacc
@@ -590,7 +644,7 @@ contains
 
     if (lhook) call dr_hook('radiation_cloud:create_fractional_std',1,hook_handle)
 
-  end subroutine create_fractional_std
+  end subroutine create_fractional_std_impl
 
 
   !---------------------------------------------------------------------
@@ -704,6 +758,32 @@ contains
   subroutine param_cloud_effective_separation_eta(this, ncol, nlev, &
        &  pressure_hl, separation_surf, separation_toa, power, &
        &  inhom_separation_factor, istartcol, iendcol)
+    use yomhook,                  only : lhook, dr_hook, jphook
+    class(cloud_type), intent(inout) :: this
+    integer,           intent(in)    :: ncol, nlev
+    real(jprb),        intent(in)    :: pressure_hl(:,:)
+    ! Separation distances at surface and top-of-atmosphere, and power
+    real(jprb),           intent(in) :: separation_surf ! m
+    real(jprb),           intent(in) :: separation_toa ! m
+    real(jprb),           intent(in) :: power
+    real(jprb), optional, intent(in) :: inhom_separation_factor
+    integer,    optional, intent(in) :: istartcol, iendcol
+    real(jprb) :: eta(nlev)
+    real(jprb) :: eff_separation(nlev)
+    ! Local values of istartcol, iendcol
+    select type (this)
+    type is (cloud_type)
+      call param_cloud_effective_separation_eta_impl(this, ncol, nlev, &
+       &  pressure_hl, separation_surf, separation_toa, power, &
+       &  inhom_separation_factor, istartcol, iendcol)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine param_cloud_effective_separation_eta
+
+  subroutine param_cloud_effective_separation_eta_impl(this, ncol, nlev, &
+       &  pressure_hl, separation_surf, separation_toa, power, &
+       &  inhom_separation_factor, istartcol, iendcol)
 
     use yomhook,                  only : lhook, dr_hook, jphook
 
@@ -789,7 +869,7 @@ contains
 
     if (lhook) call dr_hook('radiation_cloud:param_cloud_effective_separation_eta',1,hook_handle)
 
-  end subroutine param_cloud_effective_separation_eta
+  end subroutine param_cloud_effective_separation_eta_impl
 
 
   !---------------------------------------------------------------------
@@ -800,6 +880,22 @@ contains
   ! all subsequent subroutines can assume that if cloud_fraction > 0.0
   ! then cloud is really present and should be treated.
   subroutine crop_cloud_fraction(this, istartcol, iendcol, &
+       &    cloud_fraction_threshold, cloud_mixing_ratio_threshold)
+    use yomhook, only : lhook, dr_hook, jphook
+    class(cloud_type), intent(inout) :: this
+    integer,           intent(in)    :: istartcol, iendcol
+    real(jprb) :: cloud_fraction_threshold, cloud_mixing_ratio_threshold
+    real(jprb) :: sum_mixing_ratio(istartcol:iendcol)
+    select type (this)
+    type is (cloud_type)
+      call crop_cloud_fraction_impl(this, istartcol, iendcol, &
+       &    cloud_fraction_threshold, cloud_mixing_ratio_threshold)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine crop_cloud_fraction
+
+  subroutine crop_cloud_fraction_impl(this, istartcol, iendcol, &
        &    cloud_fraction_threshold, cloud_mixing_ratio_threshold)
 
     use yomhook, only : lhook, dr_hook, jphook
@@ -864,7 +960,7 @@ contains
 
     if (lhook) call dr_hook('radiation_cloud:crop_cloud_fraction',1,hook_handle)
 
-  end subroutine crop_cloud_fraction
+  end subroutine crop_cloud_fraction_impl
 
 
   !---------------------------------------------------------------------
@@ -913,9 +1009,19 @@ contains
 
   !---------------------------------------------------------------------
   ! creates fields on device
-  subroutine create_device_cloud(this)
+  subroutine create_device(this)
+    class(cloud_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_type)
+      call create_device_cloud_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
 
-    type(cloud_type), intent(inout) :: this
+  subroutine create_device_cloud_impl(this)
+
+    class(cloud_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET ENTER DATA MAP(ALLOC:this%mixing_ratio) IF(allocated(this%mixing_ratio))
@@ -942,13 +1048,23 @@ contains
     !$ACC ENTER DATA CREATE(this%inv_cloud_effective_size) IF(allocated(this%inv_cloud_effective_size)) ASYNC(1)
     !$ACC ENTER DATA CREATE(this%inv_inhom_effective_size) IF(allocated(this%inv_inhom_effective_size)) ASYNC(1)
 #endif
-  end subroutine create_device_cloud
+  end subroutine create_device_cloud_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host_cloud(this)
+  subroutine update_host(this)
+    class(cloud_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_type)
+      call update_host_cloud_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
 
-    type(cloud_type), intent(inout) :: this
+  subroutine update_host_cloud_impl(this)
+
+    class(cloud_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE FROM(this%mixing_ratio) IF(allocated(this%mixing_ratio))
@@ -967,16 +1083,26 @@ contains
     !$ACC UPDATE HOST(this%inv_cloud_effective_size) IF(allocated(this%inv_cloud_effective_size)) ASYNC(1)
     !$ACC UPDATE HOST(this%inv_inhom_effective_size) IF(allocated(this%inv_inhom_effective_size)) ASYNC(1)
 #endif
-  end subroutine update_host_cloud
+  end subroutine update_host_cloud_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device_cloud(this)
+  subroutine update_device(this)
+    class(cloud_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_type)
+      call update_device_cloud_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
+
+  subroutine update_device_cloud_impl(this)
 
 #if defined(_OPENACC)
     use openacc,       only : acc_attach
 #endif
-    type(cloud_type), intent(inout) :: this
+    class(cloud_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE TO(this%mixing_ratio) IF(allocated(this%mixing_ratio))
@@ -1011,13 +1137,23 @@ contains
     !$ACC UPDATE DEVICE(this%inv_cloud_effective_size) IF(allocated(this%inv_cloud_effective_size)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%inv_inhom_effective_size) IF(allocated(this%inv_inhom_effective_size)) ASYNC(1)
 #endif
-  end subroutine update_device_cloud
+  end subroutine update_device_cloud_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
-  subroutine delete_device_cloud(this)
+  subroutine delete_device(this)
+    class(cloud_type), intent(inout) :: this
+    select type (this)
+    type is (cloud_type)
+      call delete_device_cloud_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
 
-    type(cloud_type), intent(inout) :: this
+  subroutine delete_device_cloud_impl(this)
+
+    class(cloud_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET EXIT DATA MAP(DELETE:this%mixing_ratio) IF(allocated(this%mixing_ratio))
@@ -1044,6 +1180,6 @@ contains
     !$ACC EXIT DATA DELETE(this%inv_cloud_effective_size) IF(allocated(this%inv_cloud_effective_size)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%inv_inhom_effective_size) IF(allocated(this%inv_inhom_effective_size)) ASYNC(1)
 #endif
-  end subroutine delete_device_cloud
+  end subroutine delete_device_cloud_impl
 
 end module radiation_cloud

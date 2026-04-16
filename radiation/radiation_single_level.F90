@@ -96,13 +96,13 @@ module radiation_single_level
   contains
     procedure :: allocate   => allocate_single_level
     procedure :: deallocate => deallocate_single_level
-    procedure, nopass :: init_seed_simple
-    procedure, nopass :: get_albedos
+    procedure :: init_seed_simple
+    procedure :: get_albedos
     procedure :: out_of_physical_bounds
-    procedure, nopass :: create_device => create_device_single_level
-    procedure, nopass :: update_host   => update_host_single_level
-    procedure, nopass :: update_device => update_device_single_level
-    procedure, nopass :: delete_device => delete_device_single_level
+    procedure :: create_device
+    procedure :: update_host
+    procedure :: update_device
+    procedure :: delete_device
 
   end type single_level_type
 
@@ -201,7 +201,19 @@ contains
   !---------------------------------------------------------------------
   ! Unimaginative initialization of random-number seeds
   subroutine init_seed_simple(this, istartcol, iendcol, lacc)
-    type(single_level_type), intent(inout)  :: this
+    class(single_level_type), intent(inout) :: this
+    integer, intent(in)                     :: istartcol, iendcol
+    logical, optional, intent(in)           :: lacc
+    select type (this)
+    type is (single_level_type)
+      call init_seed_simple_impl(this, istartcol, iendcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine init_seed_simple
+
+  subroutine init_seed_simple_impl(this, istartcol, iendcol, lacc)
+    type(single_level_type), intent(inout) :: this
     integer, intent(in)                     :: istartcol, iendcol
     logical, optional, intent(in)           :: lacc
 
@@ -227,19 +239,40 @@ contains
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-  end subroutine init_seed_simple
+  end subroutine init_seed_simple_impl
 
 
   !---------------------------------------------------------------------
   ! Extract the shortwave and longwave surface albedos in each g-point
   subroutine get_albedos(this, istartcol, iendcol, config, &
        &                 sw_albedo_direct, sw_albedo_diffuse, lw_albedo)
+    use radiation_config, only : config_type
+    use yomhook,          only : lhook, dr_hook, jphook
+    class(single_level_type), intent(in) :: this
+    type(config_type),        intent(in) :: config
+    integer,                  intent(in) :: istartcol, iendcol
+    real(jprb), intent(out), optional &
+         &  :: lw_albedo(config%n_g_lw, istartcol:iendcol)
+    real(jprb), intent(out), dimension(config%n_g_sw, istartcol:iendcol) &
+         &  :: sw_albedo_direct, sw_albedo_diffuse
+    real(jprb) :: sw_albedo_band(istartcol:iendcol, config%n_bands_sw)
+    real(jprb) :: lw_albedo_band(istartcol:iendcol, config%n_bands_lw)
+    select type (this)
+    type is (single_level_type)
+      call get_albedos_impl(this, istartcol, iendcol, config, &
+       &                 sw_albedo_direct, sw_albedo_diffuse, lw_albedo)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine get_albedos
+
+  subroutine get_albedos_impl(this, istartcol, iendcol, config, &
+       &                 sw_albedo_direct, sw_albedo_diffuse, lw_albedo)
 
     use radiation_config, only : config_type
-    use radiation_io,     only : nulerr, radiation_abort
     use yomhook,          only : lhook, dr_hook, jphook
 
-    type(single_level_type),  intent(in) :: this
+    type(single_level_type), intent(in) :: this
     type(config_type),        intent(in) :: config
     integer,                  intent(in) :: istartcol, iendcol
 
@@ -280,7 +313,6 @@ contains
         if (size(this%sw_albedo,2) /= config%n_g_sw) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%sw_albedo does not have the expected ', &
                &  config%n_g_sw, ' spectral intervals'
-          call radiation_abort()
         end if
         sw_albedo_diffuse = transpose(this%sw_albedo(istartcol:iendcol,:))
         if (allocated(this%sw_albedo_direct)) then
@@ -292,7 +324,6 @@ contains
         if (size(this%sw_albedo,2) /= nalbedoband) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%sw_albedo does not have the expected ', &
                &  nalbedoband, ' bands'
-          call radiation_abort()
         end if
 
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
@@ -442,7 +473,6 @@ contains
         if (maxval(config%i_albedo_from_band_sw) > size(this%sw_albedo,2)) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%sw_albedo has fewer than required ', &
                &  maxval(config%i_albedo_from_band_sw), ' bands'
-          call radiation_abort()
         end if
         sw_albedo_diffuse = transpose(this%sw_albedo(istartcol:iendcol, &
              &  config%i_albedo_from_band_sw(config%i_band_from_reordered_g_sw)))
@@ -460,7 +490,6 @@ contains
         if (config%n_g_lw /= size(this%lw_emissivity,2)) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%lw_emissivity does not have the expected ', &
                &  config%n_g_lw, ' spectral intervals'
-          call radiation_abort()
         end if
         lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol,:))
       else if (.not. config%do_nearest_spectral_lw_emiss) then
@@ -469,7 +498,6 @@ contains
         if (nalbedoband /= size(this%lw_emissivity,2)) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%lw_emissivity does not have the expected ', &
                &  nalbedoband, ' bands'
-          call radiation_abort()
         end if
 
         do jband = 1,config%n_bands_lw
@@ -497,7 +525,6 @@ contains
         if (maxval(config%i_emiss_from_band_lw) > size(this%lw_emissivity,2)) then
           write(nulerr,'(a,i0,a)') '*** Error: single_level%lw_emissivity has fewer than required ', &
                &  maxval(config%i_emiss_from_band_lw), ' bands'
-          call radiation_abort()
         end if
 #if !defined(_OPENACC) && !defined(OMPGPU)
         lw_albedo = 1.0_jprb - transpose(this%lw_emissivity(istartcol:iendcol, &
@@ -524,7 +551,7 @@ contains
 
     if (lhook) call dr_hook('radiation_single_level:get_albedos',1,hook_handle)
 
-  end subroutine get_albedos
+  end subroutine get_albedos_impl
 
 
   !---------------------------------------------------------------------
@@ -570,9 +597,19 @@ contains
 
   !---------------------------------------------------------------------
   ! creates fields on device
-  subroutine create_device_single_level(this)
+  subroutine create_device(this)
+    class(single_level_type), intent(inout) :: this
+    select type (this)
+    type is (single_level_type)
+      call create_device_single_level_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
 
-    type(single_level_type), intent(inout) :: this
+  subroutine create_device_single_level_impl(this)
+
+    class(single_level_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET ENTER DATA MAP(ALLOC:this%cos_sza) IF(allocated(this%cos_sza))
@@ -593,13 +630,23 @@ contains
     !$ACC ENTER DATA CREATE(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
     !$ACC ENTER DATA CREATE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 #endif
-  end subroutine create_device_single_level
+  end subroutine create_device_single_level_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host_single_level(this)
+  subroutine update_host(this)
+    class(single_level_type), intent(inout) :: this
+    select type (this)
+    type is (single_level_type)
+      call update_host_single_level_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
 
-    type(single_level_type), intent(inout) :: this
+  subroutine update_host_single_level_impl(this)
+
+    class(single_level_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE FROM(this%cos_sza) IF(allocated(this%cos_sza))
@@ -620,13 +667,23 @@ contains
     !$ACC UPDATE HOST(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
     !$ACC UPDATE HOST(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 #endif
-  end subroutine update_host_single_level
+  end subroutine update_host_single_level_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device_single_level(this)
+  subroutine update_device(this)
+    class(single_level_type), intent(inout) :: this
+    select type (this)
+    type is (single_level_type)
+      call update_device_single_level_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
 
-    type(single_level_type), intent(inout) :: this
+  subroutine update_device_single_level_impl(this)
+
+    class(single_level_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE TO(this%cos_sza) IF(allocated(this%cos_sza))
@@ -647,13 +704,23 @@ contains
     !$ACC UPDATE DEVICE(this%spectral_solar_scaling) IF( allocated(this%spectral_solar_scaling)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 #endif
-  end subroutine update_device_single_level
+  end subroutine update_device_single_level_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
-  subroutine delete_device_single_level(this)
+  subroutine delete_device(this)
+    class(single_level_type), intent(inout) :: this
+    select type (this)
+    type is (single_level_type)
+      call delete_device_single_level_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
 
-    type(single_level_type), intent(inout) :: this
+  subroutine delete_device_single_level_impl(this)
+
+    class(single_level_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET EXIT DATA MAP(DELETE:this%cos_sza) IF(allocated(this%cos_sza))
@@ -674,6 +741,6 @@ contains
     !$ACC EXIT DATA DELETE(this%spectral_solar_scaling) IF(allocated(this%spectral_solar_scaling)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%iseed) IF(allocated(this%iseed)) ASYNC(1)
 #endif
-  end subroutine delete_device_single_level
+  end subroutine delete_device_single_level_impl
 
 end module radiation_single_level

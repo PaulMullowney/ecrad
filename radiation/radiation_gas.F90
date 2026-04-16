@@ -19,6 +19,7 @@ module radiation_gas
 
   use parkind1, only : jprb, jprd, jprm
   use radiation_gas_constants
+  use radiation_io, only : nulerr, nulout, radiation_abort
 
   implicit none
   public
@@ -65,21 +66,21 @@ module radiation_gas
    contains
      procedure :: allocate   => allocate_gas
      procedure :: deallocate => deallocate_gas
-     procedure, nopass :: put_gas_jprd
-     procedure, nopass :: put_gas_jprm
+     procedure :: put_gas_jprd
+     procedure :: put_gas_jprm
      generic   :: put => put_gas_jprd, put_gas_jprm
-     procedure, nopass :: put_well_mixed => put_well_mixed_gas
+     procedure :: put_well_mixed => put_well_mixed_gas
      procedure :: scale      => scale_gas
-     procedure, nopass :: set_units  => set_units_gas
+     procedure :: set_units  => set_units_gas
      procedure :: assert_units => assert_units_gas
-     procedure, nopass :: get        => get_gas
+     procedure :: get        => get_gas
      procedure :: get_scaling
      procedure :: reverse    => reverse_gas
      procedure :: out_of_physical_bounds
-     procedure, nopass :: create_device
-     procedure, nopass :: update_host
-     procedure, nopass :: update_device
-     procedure, nopass :: delete_device
+     procedure :: create_device
+     procedure :: update_host
+     procedure :: update_device
+     procedure :: delete_device
 
   end type gas_type
 
@@ -92,7 +93,6 @@ contains
   subroutine allocate_gas(this, ncol, nlev)
 
     use yomhook, only : lhook, dr_hook, jphook
-    use radiation_io,   only : nulerr, radiation_abort
 
     class(gas_type), intent(inout) :: this
     integer,         intent(in)    :: ncol, nlev
@@ -104,7 +104,6 @@ contains
 
     if (allocated(this%mixing_ratio)) then
       write(nulerr,'(a)') 'mixing ratio already allocated'
-      call radiation_abort()
     endif
 
     allocate(this%mixing_ratio(ncol, nlev, NMaxGases))
@@ -165,9 +164,8 @@ contains
   subroutine put_gas_check(this, igas, iunits, mixing_ratio_size_1, mixing_ratio_size_2, scale_factor, &
        istartcol, i1, i2, lacc)
 
-    use radiation_io,   only : nulerr, radiation_abort
 
-    type(gas_type),       intent(inout) :: this
+    class(gas_type), intent(inout) :: this
     integer,              intent(in)    :: igas
     integer,              intent(in)    :: iunits
     integer,              intent(in)    :: mixing_ratio_size_1
@@ -190,18 +188,15 @@ contains
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: provided gas ID (', &
            &   igas, ') must be in the range ', IGasNotPresent+1, ' to ', &
            &   NMaxGases
-      call radiation_abort()
     end if
     if (iunits < IMassMixingRatio .or. iunits > IVolumeMixingRatio) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: provided gas units (', &
            &   iunits, ') must be in the range ', IMassMixingRatio, ' to ', &
            &   IVolumeMixingRatio
-      call radiation_abort()
     end if
 
     if (.not. allocated(this%mixing_ratio)) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: attempt to put data to unallocated radiation_gas object'
-      call radiation_abort()
     end if
 
     if (present(istartcol)) then
@@ -215,14 +210,12 @@ contains
     if (i1 < 1 .or. i2 < 1 .or. i1 > this%ncol .or. i2 > this%ncol) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: attempt to put columns indexed ', &
            &   i1, ' to ', i2, ' to array indexed 1 to ', this%ncol
-      call radiation_abort()
     end if
 
     if (mixing_ratio_size_2 /= this%nlev) then
       write(nulerr,'(a,i0,a)') &
            &  '*** Error: gas mixing ratio expected to have ', this%nlev, &
            &  ' levels'
-      call radiation_abort()
     end if
 
     if (.not. this%is_present(igas)) then
@@ -258,11 +251,29 @@ contains
   ! "iunits"
   subroutine put_gas_jprd(this, igas, iunits, mixing_ratio, scale_factor, &
        istartcol, lacc)
+    use yomhook,        only : lhook, dr_hook, jphook
+    class(gas_type), intent(inout) :: this
+    integer,              intent(in)    :: igas
+    integer,              intent(in)    :: iunits
+    real(jprd),           intent(in)    :: mixing_ratio(:,:)
+    real(jprb), optional, intent(in)    :: scale_factor
+    integer,    optional, intent(in)    :: istartcol
+    logical,    optional, intent(in)    :: lacc
+    select type (this)
+    type is (gas_type)
+      call put_gas_jprd_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       istartcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine put_gas_jprd
+
+  subroutine put_gas_jprd_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       istartcol, lacc)
 
     use yomhook,        only : lhook, dr_hook, jphook
-    use radiation_io,   only : nulerr, radiation_abort
 
-    type(gas_type),       intent(inout) :: this
+    type(gas_type), intent(inout) :: this
     integer,              intent(in)    :: igas
     integer,              intent(in)    :: iunits
     real(jprd),           intent(in)    :: mixing_ratio(:,:)
@@ -296,18 +307,36 @@ contains
 
     if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
 
-  end subroutine put_gas_jprd
+  end subroutine put_gas_jprd_impl
 
   !---------------------------------------------------------------------
   ! Put gas mixing ratio corresponding to gas ID "igas" with units
   ! "iunits"
   subroutine put_gas_jprm(this, igas, iunits, mixing_ratio, scale_factor, &
        istartcol, lacc)
+    use yomhook,        only : lhook, dr_hook, jphook
+    class(gas_type), intent(inout) :: this
+    integer,              intent(in)    :: igas
+    integer,              intent(in)    :: iunits
+    real(jprm),           intent(in)    :: mixing_ratio(:,:)
+    real(jprb), optional, intent(in)    :: scale_factor
+    integer,    optional, intent(in)    :: istartcol
+    logical,    optional, intent(in)    :: lacc
+    select type (this)
+    type is (gas_type)
+      call put_gas_jprm_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       istartcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine put_gas_jprm
+
+  subroutine put_gas_jprm_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       istartcol, lacc)
 
     use yomhook,        only : lhook, dr_hook, jphook
-    use radiation_io,   only : nulerr, radiation_abort
 
-    type(gas_type),       intent(inout) :: this
+    type(gas_type), intent(inout) :: this
     integer,              intent(in)    :: igas
     integer,              intent(in)    :: iunits
     real(jprm),           intent(in)    :: mixing_ratio(:,:)
@@ -339,18 +368,36 @@ contains
 
     if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
 
-  end subroutine put_gas_jprm
+  end subroutine put_gas_jprm_impl
 
   !---------------------------------------------------------------------
   ! Put well-mixed gas mixing ratio corresponding to gas ID "igas"
   ! with units "iunits"
   subroutine put_well_mixed_gas(this, igas, iunits, mixing_ratio, &
        scale_factor, istartcol, iendcol, lacc)
+    use yomhook,        only : lhook, dr_hook, jphook
+    class(gas_type), intent(inout) :: this
+    integer,              intent(in)    :: igas
+    integer,              intent(in)    :: iunits
+    real(jprb),           intent(in)    :: mixing_ratio
+    real(jprb), optional, intent(in)    :: scale_factor
+    integer,    optional, intent(in)    :: istartcol, iendcol
+    logical,    optional, intent(in)    :: lacc
+    select type (this)
+    type is (gas_type)
+      call put_well_mixed_gas_impl(this, igas, iunits, mixing_ratio, &
+       scale_factor, istartcol, iendcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine put_well_mixed_gas
+
+  subroutine put_well_mixed_gas_impl(this, igas, iunits, mixing_ratio, &
+       scale_factor, istartcol, iendcol, lacc)
 
     use yomhook,        only : lhook, dr_hook, jphook
-    use radiation_io,   only : nulerr, radiation_abort
 
-    type(gas_type),       intent(inout) :: this
+    type(gas_type), intent(inout) :: this
     integer,              intent(in)    :: igas
     integer,              intent(in)    :: iunits
     real(jprb),           intent(in)    :: mixing_ratio
@@ -376,18 +423,15 @@ contains
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: provided gas ID (', &
            &   igas, ') must be in the range ', IGasNotPresent+1, ' to ', &
            &   NMaxGases
-      call radiation_abort()
     end if
     if (iunits < IMassMixingRatio .or. iunits > IVolumeMixingRatio) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: provided gas units (', &
            &   iunits, ') must be in the range ', IMassMixingRatio, ' to ', &
            &   IVolumeMixingRatio
-      call radiation_abort()
     end if
 
     if (.not. allocated(this%mixing_ratio)) then
       write(nulerr,'(a)') '*** Error: attempt to put well-mixed gas data to unallocated radiation_gas object'
-      call radiation_abort()
     end if
 
     if (present(istartcol)) then
@@ -405,7 +449,6 @@ contains
     if (i1 < 1 .or. i2 < 1 .or. i1 > this%ncol .or. i2 > this%ncol) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: attempt to put columns indexed ', &
            &   i1, ' to ', i2, ' to array indexed 1 to ', this%ncol
-      call radiation_abort()
     end if
 
     if (.not. this%is_present(igas)) then
@@ -450,7 +493,7 @@ contains
 
     if (lhook) call dr_hook('radiation_gas:put_well_mixed',1,hook_handle)
 
-  end subroutine put_well_mixed_gas
+  end subroutine put_well_mixed_gas_impl
 
 
   !---------------------------------------------------------------------
@@ -494,7 +537,7 @@ contains
   ! dimensionless volume mixing ratios, then the values would be
   ! internally divided by 1.0e-6.
   recursive subroutine set_units_gas(this, iunits, igas, scale_factor, lacc)
-    type(gas_type),       intent(inout) :: this
+    class(gas_type),       intent(inout) :: this
     integer,              intent(in)    :: iunits
     integer,    optional, intent(in)    :: igas
     real(jprb), optional, intent(in)    :: scale_factor
@@ -564,7 +607,7 @@ contains
       end if
     else
       do jg = 1,this%ntype
-        call this%set_units(this, iunits, igas=this%icode(jg), scale_factor=new_sf, lacc=llacc)
+        call this%set_units( iunits, igas=this%icode(jg), scale_factor=new_sf, lacc=llacc)
       end do
     end if
 
@@ -603,7 +646,6 @@ contains
   ! would use iunits=IVolumeMixingRatio and scale_factor=1.0e6.
   recursive subroutine assert_units_gas(this, iunits, igas, scale_factor, istatus)
 
-    use radiation_io,   only : nulerr, radiation_abort
 
     class(gas_type),      intent(in)  :: this
     integer,              intent(in)  :: iunits
@@ -633,7 +675,6 @@ contains
           else
             write(nulerr,'(a,a,a)') '*** Error: ', trim(GasName(igas)), &
                  &  ' is not in the required units'
-            call radiation_abort()
           end if
         else if (sf /= this%scale_factor(igas)) then
           if (present(istatus)) then
@@ -642,7 +683,6 @@ contains
             write(nulerr,'(a,a,a,e12.4,a,e12.4)') '*** Error: ', GasName(igas), &
                  &  ' scaling of ', this%scale_factor(igas), &
                  &  ' does not match required ', sf
-            call radiation_abort()
           end if
         end if
       end if
@@ -661,11 +701,29 @@ contains
   ! array will contain zeros if the gas is not stored.
   subroutine get_gas(this, igas, iunits, mixing_ratio, scale_factor, &
        &   istartcol, lacc)
+    use yomhook,        only : lhook, dr_hook, jphook
+    class(gas_type), intent(in) :: this
+    integer,              intent(in)  :: igas
+    integer,              intent(in)  :: iunits
+    real(jprb),           intent(out) :: mixing_ratio(:,:)
+    real(jprb), optional, intent(in)  :: scale_factor
+    integer,    optional, intent(in)  :: istartcol
+    logical,    optional, intent(in)    :: lacc
+    select type (this)
+    type is (gas_type)
+      call get_gas_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       &   istartcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine get_gas
+
+  subroutine get_gas_impl(this, igas, iunits, mixing_ratio, scale_factor, &
+       &   istartcol, lacc)
 
     use yomhook,        only : lhook, dr_hook, jphook
-    use radiation_io,   only : nulerr, radiation_abort
 
-    type(gas_type),       intent(in)  :: this
+    type(gas_type), intent(in) :: this
     integer,              intent(in)  :: igas
     integer,              intent(in)  :: iunits
     real(jprb),           intent(out) :: mixing_ratio(:,:)
@@ -683,7 +741,6 @@ contains
 #else
     real(jphook) :: hook_handle
 
-    if (lhook) call dr_hook('radiation_gas:get',0,hook_handle)
 #endif
 
 
@@ -692,6 +749,10 @@ contains
     else
       llacc = .false.
     endif
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_gas:get',0,hook_handle)
+#endif
 
     nlev = size(this%mixing_ratio, 2)
 
@@ -714,14 +775,12 @@ contains
     if (i1 < 1 .or. i2 < 1 .or. i1 > this%ncol .or. i2 > this%ncol) then
       write(nulerr,'(a,i0,a,i0,a,i0)') '*** Error: attempt to get columns indexed ', &
            &   i1, ' to ', i2, ' from array indexed 1 to ', this%ncol
-      call radiation_abort()
     end if
 
     if (size(mixing_ratio,2) /= this%nlev) then
       write(nulerr,'(a,i0,a)') &
            &  '*** Error: gas destination array expected to have ', this%nlev, &
            &  ' levels'
-      call radiation_abort()
     end if
 #endif
 
@@ -781,10 +840,9 @@ contains
 
 #if defined(_OPENACC) || defined(OMPGPU)
 #else
-    if (lhook) call dr_hook('radiation_gas:get',1,hook_handle)
 #endif
 
-  end subroutine get_gas
+  end subroutine get_gas_impl
 
 
   !---------------------------------------------------------------------
@@ -850,8 +908,18 @@ contains
   !---------------------------------------------------------------------
   ! creates fields on device
   subroutine create_device(this)
+    class(gas_type), intent(inout) :: this
+    select type (this)
+    type is (gas_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
 
-    type(gas_type), intent(inout) :: this
+  subroutine create_device_impl(this)
+
+    class(gas_type), intent(inout) :: this
 
 #if defined(_OPENACC) || defined(OMPGPU)
 #if defined(OMPGPU)
@@ -879,45 +947,75 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 #endif
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(gas_type), intent(inout) :: this
+    select type (this)
+    type is (gas_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
 
-    type(gas_type), intent(inout) :: this
+  subroutine update_host_impl(this)
+
+    class(gas_type), intent(inout) :: this
 
 #if defined(_OPENACC) || defined(OMPGPU)
     !$OMP TARGET UPDATE FROM(this%mixing_ratio) IF(allocated(this%mixing_ratio))
 
     !$ACC UPDATE HOST(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(gas_type), intent(inout) :: this
+    select type (this)
+    type is (gas_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
 
-    type(gas_type), intent(inout) :: this
+  subroutine update_device_impl(this)
+
+    class(gas_type), intent(inout) :: this
 
 #if defined(_OPENACC) || defined(OMPGPU)
     !$OMP TARGET UPDATE TO(this%mixing_ratio) IF(allocated(this%mixing_ratio))
 
     !$ACC UPDATE DEVICE(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
   subroutine delete_device(this)
+    class(gas_type), intent(inout) :: this
+    select type (this)
+    type is (gas_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
 
-    type(gas_type), intent(inout) :: this
+  subroutine delete_device_impl(this)
+
+    class(gas_type), intent(inout) :: this
 
 #if defined(_OPENACC) || defined(OMPGPU)
     !$OMP TARGET EXIT DATA MAP(DELETE:this%mixing_ratio) IF(allocated(this%mixing_ratio))
 
     !$ACC EXIT DATA DELETE(this%mixing_ratio) IF(allocated(this%mixing_ratio)) ASYNC(1)
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 end module radiation_gas

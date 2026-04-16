@@ -20,6 +20,7 @@
 module radiation_thermodynamics
 
   use parkind1, only : jprb
+  use radiation_io, only : radiation_abort
 
   implicit none
   public
@@ -53,14 +54,14 @@ module radiation_thermodynamics
    contains
      procedure :: allocate   => allocate_thermodynamics_arrays
      procedure :: deallocate => deallocate_thermodynamics_arrays
-     procedure, nopass :: get_layer_mass
+     procedure :: get_layer_mass
      procedure :: get_layer_mass_column
      procedure :: out_of_physical_bounds
-     procedure, nopass :: calc_saturation_wrt_liquid
-     procedure, nopass :: create_device
-     procedure, nopass :: update_host
-     procedure, nopass :: update_device
-     procedure, nopass :: delete_device
+     procedure :: calc_saturation_wrt_liquid
+     procedure :: create_device
+     procedure :: update_host
+     procedure :: update_device
+     procedure :: delete_device
   end type thermodynamics_type
 
 contains
@@ -149,10 +150,23 @@ contains
   !---------------------------------------------------------------------
   ! Calculate approximate saturation with respect to liquid
   subroutine calc_saturation_wrt_liquid(this,istartcol,iendcol, lacc)
+    use yomhook,  only : lhook, dr_hook, jphook
+    class(thermodynamics_type), intent(inout) :: this
+    integer, intent(in)                       :: istartcol, iendcol
+    logical, optional, intent(in)             :: lacc
+    select type (this)
+    type is (thermodynamics_type)
+      call calc_saturation_wrt_liquid_impl(this,istartcol,iendcol, lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine calc_saturation_wrt_liquid
+
+  subroutine calc_saturation_wrt_liquid_impl(this,istartcol,iendcol, lacc)
 
     use yomhook,  only : lhook, dr_hook, jphook
 
-    type(thermodynamics_type), intent(inout)  :: this
+    type(thermodynamics_type), intent(inout) :: this
     integer, intent(in)                       :: istartcol, iendcol
     logical, optional, intent(in)             :: lacc
 
@@ -203,18 +217,33 @@ contains
 
     if (lhook) call dr_hook('radiation_thermodynamics:calc_saturation_wrt_liquid',1,hook_handle)
 
-  end subroutine calc_saturation_wrt_liquid
+  end subroutine calc_saturation_wrt_liquid_impl
 
 
   !---------------------------------------------------------------------
   ! Calculate the dry mass of each layer, neglecting humidity effects.
   ! The first version is for all columns.
   subroutine get_layer_mass(this,istartcol,iendcol,layer_mass,lacc)
+    use yomhook,              only : lhook, dr_hook, jphook
+    use radiation_constants,  only : AccelDueToGravity
+    class(thermodynamics_type), intent(in) :: this
+    integer,                    intent(in)  :: istartcol, iendcol
+    real(jprb),                 intent(out) :: layer_mass(istartcol:iendcol,ubound(this%pressure_hl,2))
+    logical, optional,          intent(in)  :: lacc
+    select type (this)
+    type is (thermodynamics_type)
+      call get_layer_mass_impl(this,istartcol,iendcol,layer_mass,lacc)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine get_layer_mass
+
+  subroutine get_layer_mass_impl(this,istartcol,iendcol,layer_mass,lacc)
 
     use yomhook,              only : lhook, dr_hook, jphook
     use radiation_constants,  only : AccelDueToGravity
 
-    type(thermodynamics_type),  intent(in)  :: this
+    type(thermodynamics_type), intent(in) :: this
     integer,                    intent(in)  :: istartcol, iendcol
     real(jprb),                 intent(out) :: layer_mass(istartcol:iendcol,ubound(this%pressure_hl,2))
     logical, optional,          intent(in)  :: lacc
@@ -252,7 +281,7 @@ contains
 
     if (lhook) call dr_hook('radiation_thermodynamics:get_layer_mass',1,hook_handle)
 
-  end subroutine get_layer_mass
+  end subroutine get_layer_mass_impl
 
   !---------------------------------------------------------------------
   ! Calculate the dry mass of each layer, neglecting humidity effects.
@@ -395,8 +424,18 @@ contains
   !---------------------------------------------------------------------
   ! Creates fields on device
   subroutine create_device(this)
+    class(thermodynamics_type), intent(inout) :: this
+    select type (this)
+    type is (thermodynamics_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
 
-    type(thermodynamics_type), intent(inout) :: this
+  subroutine create_device_impl(this)
+
+    class(thermodynamics_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET ENTER DATA MAP(ALLOC:this%pressure_hl) IF(allocated(this%pressure_hl))
@@ -411,13 +450,23 @@ contains
     !$ACC ENTER DATA CREATE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
     !$ACC ENTER DATA CREATE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(thermodynamics_type), intent(inout) :: this
+    select type (this)
+    type is (thermodynamics_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
 
-    type(thermodynamics_type), intent(inout) :: this
+  subroutine update_host_impl(this)
+
+    class(thermodynamics_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE FROM(this%pressure_hl) IF(allocated(this%pressure_hl))
@@ -432,13 +481,23 @@ contains
     !$ACC UPDATE HOST(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
     !$ACC UPDATE HOST(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(thermodynamics_type), intent(inout) :: this
+    select type (this)
+    type is (thermodynamics_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
 
-    type(thermodynamics_type), intent(inout) :: this
+  subroutine update_device_impl(this)
+
+    class(thermodynamics_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE TO(this%pressure_hl) IF(allocated(this%pressure_hl))
@@ -453,13 +512,23 @@ contains
     !$ACC UPDATE DEVICE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! Deletes fields on device
   subroutine delete_device(this)
+    class(thermodynamics_type), intent(inout) :: this
+    select type (this)
+    type is (thermodynamics_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
 
-    type(thermodynamics_type), intent(inout) :: this
+  subroutine delete_device_impl(this)
+
+    class(thermodynamics_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET EXIT DATA MAP(DELETE:this%pressure_hl) IF(allocated(this%pressure_hl))
@@ -474,6 +543,6 @@ contains
     !$ACC EXIT DATA DELETE(this%temperature_fl) IF(allocated(this%temperature_fl)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%h2o_sat_liq) IF(allocated(this%h2o_sat_liq)) ASYNC(1)
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 end module radiation_thermodynamics

@@ -21,7 +21,7 @@
 module radiation_aerosol_optics_data
 
   use parkind1,      only : jprb
-  use radiation_io,  only : nulerr, radiation_abort
+  use radiation_io, only : nulerr, nulout, radiation_abort
 
   implicit none
   public
@@ -147,10 +147,10 @@ module radiation_aerosol_optics_data
      procedure :: calc_rh_index
      procedure :: print_description
 
-     procedure, nopass :: create_device
-     procedure, nopass :: update_host
-     procedure, nopass :: update_device
-     procedure, nopass :: delete_device
+     procedure :: create_device
+     procedure :: update_host
+     procedure :: update_device
+     procedure :: delete_device
 
   end type aerosol_optics_type
 
@@ -169,7 +169,6 @@ contains
 #else
     use easy_netcdf,          only : netcdf_file
 #endif
-    use radiation_io,         only : nulerr, radiation_abort
 
     class(aerosol_optics_type), intent(inout) :: this
     character(len=*), intent(in)              :: file_name
@@ -758,6 +757,16 @@ contains
   !---------------------------------------------------------------------
   ! creates fields on device
   subroutine create_device(this)
+    class(aerosol_optics_type), intent(inout) :: this
+    select type (this)
+    type is (aerosol_optics_type)
+      call create_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
+
+  subroutine create_device_impl(this)
 
     type(aerosol_optics_type), intent(inout) :: this
 
@@ -820,11 +829,21 @@ contains
     !$ACC ENTER DATA COPYIN(this%lidar_ratio_mono_philic) IF(allocated(this%lidar_ratio_mono_philic)) ASYNC(1)
     !$ACC ENTER DATA COPYIN(this%rh_lower) IF(allocated(this%rh_lower)) ASYNC(1)
 #endif
-  end subroutine create_device
+  end subroutine create_device_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
   subroutine update_host(this)
+    class(aerosol_optics_type), intent(inout) :: this
+    select type (this)
+    type is (aerosol_optics_type)
+      call update_host_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
+
+  subroutine update_host_impl(this)
 
     type(aerosol_optics_type), intent(inout) :: this
 
@@ -887,11 +906,21 @@ contains
     !$ACC UPDATE HOST(this%lidar_ratio_mono_philic) IF(allocated(this%lidar_ratio_mono_philic)) ASYNC(1)
     !$ACC UPDATE HOST(this%rh_lower) IF(allocated(this%rh_lower)) ASYNC(1)
 #endif
-  end subroutine update_host
+  end subroutine update_host_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
   subroutine update_device(this)
+    class(aerosol_optics_type), intent(inout) :: this
+    select type (this)
+    type is (aerosol_optics_type)
+      call update_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
+
+  subroutine update_device_impl(this)
 
     type(aerosol_optics_type), intent(inout) :: this
 
@@ -954,11 +983,21 @@ contains
     !$ACC UPDATE DEVICE(this%lidar_ratio_mono_philic) IF(allocated(this%lidar_ratio_mono_philic)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%rh_lower) IF(allocated(this%rh_lower)) ASYNC(1)
 #endif
-  end subroutine update_device
+  end subroutine update_device_impl
 
   !---------------------------------------------------------------------
   ! deletes fields on device
   subroutine delete_device(this)
+    class(aerosol_optics_type), intent(inout) :: this
+    select type (this)
+    type is (aerosol_optics_type)
+      call delete_device_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
+
+  subroutine delete_device_impl(this)
 
     type(aerosol_optics_type), intent(inout) :: this
 
@@ -1021,7 +1060,7 @@ contains
     !$ACC EXIT DATA DELETE(this%lidar_ratio_mono_philic) IF(allocated(this%lidar_ratio_mono_philic)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%rh_lower) IF(allocated(this%rh_lower)) ASYNC(1)
 #endif
-  end subroutine delete_device
+  end subroutine delete_device_impl
 
 
 end module radiation_aerosol_optics_data

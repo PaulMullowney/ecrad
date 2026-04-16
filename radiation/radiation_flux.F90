@@ -25,6 +25,7 @@
 module radiation_flux
 
   use parkind1, only : jprb
+  use radiation_io, only : nulerr, radiation_abort
 
   implicit none
   public
@@ -111,14 +112,14 @@ module radiation_flux
    contains
     procedure :: allocate   => allocate_flux_type
     procedure :: deallocate => deallocate_flux_type
-    procedure, nopass :: calc_surface_spectral
+    procedure :: calc_surface_spectral
     procedure :: calc_toa_spectral
     procedure :: out_of_physical_bounds
     procedure :: heating_rate_out_of_physical_bounds
-    procedure, nopass :: create_device => create_device_flux
-    procedure, nopass :: update_host   => update_host_flux
-    procedure, nopass :: update_device => update_device_flux
-    procedure, nopass :: delete_device => delete_device_flux
+    procedure :: create_device
+    procedure :: update_host
+    procedure :: update_device
+    procedure :: delete_device
   end type flux_type
 
 ! Added for DWD (2020)
@@ -139,7 +140,6 @@ contains
   subroutine allocate_flux_type(this, config, istartcol, iendcol, nlev)
 
     use yomhook,          only : lhook, dr_hook, jphook
-    use radiation_io,     only : nulerr, radiation_abort
     use radiation_config, only : config_type
 
     integer, intent(in)             :: istartcol, iendcol, nlev
@@ -164,7 +164,6 @@ contains
         if (config%n_spec_lw == 0) then
           write(nulerr,'(a)') '*** Error: number of LW spectral points to save not yet defined ' &
                & // 'so cannot allocate spectral flux arrays'
-          call radiation_abort()
         end if
 
         allocate(this%lw_up_band(config%n_spec_lw,istartcol:iendcol,nlev+1))
@@ -185,7 +184,6 @@ contains
         if (config%n_bands_lw == 0) then
           write(nulerr,'(a)') '*** Error: number of LW bands not yet defined ' &
                & // 'so cannot allocate TOA spectral flux arrays'
-          call radiation_abort()
         end if
         allocate(this%lw_up_toa_band(config%n_bands_lw, istartcol:iendcol))
         if (config%do_clear) then
@@ -227,7 +225,6 @@ contains
         if (config%n_spec_sw == 0) then
           write(nulerr,'(a)') '*** Error: number of SW spectral points to save not yet defined ' &
                & // 'so cannot allocate spectral flux arrays'
-          call radiation_abort()
         end if
 
         allocate(this%sw_up_band(config%n_spec_sw,istartcol:iendcol,nlev+1))
@@ -253,7 +250,6 @@ contains
         if (config%n_bands_sw == 0) then
           write(nulerr,'(a)') '*** Error: number of SW bands not yet defined ' &
                & // 'so cannot allocate TOA spectral flux arrays'
-          call radiation_abort()
         end if
         allocate(this%sw_dn_surf_band(config%n_bands_sw,istartcol:iendcol))
         allocate(this%sw_dn_direct_surf_band(config%n_bands_sw,istartcol:iendcol))
@@ -269,7 +265,6 @@ contains
         if (config%n_bands_sw == 0) then
           write(nulerr,'(a)') '*** Error: number of SW bands not yet defined ' &
                & // 'so cannot allocate surface spectral flux arrays'
-          call radiation_abort()
         end if
         allocate(this%sw_dn_toa_band(config%n_bands_sw, istartcol:iendcol))
         allocate(this%sw_up_toa_band(config%n_bands_sw, istartcol:iendcol))
@@ -410,14 +405,30 @@ contains
   ! Calculate surface downwelling fluxes in each band using the
   ! downwelling surface fluxes at each g point
   subroutine calc_surface_spectral(this, config, istartcol, iendcol)
+    use yomhook,          only : lhook, dr_hook, jphook
+    use radiation_config, only : config_type
+    class(flux_type), intent(inout) :: this
+    type(config_type), intent(in)    :: config
+    integer,           intent(in)    :: istartcol, iendcol
+    real(jprb) :: lw_dn_surf_band(config%n_bands_lw,istartcol:iendcol)
+    integer :: i_emiss_from_reordered_g_lw(config%n_g_lw)
+    integer :: i_albedo_from_reordered_g_sw(config%n_g_sw)
+    select type (this)
+    type is (flux_type)
+      call calc_surface_spectral_impl(this, config, istartcol, iendcol)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine calc_surface_spectral
+
+  subroutine calc_surface_spectral_impl(this, config, istartcol, iendcol)
 
     use yomhook,          only : lhook, dr_hook, jphook
 #if defined(_OPENACC) || defined(OMPGPU)
-    use radiation_io,     only : nulerr, radiation_abort
 #endif
     use radiation_config, only : config_type
 
-    type(flux_type),  intent(inout) :: this
+    type(flux_type), intent(inout) :: this
     type(config_type), intent(in)    :: config
     integer,           intent(in)    :: istartcol, iendcol
 
@@ -442,7 +453,6 @@ contains
 #if defined(_OPENACC) || defined(OMPGPU)
     if (use_indexed_sum_vec) then
       write(nulerr,'(a)') '*** Error: radiation_flux:calc_surface_spectral use_indexed_sum_vec==.true. not ported to GPU'
-      call radiation_abort()
     endif
 #endif
 
@@ -791,7 +801,7 @@ contains
 
     if (lhook) call dr_hook('radiation_flux:calc_surface_spectral',1,hook_handle)
 
-  end subroutine calc_surface_spectral
+  end subroutine calc_surface_spectral_impl
 
 
   !---------------------------------------------------------------------
@@ -802,7 +812,6 @@ contains
     use yomhook,          only : lhook, dr_hook, jphook
     use radiation_config, only : config_type
 #if defined(_OPENACC) || defined(OMPGPU)
-    use radiation_io,     only : nulerr, radiation_abort
 #endif
 
 
@@ -819,7 +828,6 @@ contains
 #if defined(_OPENACC) || defined(OMPGPU)
     if (config%do_toa_spectral_flux) then
       write(nulerr,'(a)') '*** Error: radiation_flux:calc_toa_spectral not ported to GPU.'
-      call radiation_abort()
     end if
 #endif
 
@@ -1109,9 +1117,19 @@ contains
 
   !---------------------------------------------------------------------
   ! Creates fields on device
-  subroutine create_device_flux(this)
+  subroutine create_device(this)
+    class(flux_type), intent(inout) :: this
+    select type (this)
+    type is (flux_type)
+      call create_device_flux_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine create_device
 
-    type(flux_type), intent(inout) :: this
+  subroutine create_device_flux_impl(this)
+
+    class(flux_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET ENTER DATA MAP(ALLOC:this%lw_up) IF(allocated(this%lw_up))
@@ -1208,13 +1226,23 @@ contains
     !$ACC ENTER DATA CREATE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC ENTER DATA CREATE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 #endif
-  end subroutine create_device_flux
+  end subroutine create_device_flux_impl
 
   !---------------------------------------------------------------------
   ! updates fields on host
-  subroutine update_host_flux(this)
+  subroutine update_host(this)
+    class(flux_type), intent(inout) :: this
+    select type (this)
+    type is (flux_type)
+      call update_host_flux_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_host
 
-    type(flux_type), intent(inout) :: this
+  subroutine update_host_flux_impl(this)
+
+    class(flux_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE FROM(this%lw_up) IF(allocated(this%lw_up))
@@ -1311,13 +1339,23 @@ contains
     !$ACC UPDATE HOST(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC UPDATE HOST(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 #endif
-  end subroutine update_host_flux
+  end subroutine update_host_flux_impl
 
   !---------------------------------------------------------------------
   ! updates fields on device
-  subroutine update_device_flux(this)
+  subroutine update_device(this)
+    class(flux_type), intent(inout) :: this
+    select type (this)
+    type is (flux_type)
+      call update_device_flux_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine update_device
 
-    type(flux_type), intent(inout) :: this
+  subroutine update_device_flux_impl(this)
+
+    class(flux_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET UPDATE TO(this%lw_up) IF(allocated(this%lw_up))
@@ -1414,13 +1452,23 @@ contains
     !$ACC UPDATE DEVICE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC UPDATE DEVICE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 #endif
-  end subroutine update_device_flux
+  end subroutine update_device_flux_impl
 
   !---------------------------------------------------------------------
   ! Deletes fields on device
-  subroutine delete_device_flux(this)
+  subroutine delete_device(this)
+    class(flux_type), intent(inout) :: this
+    select type (this)
+    type is (flux_type)
+      call delete_device_flux_impl(this)
+    class default
+      call radiation_abort()
+    end select
+  end subroutine delete_device
 
-    type(flux_type), intent(inout) :: this
+  subroutine delete_device_flux_impl(this)
+
+    class(flux_type), intent(inout) :: this
 
 #if defined(_OPENACC)  || defined(OMPGPU)
     !$OMP TARGET EXIT DATA MAP(DELETE:this%lw_up) IF(allocated(this%lw_up))
@@ -1517,6 +1565,6 @@ contains
     !$ACC EXIT DATA DELETE(this%sw_up_toa_band) IF(allocated(this%sw_up_toa_band)) ASYNC(1)
     !$ACC EXIT DATA DELETE(this%sw_up_toa_clear_band) IF(allocated(this%sw_up_toa_clear_band)) ASYNC(1)
 #endif
-  end subroutine delete_device_flux
+  end subroutine delete_device_flux_impl
 
 end module radiation_flux
