@@ -271,7 +271,7 @@ contains
     integer,    optional, intent(in)    :: istartcol
     logical,    optional, intent(in)    :: lacc
 
-    integer :: i1, i2, jc, jk
+    integer :: i1, i2
     logical :: llacc
 
     real(jphook) :: hook_handle
@@ -285,6 +285,25 @@ contains
 
     call put_gas_check(this, igas, iunits, size(mixing_ratio, 1), &
           size(mixing_ratio, 2), scale_factor, istartcol, i1, i2, lacc=llacc)
+
+    call put_gas_jprd_impl(this, igas, size(mixing_ratio, 1), size(mixing_ratio, 2), &
+         mixing_ratio, i1, i2, llacc)
+
+    if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
+    class default
+      call radiation_abort('*** Error: radiation_gas:put_gas_jprd: unexpected dynamic type')
+    end select
+
+  end subroutine put_gas_jprd
+
+  subroutine put_gas_jprd_impl(this, igas, n1, n2, mixing_ratio, i1, i2, llacc)
+
+    type(gas_type), intent(inout) :: this
+    integer,        intent(in)    :: igas, n1, n2, i1, i2
+    real(jprd),     intent(in)    :: mixing_ratio(n1, n2)
+    logical,        intent(in)    :: llacc
+
+    integer :: jc, jk
 
 #if defined(OMPGPU)
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) IF(LLACC)
@@ -301,12 +320,7 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 #endif
 
-    if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
-    class default
-      call radiation_abort('*** Error: radiation_gas:put_gas_jprd: unexpected dynamic type')
-    end select
-
-  end subroutine put_gas_jprd
+  end subroutine put_gas_jprd_impl
 
   !---------------------------------------------------------------------
   ! Put gas mixing ratio corresponding to gas ID "igas" with units
@@ -325,7 +339,7 @@ contains
     integer,    optional, intent(in)    :: istartcol
     logical,    optional, intent(in)    :: lacc
 
-    integer :: i1, i2, jc, jk
+    integer :: i1, i2
     logical :: llacc
 
     real(jphook) :: hook_handle
@@ -340,6 +354,25 @@ contains
     call put_gas_check(this, igas, iunits, size(mixing_ratio, 1), &
           size(mixing_ratio, 2), scale_factor, istartcol, i1, i2)
 
+    call put_gas_jprm_impl(this, igas, size(mixing_ratio, 1), size(mixing_ratio, 2), &
+         mixing_ratio, i1, i2, llacc)
+
+    if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
+    class default
+      call radiation_abort('*** Error: radiation_gas:put_gas_jprm: unexpected dynamic type')
+    end select
+
+  end subroutine put_gas_jprm
+
+  subroutine put_gas_jprm_impl(this, igas, n1, n2, mixing_ratio, i1, i2, llacc)
+
+    type(gas_type), intent(inout) :: this
+    integer,        intent(in)    :: igas, n1, n2, i1, i2
+    real(jprm),     intent(in)    :: mixing_ratio(n1, n2)
+    logical,        intent(in)    :: llacc
+
+    integer :: jc, jk
+
     !$ACC PARALLEL DEFAULT(PRESENT) ASYNC(1) IF(LLACC)
     !$ACC LOOP GANG VECTOR COLLAPSE(2)
     do jk = 1,this%nlev
@@ -349,12 +382,7 @@ contains
     end do
     !$ACC END PARALLEL
 
-    if (lhook) call dr_hook('radiation_gas:put',1,hook_handle)
-    class default
-      call radiation_abort('*** Error: radiation_gas:put_gas_jprm: unexpected dynamic type')
-    end select
-
-  end subroutine put_gas_jprm
+  end subroutine put_gas_jprm_impl
 
   !---------------------------------------------------------------------
   ! Put well-mixed gas mixing ratio corresponding to gas ID "igas"
@@ -708,7 +736,6 @@ contains
 
     real(jprb)                        :: sf
     integer                           :: i1, i2, nlev
-    integer                           :: jcol, jlev
 
     logical :: llacc
 
@@ -759,6 +786,30 @@ contains
     end if
 #endif
 
+    call get_gas_impl(this, igas, iunits, size(mixing_ratio,1), nlev, mixing_ratio, &
+         i1, i2, sf, llacc)
+
+    class default
+      call radiation_abort('*** Error: radiation_gas:get_gas: unexpected dynamic type')
+    end select
+#if defined(_OPENACC) || defined(OMPGPU)
+#else
+    if (lhook) call dr_hook('radiation_gas:get',1,hook_handle)
+#endif
+
+  end subroutine get_gas
+
+  subroutine get_gas_impl(this, igas, iunits, ncol_out, nlev, mixing_ratio, &
+       i1, i2, sf, llacc)
+
+    type(gas_type), intent(in)    :: this
+    integer,        intent(in)    :: igas, iunits, ncol_out, nlev, i1, i2
+    real(jprb),     intent(out)   :: mixing_ratio(ncol_out, nlev)
+    real(jprb),     intent(inout) :: sf
+    logical,        intent(in)    :: llacc
+
+    integer :: jcol, jlev
+
     !$ACC PARALLEL IF(LLACC)
     if (.not. this%is_present(igas)) then
 #if defined(OMPGPU) && defined(__amdflang__)
@@ -769,7 +820,7 @@ contains
 #endif
        !!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) IF(LLACC)
        !$ACC LOOP GANG VECTOR COLLAPSE(2)
-       do jcol = 1,size(mixing_ratio,1)
+       do jcol = 1,ncol_out
           do jlev = 1,nlev
              mixing_ratio(jcol,jlev) = 0.0_jprb
           end do
@@ -784,7 +835,7 @@ contains
           sf = sf * AirMolarMass / GasMolarMass(igas)
        end if
        sf = sf * this%scale_factor(igas)
-       
+
        if (sf /= 1.0_jprb) then
 #if defined(OMPGPU) && defined(__amdflang__)
           IF (LLACC) THEN
@@ -817,15 +868,7 @@ contains
     end if
     !$ACC END PARALLEL
 
-    class default
-      call radiation_abort('*** Error: radiation_gas:get_gas: unexpected dynamic type')
-    end select
-#if defined(_OPENACC) || defined(OMPGPU)
-#else
-    if (lhook) call dr_hook('radiation_gas:get',1,hook_handle)
-#endif
-
-  end subroutine get_gas
+  end subroutine get_gas_impl
 
 
   !---------------------------------------------------------------------
