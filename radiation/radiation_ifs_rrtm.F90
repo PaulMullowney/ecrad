@@ -822,7 +822,7 @@ contains
 #if defined(OMPGPU)
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
 #if defined(__amdflang__)
-        !$OMP TILE SIZES(1,256,1)
+        !$OMP TILE SIZES(1,1,64)
 #endif
         do jlev = 1,nlev
           do jcol = istartcol,iendcol
