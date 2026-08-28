@@ -354,6 +354,15 @@ contains
           ! use od_scaling so we don't need to calculate it
           cloud_cover_sw(jcol) = 0.0_jprb
         end if
+      else
+        ! The cloud generator below is entered for every column and gates on
+        ! cloud cover alone, whereas ibegin/iend are only computed for columns
+        ! with the sun above the horizon. Setting the cover explicitly keeps a
+        ! night-time column out of the generator; leaving it unset makes that
+        ! depend on whatever the MAP(ALLOC:) device buffer happens to hold, and
+        ! a value above the threshold would send the generator into the column
+        ! with an ibegin/iend range that nothing ever wrote.
+        cloud_cover_sw(jcol) = 0.0_jprb
       end if
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
