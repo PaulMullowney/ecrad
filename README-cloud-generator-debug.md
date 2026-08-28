@@ -918,8 +918,195 @@ Two things worth doing at the same time, both nearly free:
   a clear-sky atmosphere and are meaningless. Every timing in this document
   taken on NVIDIA predates the fix and needs retaking.
 
-Finally, the fix in 12.5 addresses one missed target. It does not address the
-fact that the pattern is copy-pasted across four files with no mechanism to
-catch a fifth omission, and a build that silently produces host code from
-`!$OMP TARGET` while `OMPGPU` is defined has no way to warn about it. Both are
-worth fixing separately from this bug.
+### 12.9 The mechanism reproduced on gfx942, without NVHPC
+
+Two experiments run on this machine, both confirming 12.5 and one of them
+correcting part of it.
+
+**A 50-line standalone case.** `buf_mod` allocates device storage with
+`TARGET ENTER DATA MAP(ALLOC:)`, `fill_mod` fills it in a `TARGET` region, and
+`main` reads the result both from the device and from the host — the ecrad split
+in miniature. Compiling `fill_mod` alone with `--no-offload-arch=gfx942` while
+every other unit keeps offload:
+
+```
+--- A: all units offloaded (control) ---
+device max fraction =    1.00000
+host   max fraction =   -1.00000
+--- B: fill_mod NOT offloaded (NVIDIA analogue) ---
+device max fraction =    0.00000
+host   max fraction =    1.00000
+```
+
+Case B is the NVIDIA probe signature of 12.2 exactly. The defect is therefore
+not an NVHPC code-generation bug: it is a build-graph fault that any compiler
+will reproduce, and NVHPC's only contribution is that its offload flag is
+per-target and one target was missed.
+
+Note the flag order dependence found while setting this up, because it also
+matters for the fix. The last `--offload-arch` on the command line wins, and
+CMake emits target-level options *before* the source-level flags that carry
+ecbuild's `ECBUILD_Fortran_FLAGS`. A target-level `--no-offload-arch` is
+therefore silently ignored, and the first attempt at this experiment produced a
+false "all clear" for exactly that reason.
+
+The working recipe strips the flag from the source property instead. This was a
+temporary local edit in `ifs/CMakeLists.txt` and is deliberately not part of the
+tree — a knob whose purpose is to miscompile a library does not belong in a
+build file. To repeat the experiment, add this after the `ecbuild_add_library`
+call and remove it afterwards:
+
+```cmake
+string( REPLACE "--offload-arch=gfx942" "" _host "${ECBUILD_Fortran_FLAGS}" )
+set_source_files_properties( ${ifs_SOURCES} PROPERTIES COMPILE_FLAGS "${_host}" )
+```
+
+Confirm it took effect by checking that `--offload-arch` is absent from
+`ifs.dp/CMakeFiles/ifs.dp.dir/flags.make` and still present in
+`radiation.dp/CMakeFiles/ecrad.dp.dir/flags.make` before building.
+
+**The same break in the real build.** Probe build at `nblocksize=1060`,
+`ifs.dp` compiled without `--offload-arch=gfx942` and every other library
+unchanged. Control first:
+
+```
+[probe lw] ncol=1060 nlev=137 gate_pass=1035 of 1060
+[probe lw] max cloud_cover_lw=1.00000 threshold=.100000E-5
+[probe lw] on device: max frac=1.00000 max cloud_fraction=1.00000
+[probe lw] on host  : max cloud_fraction=.663713E-318
+[probe lw] device: unset=25 iend_min=86 iend_max=137
+[probe lw] host  : unset=25 iend_min=86 iend_max=137
+```
+
+This is the AMD probe run that 12.5.1 said was missing, so that caveat is now
+discharged. `iend_max = 137 = nlev` confirms section 11.1 at a fifth block size,
+`unset = 25` accounts exactly for the `1060 - 1035` columns that fail the cloud
+gate, and device and host readbacks of `ibegin`/`iend` agree.
+
+The important line is the fourth. On AMD the *host* copy of `cloud_fraction`
+reads `6.6e-319`, a denormal indistinguishable from zero, while the device copy
+reads 1.0. That is the exact mirror of NVIDIA's `device 0.0 / host 1.0`. The
+fill loop writes whichever memory space `ifs.dp` was compiled for and nothing
+copies it across, which is the whole of the defect stated as a measurement
+rather than an argument.
+
+**Where AMD differs, and it is not subtle.** With offload stripped from
+`ifs.dp`, gfx942 does not silently produce the NVIDIA numbers. It aborts before
+the probe prints anything:
+
+```
+omptarget message: explicit extension not allowed: host address specified is
+  0x00007ffe56a6fae0 (360 bytes), but device allocation maps to host at
+  0x00007ffe56a6fae0 (72 bytes)
+omptarget fatal error 1: failure of target construct while offloading is mandatory
+```
+
+So the superseded paragraph in 12.5.1 was wrong about the cause but right that
+the `#if defined(__amdflang__)` `MAP(PRESENT, ALLOC:)` regions matter. `PRESENT`
+is an assertion, and together with explicit derived-type mapping it turns "the
+device copy was never populated" into an immediate hard failure. Under NVHPC
+those regions compile out, the arrays fall back to per-region implicit mapping,
+and the same condition passes silently. AMD could not have exhibited this bug
+quietly even if `build_amd.sh` had scoped its flags per target.
+
+That the abort is a 360-versus-72-byte mismatch at a host stack address puts it
+in the same derived-type descriptor family as the original section 8
+investigation. Pinning down the exact map clause needs a rebuild with
+`-gline-tables-only`, which has not been done.
+
+### 12.10 Exactly where to fix it
+
+**The fix that matters for the B200, and the only one needed to correct the
+bug.** `ifs/CMakeLists.txt`, immediately after the `ecbuild_add_library` call
+that creates `ifs.${PREC}` — lines 38-45, committed in `7594854`:
+
+```cmake
+# To ensure device code is generated and all link time dependencies are
+# available with OpenMP target offloading, force the `-mp=gpu` flag for NVHPC
+if( HAVE_GPU AND HAVE_OMP AND GPU_OFFLOAD STREQUAL "OMP" )
+    if( CMAKE_Fortran_COMPILER_ID MATCHES "NVHPC" )
+        target_compile_options( ifs.${PREC} PRIVATE "-mp=gpu" )
+        target_link_options( ifs.${PREC} PRIVATE "-mp=gpu" )
+    endif()
+endif()
+```
+
+This is already applied. Nothing else in the source tree needs to change to fix
+the defect. Note that `PRIVATE` is correct here and `PUBLIC` would not have
+helped: usage requirements flow from a dependency to its consumers, which is why
+`driver_lib`'s `PUBLIC` copy at `driver/CMakeLists.txt:30` never reached
+`ifs.${PREC}` in the first place.
+
+Two caveats on placement. The block must come *after* the target exists, since
+`target_compile_options` requires it. And it relies on nothing later in the
+command line negating it: CMake emits target options in `$(Fortran_FLAGS)`,
+*before* the per-source flags carrying `ECBUILD_Fortran_FLAGS`, and for
+`-gpu=`/`-mp=` the last occurrence wins. The NVIDIA global flags are only
+`-O3 -gpu=cc<arch>`, so there is no conflict today, but adding a bare `-mp` to
+`ECBUILD_Fortran_FLAGS` would silently disable offload in every one of these
+five libraries.
+
+**Second layer: remove the duplication that caused the omission.** The block now
+exists in five places:
+
+| file | lines | target | scope |
+|---|---|---|---|
+| `radiation/CMakeLists.txt` | 111-118 | `ecrad.${PREC}` | PRIVATE |
+| `radiation/CMakeLists.txt` | 185-192 | `${inlib_NAME}` | PUBLIC |
+| `ifsrrtm/CMakeLists.txt` | 239-247 | `ifsrrtm.${PREC}` | PRIVATE |
+| `driver/CMakeLists.txt` | 26-33 | `driver_lib.${PREC}` | PUBLIC |
+| `ifs/CMakeLists.txt` | 38-45 | `ifs.${PREC}` | PRIVATE |
+
+Four are byte-identical apart from the target name and scope. The `ifsrrtm` one
+is not: line 242 additionally does
+`target_link_libraries( ifsrrtm.${PREC} PUBLIC OpenMP::OpenMP_Fortran )`, inside
+the outer `if` but outside the NVHPC one. That is the only place in the tree that
+links the OpenMP target explicitly, so it has to stay behind when the rest is
+hoisted.
+
+The place to hoist it is `cmake/ecrad_compile_flags.cmake`, which already exists
+for exactly this purpose and is included from the top-level `CMakeLists.txt` at
+line 176, before the `foreach( PREC IN LISTS _PRECISIONS )` loop at line 185
+that adds every subdirectory. A function defined there is in scope for all five
+call sites, reducing each to one line:
+
+```cmake
+function( ecrad_add_offload_flags target )
+    if( HAVE_GPU AND HAVE_OMP AND GPU_OFFLOAD STREQUAL "OMP" )
+        if( CMAKE_Fortran_COMPILER_ID MATCHES "NVHPC" )
+            target_compile_options( ${target} ${ARGN} "-mp=gpu" )
+            target_link_options( ${target} ${ARGN} "-mp=gpu" )
+        endif()
+    endif()
+endfunction()
+```
+
+The scope has to stay a parameter because two of the five sites need `PUBLIC`.
+
+That still leaves nothing that *detects* a sixth library being added without the
+call. The cheap check is a build-time assertion rather than a convention: after
+the `foreach` loop in the top-level `CMakeLists.txt`, iterate the known Fortran
+libraries and fail configuration if any of them compiles a source containing
+`!$OMP TARGET` without carrying `-mp=gpu`. Alternatively, and more simply, stop
+scoping the flag per target at all and put it in `ECBUILD_Fortran_FLAGS` in
+`build_nvidia_omp.sh` alongside `-gpu=cc<arch>`, which is what `build_amd.sh`
+does with `--offload-arch=gfx942` and is why AMD never had this bug. The comment
+at `build_nvidia_omp.sh:8-9` records the decision not to; whatever reason that
+had, it is what created this defect, and it should be revisited rather than
+worked around a fifth time.
+
+**Third layer, and not needed for the B200 fix: the failure was silent.** With
+offload stripped from `ifs.dp`, gfx942 aborts immediately (12.9) while NVHPC
+produced plausible-looking wrong numbers. The difference is the
+`MAP(PRESENT, ALLOC: ...)` regions, whose `PRESENT` acts as an assertion that
+the data is already on the device. They are guarded on `__amdflang__` and so are
+inert under NVHPC — in `radiation_mcica_omp_lw.F90` the guarded list includes
+`cloud_fraction`, `cloud_fractional_std`, `cloud_overlap_param` and
+`cloud_cover_lw`, which are precisely the arrays that were missing.
+
+Making those active under NVHPC means widening the guard, not repairing a
+spelling, and it is speculative in two ways: whether nvfortran enforces
+`MAP(PRESENT, ...)` strictly enough to fire at all, and what it costs, given
+that section 8 introduced those regions specifically to avoid descriptor-copy
+overhead. Worth an experiment, but it is a hardening measure against the next
+occurrence, not part of this fix.
