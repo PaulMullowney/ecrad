@@ -555,3 +555,371 @@ disappears, it was the shortwave path, and the fix in 11.3 addresses it. If it
 survives, the longwave fault is real on NVHPC while being unreachable in the
 same source on amdflang, which would make it a code-generation problem rather
 than a source defect and would need a different investigation.
+
+> Correction from section 12: `do_sw=false` is not usable. Cloud-optics setup
+> validates the shortwave band count against the gas optics and aborts with
+> `number of shortwave bands for droplets (14) does not match number for gases
+> (0)`. Selecting a single solver has to be done at compile time instead.
+
+## 12. Measured on NVIDIA (B200, NVHPC 26.3, ipn11)
+
+### 12.1 Method: a probe that never launches the suspect kernel
+
+Every previous attempt to observe the fault on NVIDIA cost a GPU. A faulting
+kernel leaves a context that cannot be torn down, the GPU keeps its memory with
+no owning process, and `nvidia-smi -r` cannot reset it while Fabric Manager is
+attached. Worse, the driver enumerates all physical devices during `cuInit`
+before applying `CUDA_VISIBLE_DEVICES`, so one wedged GPU hangs every other GPU
+process on the node, including `nvfortran` offload compilation. Containment does
+not work; the fault has to not happen.
+
+So the measurement is built the other way round. Under
+`-DECRAD_PROBE_CLOUD_RANGE` each solver poisons `ibegin`/`iend` to `-999999` on
+the device, runs the existing cloud-cover and range-finding kernels, measures
+the generator's inputs both from a device-side reduction and from a host-side
+readback, prints them, and executes a Fortran `stop`. The generator kernel is
+never enqueued. Everything that runs is `O(ncol*nlev)` with no g-point
+dimension, so the whole run is a second or two and terminates normally with no
+kernel resident, which releases the GPU cleanly.
+
+`radiation_interface` calls the longwave solver before the shortwave one, so
+with both solvers enabled the longwave probe stops the program before the
+shortwave generator is reached. For the shortwave probe,
+`-DECRAD_PROBE_SW` makes the longwave solver `return` before enqueueing its own
+generator. Configuration is `config_probe.nam`; the harness is `run_safe.sh`
+with `LIMIT=0`, which sends no signal under any circumstance.
+
+Four probe runs were executed this way. All four exited 0 and released the GPU.
+
+### 12.2 Result: the cloud field never reaches the device
+
+```
+[probe lw] ncol=16960 nlev=137 gate_pass=0 of 16960
+[probe lw] max cloud_cover_lw=0.00000 threshold=0.100000E-05
+[probe lw] on device: max frac=0.00000 max cloud_fraction=0.00000
+[probe lw] on host  : max cloud_fraction=1.00000
+[probe lw] device: unset=16960 iend_min=2147483647 iend_max=-2147483647
+[probe lw] host  : unset=16960 iend_min=2147483647 iend_max=-2147483647
+```
+
+`cloud_fraction` is the solver's dummy for `cloud%fraction`. Read from device
+memory inside a target region it is identically zero across all 16,960 columns
+and 137 levels; read from host memory at the same point it peaks at 1.0. The
+data exists and is correct on the host and is absent on the device.
+
+Consequently no column passes the cloud gate, `ibegin`/`iend` are never written
+for any column, and the generator would do no work at all.
+
+One secondary result: the device-side reduction and the host-side readback of
+`ibegin`/`iend` agree exactly, so those arrays round-trip correctly — the
+earlier worry that `iend` simply was not coming back from the device is dead.
+
+> **Correction.** An earlier version of this section read `ncol=16960` as
+> evidence that the `&radiation_driver` column range was being ignored. It is
+> not. The probe prints `iendcol-istartcol+1`, which is the range the solver was
+> handed, and both IFS drivers hand the solver one block at a time, so
+> `ncol=16960` simply means that run used `nblocksize=16960` — the first entry
+> in the section 11 block-size sweep. The namelist was read correctly: the
+> default `nblocksize` is 8, so a failed read would have printed `ncol=8`, and a
+> default `iendcol=0` is clamped to the column count rather than ignored. The
+> `nblocksize=1060` now in `config_probe.nam` is a later, smaller setting that
+> has not yet been used for an NVIDIA run. There is no namelist defect.
+
+### 12.3 What this explains
+
+It explains why a single-repeat run appeared to succeed: the generator was doing
+nothing, because there were no clouds on the device. It explains why the
+provisional performance numbers are meaningless, since the GPU was computing a
+clear-sky atmosphere. And it explains why the guard experiment of section 5 came
+back with zero guard-plane writes — the test was vacuous, not clean.
+
+### 12.4 What this does NOT explain
+
+It does not explain the out-of-bounds write, and it is important to be explicit
+about that rather than to claim a single unified cause.
+
+If the cloud field is zero, `total_cloud_cover` is zero, the generator's own
+`if (total_cloud_cover >= frac_threshold)` fails, and the routine returns
+without executing either write. Zero cloud data produces *no* writes, not
+out-of-bounds ones. It cannot be the direct cause.
+
+The reverse is also informative. `compute-sanitizer` caught the generator
+actively writing, which means that in *that* run the device cloud data was not
+zero. So the correct description of the device state is not "zero" but
+"uninitialized", and therefore run-dependent: whatever the allocator hands back.
+A freshly reset GPU returns zeros, the gate fails everywhere, and the run
+completes with wrong but finite results. Memory recycled by a previous
+`delete_device`/`create_device` cycle returns stale values, the gate passes on
+some columns, and the generator runs on data nothing wrote. That is consistent
+with the fault appearing only from the second repeat onwards.
+
+That still leaves a gap, and it should be stated as a hypothesis rather than a
+conclusion. An out-of-bounds write at level `nlev+1` requires `iend > nlev`, and
+the range-finding kernel cannot produce that: `ibegin` starts at `nlev` and only
+decreases under `min`, `iend` starts at `ibegin` and only takes `max` with
+`jlev <= nlev`. So `iend > nlev` requires the generator to run on a column for
+which the range kernel never wrote anything, leaving the poisoned or stale
+`MAP(ALLOC:)` contents in place. In the longwave solver both kernels gate on the
+same expression, `cloud_cover_lw(jcol) >= cloud_fraction_threshold`, so they can
+only disagree if that array is itself unstable between the two kernels — which
+is precisely what an uninitialized, implicitly-mapped device array can be. This
+is the mechanism to test next; it has not been demonstrated.
+
+### 12.5 Root cause: `ifs.${PREC}` is never compiled for the device
+
+> Sections 12.5.1 and 12.6 were written before this was found and are kept for
+> the record; the explanation below supersedes their structural reasoning. See
+> the notes at the head of each. Section 12.7 is unaffected.
+
+`build_nvidia_omp.sh` puts no offload flag in the global Fortran flags. Lines 8-9
+say so explicitly:
+
+```
+# Do not add -mp=gpu here. radiation/, ifsrrtm/ and driver/ CMakeLists
+# inject it per target when GPU_OFFLOAD is OMP and the compiler is NVHPC.
+```
+
+The global flags are only `-O3 -gpu=cc<arch>`. `-gpu=` selects an architecture;
+it does not enable OpenMP offload. Under NVHPC that requires `-mp=gpu`, and
+without it `!$OMP TARGET` regions compile as host code.
+
+Four targets inject it. `ifs.${PREC}` does not:
+
+| target | injects `-mp=gpu` | where |
+|---|---|---|
+| `ecrad.${PREC}` | yes | `radiation/CMakeLists.txt:115` |
+| inline lib | yes | `radiation/CMakeLists.txt:189` |
+| `ifsrrtm.${PREC}` | yes | `ifsrrtm/CMakeLists.txt:244` |
+| `driver_lib.${PREC}` | yes | `driver/CMakeLists.txt:30` |
+| **`ifs.${PREC}`** | **no** | — |
+
+`ifs/CMakeLists.txt` did receive `PRIVATE_DEFINITIONS ${GPU_OFFLOAD}GPU`, so
+`OMPGPU` is defined and `LLACC` is `.TRUE.` throughout
+`ifs/radiation_scheme.F90`. The 19 `IF(LLACC)` target regions there therefore
+*believe* they are offloading while compiling to host code. This is the worst
+possible combination: no diagnostic, correct-looking host results, and an
+untouched device.
+
+The reason this is fatal rather than merely slow is how the work is split across
+the two libraries:
+
+- `YLCLOUD%CREATE_DEVICE` (`radiation_scheme.F90:369`) is a plain procedure
+  call. It resolves into `create_device_cloud` in `radiation/radiation_cloud.F90`
+  — that is `ecrad.${PREC}`, which *does* have `-mp=gpu`. Its
+  `!$OMP TARGET ENTER DATA MAP(ALLOC:this%fraction)` runs and really does
+  allocate device storage, uninitialized.
+- The fill that populates it (`radiation_scheme.F90:605-617`) is a
+  `!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO ... IF(LLACC)` in `ifs.${PREC}`,
+  which has no `-mp=gpu`. It ran on the host.
+- There is no `YLCLOUD%UPDATE_DEVICE` anywhere in `radiation_scheme.F90` — the
+  only `UPDATE_DEVICE` in the file is a commented-out one for `RAD_CONFIG` at
+  line 364. None is needed by design, because the fill was supposed to write
+  device memory directly.
+- The solver in `ecrad.${PREC}` genuinely offloads and reads that device buffer.
+
+So the allocation happened in a library compiled for the device, the population
+happened in a library compiled for the host, and nothing bridged them. That is
+exactly the 12.2 measurement: `device max cloud_fraction = 0.0`,
+`host max cloud_fraction = 1.0`.
+
+**Fix applied** to `ifs/CMakeLists.txt`, verbatim from the other injection
+sites (`ifsrrtm.${PREC}` and `driver_lib.${PREC}` are `TYPE OBJECT` too, so the
+two-line compile-plus-link form is the established convention here):
+
+```cmake
+if( HAVE_GPU AND HAVE_OMP AND GPU_OFFLOAD STREQUAL "OMP" )
+    if( CMAKE_Fortran_COMPILER_ID MATCHES "NVHPC" )
+        target_compile_options( ifs.${PREC} PRIVATE "-mp=gpu" )
+        target_link_options( ifs.${PREC} PRIVATE "-mp=gpu" )
+    endif()
+endif()
+```
+
+Note that `driver/CMakeLists.txt` uses `PUBLIC`, but usage requirements flow
+from a dependency to its consumers, not the reverse, so `driver_lib`'s `PUBLIC`
+flag never reached `ifs.${PREC}`.
+
+One piece of evidence remains outstanding, and it is the one that would close
+this beyond argument: the pre-fix compile line for `radiation_scheme.F90` from
+the NVIDIA build, i.e. `build*/ifs.dp/CMakeFiles/ifs.dp.dir/flags.make` (or the
+entry in `compile_commands.json`). It should show no `-mp=gpu`, and the same
+file for `ecrad.dp` should show it.
+
+That four separate `CMakeLists.txt` files repeat this block is the underlying
+hazard: adding a fifth library that contains target regions requires remembering
+to repeat it again. It belongs in one shared function called by each
+subdirectory.
+
+### 12.5.1 Why AMD does not have this problem
+
+Section 11.1 already proves the cloud data does reach the device on gfx942. The
+poisoned-range measurement there found `max iend = 137 = nlev` across five block
+sizes and two inputs, with no unset entries. Columns could only have written
+`iend` by passing the cloud gate, which requires non-zero cloud cover, which
+requires the cloud fraction to be present on the device. Had AMD suffered the
+same missing transfer, that measurement would have returned `gate_pass = 0` and
+no `iend` values at all — exactly the NVIDIA result in 12.2. So the defect is
+specific to the NVHPC data-movement path, not to the shared source.
+
+The real structural reason is simpler than the one given below, and it is a
+build-system difference rather than a source one. `build_amd.sh` puts
+`--offload-arch=gfx942 -fopenmp` directly in `ECBUILD_Fortran_FLAGS`, so *every*
+target inherits offload, `ifs.dp` included. NVHPC's flag is injected per target
+and `ifs.${PREC}` was missed. No source divergence is needed to explain the
+asymmetry.
+
+This is measured, not inferred. From the existing gfx942 build tree,
+`build.rocm-24.1.0-pre.Release.opt/ifs.dp/CMakeFiles/ifs.dp.dir/flags.make`:
+
+```
+# Custom flags: ifs.dp/CMakeFiles/ifs.dp.dir/radiation_scheme.F90.o_FLAGS =
+#   -march=native -fdefault-real-8 -O3 --offload-arch=gfx942 -ffast-real-mod -fopenmp
+```
+
+which is character-for-character the same flag set that `ecrad.dp` gets. On AMD
+the cloud fill loop in `radiation_scheme.F90` is compiled for the device, so it
+writes the device buffer that `create_device_cloud` allocated, and section
+11.1's `max iend = 137` follows. The equivalent NVIDIA file is the outstanding
+evidence requested at the end of 12.5.
+
+> The paragraph below is superseded. It remains a real difference between the
+> two compilers and may still matter for other symptoms, but it is not why the
+> cloud field failed to reach the device.
+
+The structural reason is the divergence already flagged in section 8. Six files
+under `radiation/` carry `#if defined(__amdflang__)` regions that declare these
+very arrays with `MAP(PRESENT, ALLOC: ...)` — in `radiation_mcica_omp_lw.F90`
+the list includes `cloud_fraction`, `cloud_fractional_std`,
+`cloud_overlap_param` and `cloud_cover_lw`. Under NVHPC those regions compile
+out, so the same arrays fall back to per-region implicit mapping. Combined with
+`create_device_cloud` using `MAP(ALLOC:)`, which allocates device storage
+without copying, and `update_device_cloud` being called once before the
+per-block cloud fill rather than after it, the device copy can simply never be
+populated.
+
+A second, smaller factor is allocator behaviour, already noted in section 3 for
+a different purpose: HIP hands back zeroed pages, so an uninitialized read is a
+deterministic zero on AMD, whereas NVIDIA does not zero, so the same read is
+arbitrary. That makes the AMD failure mode quiet and the NVIDIA one violent.
+
+Caveat: this probe has not been run on AMD. The inference above rests on the
+section 11.1 measurement, not on a direct AMD/NVIDIA comparison with identical
+instrumentation. Running the probe on gfx942 would settle it and is cheap.
+
+### 12.6 The suspect still to be tested
+
+> Demoted by 12.5. The device field is lost before `crop_cloud_fraction` is ever
+> reached, because the fill loop that should have written it ran on the host.
+> `crop_cloud_fraction` is reached from `radiation_interface.F90` in
+> `ecrad.${PREC}`, so it *does* run on the device and would zero a device
+> fraction that was already zero — indistinguishable from the observed result.
+> The `-DECRAD_PROBE_SKIP_CROP` test is therefore expected to show no change,
+> and is now a control rather than a hypothesis. Retain it only to confirm that
+> after the 12.5 fix.
+
+`crop_cloud_fraction` in `radiation_cloud.F90` was the leading candidate for
+where the device field is lost. Its `#if defined(OMPGPU)` branch zeroes the
+fraction wherever the summed mixing ratio falls below threshold:
+
+```fortran
+if (this%fraction(jcol,jlev)        < cloud_fraction_threshold &
+     &  .or. sum_mixing_ratio(jcol) < cloud_mixing_ratio_threshold) then
+   this%fraction(jcol,jlev) = 0.0_jprb
+end if
+```
+
+If `this%mixing_ratio` is not populated on the device, or if `this%ntype` is
+zero so the accumulation loop never runs, `sum_mixing_ratio` stays zero and
+every fraction is zeroed on the device while the host copy is untouched — which
+is exactly the asymmetry measured in 12.2. The call site in
+`radiation_interface.F90` already carries the comment *"WARNING: not 100% tested
+on GPU as it has no effect on result"*.
+
+The counter-argument is that the OpenACC branch of the same routine is
+logically identical, so if `mixing_ratio` alone were at fault the OpenACC build
+would fail the same way. Either `mixing_ratio` is valid under ACC and not under
+OMP, or `crop_cloud_fraction` is not the culprit and the field is lost earlier.
+
+The test is prepared but not yet run: `-DECRAD_PROBE_SKIP_CROP` skips the call
+in `radiation_interface.F90`. If the device cloud fraction becomes non-zero with
+the crop skipped, the routine is confirmed as the point of loss. The value of
+`this%ntype` at that call should be checked at the same time.
+
+### 12.7 Operational lessons
+
+A wall-clock timeout is not a safety net. The first guard run was bounded with
+`timeout --signal=INT 300`; the signal landed while a kernel was resident and
+wedged GPU 0, which is the very outcome the harness existed to prevent. Bound
+the *work* instead — few columns, few repeats, stop early — so the run ends on
+its own. `run_safe.sh` now defaults to `LIMIT=0` and arms no signal.
+
+Do not build these experiments with `-g`. It slows device code by roughly two
+orders of magnitude; a 64-column run that should take seconds had not finished
+its second repeat after five minutes, which is what caused the timeout to fire
+in the first place.
+
+Launch with `nohup setsid` so that a dropped ssh connection cannot deliver
+SIGHUP to a running kernel.
+
+Recovering a wedged GPU needs root *and* the persistent clients detached:
+`nvidia-smi -i N -r` fails with "In use by another client" until
+`nvidia-fabricmanager` and `nvidia-persistenced` are stopped. If a task is stuck
+uninterruptibly in the driver, `ps` and `pgrep` hang and cannot be killed even
+with `timeout`, and only a reboot recovers the node; `/proc/stat` remains safe
+to read, per-process `status`, `cmdline` and `maps` do not.
+
+### 12.8 Validating the 12.5 fix
+
+The harness is already in place: `config_probe.nam` is now set to
+`nblocksize=1060`, `iendcol=1060`, `nrepeat=1`, `nwarmup=0`, and `run_safe.sh`
+defaults to `LIMIT=0`. That is one block of 1060 columns, roughly a sixteenth of
+the 16,960-column production case used for the 12.2 measurement, which keeps the
+work bounded per 12.7 without changing what is being tested.
+
+Four steps, in order, each cheap and each falsifiable:
+
+1. **Capture the evidence before rebuilding.** Save
+   `build*/ifs.dp/CMakeFiles/ifs.dp.dir/flags.make` from the existing NVIDIA
+   build. Once it is reconfigured this record is gone, and it is the direct proof
+   that `-mp=gpu` was absent.
+
+2. **Reconfigure and confirm the flag arrived.** `build_nvidia_omp.sh` must be
+   re-run rather than just `make`, since `ifs/CMakeLists.txt` changed. Then diff
+   the new `flags.make` against the saved one; it should differ by `-mp=gpu`
+   alone.
+
+3. **Re-run the longwave probe** (`-DECRAD_PROBE_CLOUD_RANGE`) under
+   `run_safe.sh`. The prediction is specific: `on device: max cloud_fraction`
+   changes from `0.00000` to `1.00000` and agrees with the host line;
+   `gate_pass` becomes non-zero; `unset` drops well below `ncol`. If the device
+   line is still zero, 12.5 is wrong and the loss is genuinely inside
+   `crop_cloud_fraction` or earlier, so 12.6 is reinstated.
+
+4. **Only then re-run `compute-sanitizer`** on the full case. This is the step
+   that answers 12.4. Two outcomes, and they lead in opposite directions:
+   - The out-of-bounds write disappears. It was an artifact of the generator
+     running on uninitialized device memory, and there is no source defect in
+     `cloud_generator_omp` to chase.
+     Note this cannot be verified by absence alone — the pre-fix runs only
+     faulted from the second repeat onwards, so `nrepeat` must exceed 1 here for
+     the result to mean anything.
+   - The write survives. Then it is a real defect independent of the data-transfer
+     bug, and the `iend > nlev` mechanism at the end of 12.4 becomes the live
+     hypothesis rather than a speculative one.
+
+Two things worth doing at the same time, both nearly free:
+
+- **Run the probe on gfx942** to remove the caveat at the end of 12.5.1. AMD is
+  expected to be unchanged in every respect, since the fix is guarded by
+  `CMAKE_Fortran_COMPILER_ID MATCHES "NVHPC"` and AMD already had global offload
+  flags. That guard is itself worth confirming by checking that the AMD build's
+  `flags.make` is byte-identical before and after.
+- **Re-check the performance numbers.** Section 12.3 notes they were measured on
+  a clear-sky atmosphere and are meaningless. Every timing in this document
+  taken on NVIDIA predates the fix and needs retaking.
+
+Finally, the fix in 12.5 addresses one missed target. It does not address the
+fact that the pattern is copy-pasted across four files with no mechanism to
+catch a fifth omission, and a build that silently produces host code from
+`!$OMP TARGET` while `OMPGPU` is defined has no way to warn about it. Both are
+worth fixing separately from this bug.

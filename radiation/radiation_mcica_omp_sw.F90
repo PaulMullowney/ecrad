@@ -201,6 +201,18 @@ contains
 
     ! First and last cloudy layers
     integer :: ibegin(istartcol:iendcol), iend(istartcol:iendcol)
+
+#ifdef ECRAD_GUARD_OD_SCALING
+    real(jprb), parameter :: guard_sentinel = -12345.0_jprb
+    integer :: n_guard_hit, n_iend_bad, n_iend_unset, iend_max, iend_min
+#endif
+
+#ifdef ECRAD_PROBE_CLOUD_RANGE
+    integer    :: n_day_dev, n_gate_gen_dev, n_gate_range_dev, n_mismatch_dev
+    integer    :: n_unset_dev, iend_max_dev, iend_min_dev
+    integer    :: n_unset_host, iend_max_host, iend_min_host
+    real(jprb) :: cover_max_dev
+#endif
  
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     ! Local variables : Was stack and is now in Global Memory
@@ -223,7 +235,13 @@ contains
 
     ! Optical depth scaling from the cloud generator, zero indicating
     ! clear skies
+#ifdef ECRAD_GUARD_OD_SCALING
+    ! One extra level so that a stray write to level nlev+1 lands inside this
+    ! column's own storage rather than past the end of the allocation
+    real(jprb), dimension(ng,nlev+1,istartcol:iendcol) :: od_scaling
+#else
     real(jprb), dimension(ng,nlev,istartcol:iendcol) :: od_scaling
+#endif
 
     ! Temporary working array
     real(jprb), dimension(ng,nlev+1,istartcol:iendcol) :: tmp_work_source
@@ -367,6 +385,17 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(ECRAD_GUARD_OD_SCALING) || defined(ECRAD_PROBE_CLOUD_RANGE)
+    ! Poison the range so that columns the gate never writes are distinguishable
+    ! from columns it does write
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    do jcol = istartcol,iendcol
+      ibegin(jcol) = -999999
+      iend(jcol)   = -999999
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
+
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     do jcol = istartcol,iendcol
       !Only perform calculation if sun above the horizon
@@ -390,6 +419,89 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#ifdef ECRAD_PROBE_CLOUD_RANGE
+    ! Measure everything the cloud generator would consume, then stop. The
+    ! generator kernel is never enqueued, so there is nothing that can fault.
+    !
+    ! n_mismatch_dev is the number that matters here: columns the generator
+    ! would enter but for which the range kernel never wrote ibegin/iend,
+    ! because its gate carries an extra cos_sza_col > 0 conjunct. It must be 0.
+    n_day_dev        = 0
+    n_gate_gen_dev   = 0
+    n_gate_range_dev = 0
+    n_mismatch_dev   = 0
+    n_unset_dev      = 0
+    iend_max_dev     = -huge(1)
+    iend_min_dev     =  huge(1)
+    cover_max_dev    = -1.0_jprb
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP&   REDUCTION(+:n_day_dev,n_gate_gen_dev,n_gate_range_dev,n_mismatch_dev,n_unset_dev) &
+    !$OMP&   REDUCTION(max:iend_max_dev,cover_max_dev) &
+    !$OMP&   REDUCTION(min:iend_min_dev) &
+    !$OMP&   MAP(TOFROM: n_day_dev,n_gate_gen_dev,n_gate_range_dev,n_mismatch_dev, &
+    !$OMP&               n_unset_dev,iend_max_dev,iend_min_dev,cover_max_dev)
+    do jcol = istartcol,iendcol
+      if (cos_sza_col(jcol) > 0.0_jprb) then
+        n_day_dev = n_day_dev + 1
+      end if
+      cover_max_dev = max(cover_max_dev, cloud_cover_sw(jcol))
+      if (cloud_cover_sw(jcol) >= cloud_fraction_threshold) then
+        n_gate_gen_dev = n_gate_gen_dev + 1
+        if (cos_sza_col(jcol) > 0.0_jprb) then
+          n_gate_range_dev = n_gate_range_dev + 1
+        else
+          n_mismatch_dev = n_mismatch_dev + 1
+        end if
+      end if
+      if (iend(jcol) == -999999) then
+        n_unset_dev = n_unset_dev + 1
+      else
+        iend_max_dev = max(iend_max_dev, iend(jcol))
+        iend_min_dev = min(iend_min_dev, iend(jcol))
+      end if
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+    ! Independent host-side read of the same array. If this disagrees with the
+    ! device-side reduction above, the fault is in the mapping, not the range.
+    !$OMP TARGET UPDATE FROM(ibegin, iend)
+    n_unset_host  = 0
+    iend_max_host = -huge(1)
+    iend_min_host =  huge(1)
+    do jcol = istartcol,iendcol
+      if (iend(jcol) == -999999) then
+        n_unset_host = n_unset_host + 1
+      else
+        iend_max_host = max(iend_max_host, iend(jcol))
+        iend_min_host = min(iend_min_host, iend(jcol))
+      end if
+    end do
+
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe sw] ncol=', iendcol-istartcol+1, &
+         &  ' nlev=', nlev, ' daylight_cols=', n_day_dev
+    write(nulout,'(a,g0.6,a,g0.6)') '[probe sw] max cloud_cover_sw=', cover_max_dev, &
+         &  ' threshold=', cloud_fraction_threshold
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe sw] generator gate=', n_gate_gen_dev, &
+         &  ' range gate=', n_gate_range_dev, ' MISMATCH=', n_mismatch_dev
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe sw] device: unset=', n_unset_dev, &
+         &  ' iend_min=', iend_min_dev, ' iend_max=', iend_max_dev
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe sw] host  : unset=', n_unset_host, &
+         &  ' iend_min=', iend_min_host, ' iend_max=', iend_max_host
+    write(nulout,'(a)') '[probe sw] stopping before the cloud generator kernel'
+    flush(nulout)
+    stop
+#endif
+
+#ifdef ECRAD_GUARD_OD_SCALING
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    do jcol = istartcol,iendcol
+       do jg = 1, ng
+          od_scaling(jg,nlev+1,jcol) = guard_sentinel
+       end do
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
+
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
     !$OMP& THREAD_LIMIT(512)
     do jcol = istartcol,iendcol
@@ -409,6 +521,40 @@ contains
                &  pair_cloud_cover=pair_cloud_cover(:,jcol))
        enddo
     enddo
+
+#ifdef ECRAD_GUARD_OD_SCALING
+    !$OMP TARGET UPDATE FROM(od_scaling, ibegin, iend, cloud_cover_sw)
+    n_guard_hit  = 0
+    n_iend_bad   = 0
+    n_iend_unset = 0
+    iend_max     = -huge(1)
+    iend_min     =  huge(1)
+    do jcol = istartcol,iendcol
+       if (iend(jcol) == -999999) then
+          ! Only safe if the generator's gate also rejects this column
+          if (cloud_cover_sw(jcol) >= cloud_fraction_threshold) then
+             n_iend_unset = n_iend_unset + 1
+          end if
+       else
+          iend_max = max(iend_max, iend(jcol))
+          iend_min = min(iend_min, iend(jcol))
+          if (iend(jcol) > nlev .or. iend(jcol) < ibegin(jcol)) then
+             n_iend_bad = n_iend_bad + 1
+          end if
+       end if
+       do jg = 1, ng
+          if (od_scaling(jg,nlev+1,jcol) /= guard_sentinel) then
+             n_guard_hit = n_guard_hit + 1
+          end if
+       end do
+    end do
+    write(nulout,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,i0)') &
+         &  '[od_scaling guard sw] nlev=', nlev, ' iend_min=', iend_min, &
+         &  ' iend_max=', iend_max, ' bad_iend_cols=', n_iend_bad, &
+         &  ' ungated_unset_cols=', n_iend_unset, &
+         &  ' guard_plane_writes=', n_guard_hit
+    flush(nulout)
+#endif
 
     ! Split the former combined kernel so the always-on clear-sky path is not
     ! compiled together with cloudy two-stream/adding.

@@ -410,9 +410,11 @@ contains
         ! a fraction or water content; after this, we can safely
         ! assume that a cloud is present if cloud%fraction > 0.0.
         ! WARNING: not 100% tested on GPU as it has no effect on result
+#ifndef ECRAD_PROBE_SKIP_CROP
         call cloud%crop_cloud_fraction(cloud, istartcol, iendcol, &
              &            config%cloud_fraction_threshold, &
              &            config%cloud_mixing_ratio_threshold)
+#endif
 
         ! Compute hydrometeor absorption/scattering properties in each
         ! shortwave and longwave band

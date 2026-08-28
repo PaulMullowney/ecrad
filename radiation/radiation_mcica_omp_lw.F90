@@ -241,7 +241,13 @@ contains
 
     ! Optical depth scaling from the cloud generator, zero indicating
     ! clear skies
+#ifdef ECRAD_GUARD_OD_SCALING
+    ! One extra level so that a stray write to level nlev+1 lands inside this
+    ! column's own storage rather than past the end of the allocation
+    real(jprb), dimension(ng,nlev+1, istartcol:iendcol) :: od_scaling
+#else
     real(jprb), dimension(ng,nlev, istartcol:iendcol) :: od_scaling
+#endif
     
         ! Temporary working array
     real(jprb), dimension(ng,nlev+1, istartcol:iendcol) :: tmp_work_source
@@ -278,6 +284,17 @@ contains
 
     !real(jprb)  totalMem
     integer :: file_idx, fidx1, fidx2, fidx3
+
+#ifdef ECRAD_GUARD_OD_SCALING
+    real(jprb), parameter :: guard_sentinel = -12345.0_jprb
+    integer :: n_guard_hit, n_iend_bad, iend_max, iend_min
+#endif
+
+#ifdef ECRAD_PROBE_CLOUD_RANGE
+    integer    :: n_gate_dev, n_unset_dev, iend_max_dev, iend_min_dev
+    integer    :: n_unset_host, iend_max_host, iend_min_host
+    real(jprb) :: cover_max_dev, frac_max_dev, cf_max_dev
+#endif
 
     !totalMem = 6*ng * nlev
     !totalMem = totalMem+5*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,source
@@ -371,6 +388,17 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#if defined(ECRAD_GUARD_OD_SCALING) || defined(ECRAD_PROBE_CLOUD_RANGE)
+    ! Poison the range so that columns the gate never writes are distinguishable
+    ! from columns it does write
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    do jcol = istartcol,iendcol
+      ibegin(jcol) = -999999
+      iend(jcol)   = -999999
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
+
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     do jcol = istartcol,iendcol
       if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
@@ -393,6 +421,85 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#ifdef ECRAD_PROBE_CLOUD_RANGE
+#ifdef ECRAD_PROBE_SW
+    ! This build targets the shortwave solver. radiation_interface calls the
+    ! longwave solver first, so leave here, before the longwave cloud generator
+    ! is enqueued; the shortwave probe then stops the program. Device data mapped
+    ! above is left mapped, which is harmless because we stop moments later.
+    return
+#endif
+    ! Measure everything the cloud generator would consume, then stop. The
+    ! generator kernel is never enqueued, so there is nothing that can fault.
+    ! Only cheap O(ncol*nlev) kernels have run at this point.
+    n_gate_dev    = 0
+    n_unset_dev   = 0
+    iend_max_dev  = -huge(1)
+    iend_min_dev  =  huge(1)
+    cover_max_dev = -1.0_jprb
+    frac_max_dev  = -1.0_jprb
+    cf_max_dev    = -1.0_jprb
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP&   REDUCTION(+:n_gate_dev,n_unset_dev) &
+    !$OMP&   REDUCTION(max:iend_max_dev,cover_max_dev,frac_max_dev,cf_max_dev) &
+    !$OMP&   REDUCTION(min:iend_min_dev) &
+    !$OMP&   MAP(TOFROM: n_gate_dev,n_unset_dev,iend_max_dev,iend_min_dev, &
+    !$OMP&               cover_max_dev,frac_max_dev,cf_max_dev)
+    do jcol = istartcol,iendcol
+      ! frac is the solver's device-side copy; cloud_fraction is the caller's
+      ! array it was filled from. Comparing them says whether cloud data reached
+      ! the device at all, and if so where it was lost.
+      do jlev = 1, nlev
+        frac_max_dev = max(frac_max_dev, frac(jlev,jcol))
+        cf_max_dev   = max(cf_max_dev,   cloud_fraction(jcol,jlev))
+      end do
+      if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
+        n_gate_dev = n_gate_dev + 1
+      end if
+      cover_max_dev = max(cover_max_dev, cloud_cover_lw(jcol))
+      if (iend(jcol) == -999999) then
+        n_unset_dev = n_unset_dev + 1
+      else
+        iend_max_dev = max(iend_max_dev, iend(jcol))
+        iend_min_dev = min(iend_min_dev, iend(jcol))
+      end if
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+    ! Independent host-side read of the same array. If this disagrees with the
+    ! device-side reduction above, the fault is in the mapping, not the range.
+    !$OMP TARGET UPDATE FROM(ibegin, iend)
+    n_unset_host  = 0
+    iend_max_host = -huge(1)
+    iend_min_host =  huge(1)
+    do jcol = istartcol,iendcol
+      if (iend(jcol) == -999999) then
+        n_unset_host = n_unset_host + 1
+      else
+        iend_max_host = max(iend_max_host, iend(jcol))
+        iend_min_host = min(iend_min_host, iend(jcol))
+      end if
+    end do
+
+    write(nulout,'(a,i0,a,i0,a,i0,a,i0)') '[probe lw] ncol=', iendcol-istartcol+1, &
+         &  ' nlev=', nlev, ' gate_pass=', n_gate_dev, ' of ', iendcol-istartcol+1
+    write(nulout,'(a,g0.6,a,g0.6)') '[probe lw] max cloud_cover_lw=', cover_max_dev, &
+         &  ' threshold=', cloud_fraction_threshold
+    write(nulout,'(a,g0.6,a,g0.6)') '[probe lw] on device: max frac=', frac_max_dev, &
+         &  ' max cloud_fraction=', cf_max_dev
+    ! Same array read from host memory. device==0 with host/=0 means the copy to
+    ! the device is missing; both zero means the data was never built at all.
+    write(nulout,'(a,g0.6)') '[probe lw] on host  : max cloud_fraction=', &
+         &  maxval(cloud_fraction(istartcol:iendcol,1:nlev))
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe lw] device: unset=', n_unset_dev, &
+         &  ' iend_min=', iend_min_dev, ' iend_max=', iend_max_dev
+    write(nulout,'(a,i0,a,i0,a,i0)') '[probe lw] host  : unset=', n_unset_host, &
+         &  ' iend_min=', iend_min_host, ' iend_max=', iend_max_host
+    write(nulout,'(a)') '[probe lw] stopping before the cloud generator kernel'
+    flush(nulout)
+    stop
+#endif
+
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev+1
@@ -409,6 +516,16 @@ contains
     !
     ! This kernel does band independent computations. Some computation is done across veritical levels
     !
+#ifdef ECRAD_GUARD_OD_SCALING
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    do jcol = istartcol,iendcol
+       do jg = 1, ng
+          od_scaling(jg,nlev+1,jcol) = guard_sentinel
+       end do
+    end do
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
+
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
     !$OMP& THREAD_LIMIT(256)
     do jcol = istartcol,iendcol
@@ -427,6 +544,33 @@ contains
                &  pair_cloud_cover=pair_cloud_cover(:,jcol))
        enddo
     enddo
+
+#ifdef ECRAD_GUARD_OD_SCALING
+    !$OMP TARGET UPDATE FROM(od_scaling, ibegin, iend)
+    n_guard_hit = 0
+    n_iend_bad  = 0
+    iend_max    = -huge(1)
+    iend_min    =  huge(1)
+    do jcol = istartcol,iendcol
+       if (iend(jcol) /= -999999) then
+          iend_max = max(iend_max, iend(jcol))
+          iend_min = min(iend_min, iend(jcol))
+          if (iend(jcol) > nlev .or. iend(jcol) < ibegin(jcol)) then
+             n_iend_bad = n_iend_bad + 1
+          end if
+       end if
+       do jg = 1, ng
+          if (od_scaling(jg,nlev+1,jcol) /= guard_sentinel) then
+             n_guard_hit = n_guard_hit + 1
+          end if
+       end do
+    end do
+    write(nulout,'(a,i0,a,i0,a,i0,a,i0,a,i0)') &
+         &  '[od_scaling guard] nlev=', nlev, ' iend_min=', iend_min, &
+         &  ' iend_max=', iend_max, ' bad_iend_cols=', n_iend_bad, &
+         &  ' guard_plane_writes=', n_guard_hit
+    flush(nulout)
+#endif
 
     ! Split the former combined kernel so the always-on clear-sky path is not
     ! compiled together with cloudy two-stream/adding (high VGPR/scratch).
