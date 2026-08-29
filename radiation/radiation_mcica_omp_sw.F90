@@ -141,8 +141,12 @@ contains
          &                               calc_reflectance_transmittance_sw_single_band_omp, &
          &                               calc_ref_trans_sw_omp, calc_ref_trans_sw_single_level_omp
     use radiation_adding_ica_sw, only  : adding_ica_sw_omp
-    use radiation_cloud_generator_acc, only: cloud_generator_omp
     use radiation_cloud_cover, only    : beta2alpha, MaxCloudFrac
+#ifdef __NVCOMPILER
+    use radiation_cloud_generator_acc, only : cloud_generator_block_omp
+#else
+    use radiation_cloud_generator_acc, only : cloud_generator_omp
+#endif
 
     implicit none
 
@@ -257,11 +261,24 @@ contains
 
     ! Loop indices for level, column and g point
     integer :: jlev, jcol, jg
+#ifdef __NVCOMPILER
+    ! nvfortran launches these kernels one team per SM (grid=148 on B200)
+    ! whatever THREAD_LIMIT asks for, which leaves the GPU ~6% occupied. Sizing
+    ! the team count from the iteration space instead is worth ~1.6x; it is
+    ! derived from the work rather than the device so it needs no device query
+    ! and scales with the column block. See README-cloud-generator-debug.md.
+    integer :: nteams
+#endif
+
     !real(jprb)  totalMem
 
 !$OMP TARGET ENTER DATA MAP(ALLOC: ref_clear,  trans_clear, ref_dir_clear, &
     !$OMP&   od_scaling, tmp_work_source,&
     !$OMP&   ref_dir, trans_dir_diff, trans_dir_dir, reflectance, transmittance)
+#ifdef __NVCOMPILER
+    nteams = ((iendcol-istartcol+1)*ng + 127) / 128
+#endif
+
     !$OMP TARGET ENTER DATA MAP(ALLOC: flux_up, flux_dn_diffuse, flux_dn_direct, &
     !$OMP             flux_up_clear, flux_dn_diffuse_clear, flux_dn_direct_clear, &
     !$OMP             sample_val, frac, frac_std, overlap_param, &
@@ -354,6 +371,13 @@ contains
           ! use od_scaling so we don't need to calculate it
           cloud_cover_sw(jcol) = 0.0_jprb
         end if
+      else
+        ! The cloud generator is entered for every column and gates on cloud
+        ! cover alone, whereas ibegin/iend below are only computed for columns
+        ! with the sun above the horizon. Setting the cover explicitly keeps a
+        ! night-time column out of the generator; leaving it unset makes that
+        ! depend on whatever the MAP(ALLOC:) device buffer happens to hold.
+        cloud_cover_sw(jcol) = 0.0_jprb
       end if
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
@@ -381,6 +405,23 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
+#ifdef __NVCOMPILER
+    ! nvfortran (checked through 26.3) computes a wrong device base address for
+    ! the od_scaling(:,:,jcol) slice when it is associated with the explicit-shape
+    ! dummy od_scaling(ng,nlev) inside the collapsed target region below. The
+    ! generator's own zeroing loop, which cannot leave the dummy's declared
+    ! extent, then writes outside the allocation and the kernel dies with
+    ! CUDA_ERROR_ILLEGAL_ADDRESS. cloud_generator_block_omp is the same generator
+    ! with the column and g-point loops moved inside, so the arrays cross the call
+    ! boundary whole and no slice is ever associated. The original form below is
+    ! valid Fortran and valid OpenMP; it is bypassed only for this compiler.
+    ! See README-cloud-generator-debug.md.
+    call cloud_generator_block_omp(ncol, istartcol, iendcol, ng, nlev, &
+         &  iseed, 0, cloud_fraction_threshold, frac, overlap_param, &
+         &  cloud_inhom_decorr_scaling, frac_std, ncdf, nfsd, fsd1, &
+         &  inv_fsd_interval, sample_val, od_scaling, cloud_cover_sw, &
+         &  ibegin, iend, cum_cloud_cover, pair_cloud_cover, 512)
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
     !$OMP& THREAD_LIMIT(512)
     do jcol = istartcol,iendcol
@@ -400,12 +441,18 @@ contains
                &  pair_cloud_cover=pair_cloud_cover(:,jcol))
        enddo
     enddo
+#endif
 
     ! Split the former combined kernel so the always-on clear-sky path is not
     ! compiled together with cloudy two-stream/adding.
     ! Revert: restore radiation_mcica_omp_sw.F90.pre_split_l404
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, gamma1, gamma2, gamma3, od_total, &
+#ifdef __NVCOMPILER
+    !$OMP& ssa_total, g_total, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
     !$OMP& ssa_total, g_total, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Only perform calculation if sun above the horizon
@@ -470,7 +517,12 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, od_cloud_new, od_total, &
+#ifdef __NVCOMPILER
+    !$OMP& ssa_total, g_total, scat_od, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
     !$OMP& ssa_total, g_total, scat_od, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
           if (cos_sza_col(jcol) > 0.0_jprb) then
@@ -559,7 +611,11 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     ! Loop through columns
+#ifdef __NVCOMPILER
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(128)
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(16)
+#endif
     do jcol = istartcol,iendcol
        do jlev = 1, nlev+1
 

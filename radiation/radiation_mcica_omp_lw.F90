@@ -57,7 +57,6 @@ contains
          &                               calc_no_scattering_transmittance_lw_single_cell_omp
     use radiation_adding_ica_lw, only  : fast_adding_ica_lw_omp, calc_fluxes_no_scattering_lw_omp
     
-    use radiation_cloud_generator_acc, only: cloud_generator_omp
     use radiation_cloud_cover, only    : beta2alpha, MaxCloudFrac
 
 #ifdef HAVE_ROCTX
@@ -166,8 +165,12 @@ contains
          &                               calc_no_scattering_transmittance_lw_omp, &
          &                               calc_no_scattering_transmittance_lw_single_cell_omp
     use radiation_adding_ica_lw, only  : fast_adding_ica_lw_omp, calc_fluxes_no_scattering_lw_omp
-    use radiation_cloud_generator_acc, only: cloud_generator_omp
     use radiation_cloud_cover, only    : beta2alpha, MaxCloudFrac
+#ifdef __NVCOMPILER
+    use radiation_cloud_generator_acc, only : cloud_generator_block_omp
+#else
+    use radiation_cloud_generator_acc, only : cloud_generator_omp
+#endif
 
     implicit none
 
@@ -275,6 +278,15 @@ contains
 
     ! Loop indices for level, column and g point
     integer :: jlev, jcol, jg
+#ifdef __NVCOMPILER
+    ! nvfortran launches these kernels one team per SM (grid=148 on B200)
+    ! whatever THREAD_LIMIT asks for, which leaves the GPU ~6% occupied. Sizing
+    ! the team count from the iteration space instead is worth ~1.6x; it is
+    ! derived from the work rather than the device so it needs no device query
+    ! and scales with the column block. See README-cloud-generator-debug.md.
+    integer :: nteams
+#endif
+
 
     !real(jprb)  totalMem
     integer :: file_idx, fidx1, fidx2, fidx3
@@ -283,6 +295,10 @@ contains
     !totalMem = totalMem+5*(ng)*(nlev+1) !flux_up,dn,up_clear,dn_clear,source
     !totalmem = totalMem*(iendcol-istartcol)*SIZEOF((real(jprb)))/1.e9
     !write(nulout,'(a,a,i0,a,g0.5)') __FILE__, " : LINE = ", __LINE__, " total_memory=",totalMem
+
+#ifdef __NVCOMPILER
+    nteams = ((iendcol-istartcol+1)*ng + 127) / 128
+#endif
 
     !$OMP TARGET ENTER DATA MAP(ALLOC: flux_up, flux_dn, flux_up_clear, flux_dn_clear, &
     !$OMP             is_clear_sky_layer, &
@@ -409,6 +425,23 @@ contains
     !
     ! This kernel does band independent computations. Some computation is done across veritical levels
     !
+#ifdef __NVCOMPILER
+    ! nvfortran (checked through 26.3) computes a wrong device base address for
+    ! the od_scaling(:,:,jcol) slice when it is associated with the explicit-shape
+    ! dummy od_scaling(ng,nlev) inside the collapsed target region below. The
+    ! generator's own zeroing loop, which cannot leave the dummy's declared
+    ! extent, then writes outside the allocation and the kernel dies with
+    ! CUDA_ERROR_ILLEGAL_ADDRESS. cloud_generator_block_omp is the same generator
+    ! with the column and g-point loops moved inside, so the arrays cross the call
+    ! boundary whole and no slice is ever associated. The original form below is
+    ! valid Fortran and valid OpenMP; it is bypassed only for this compiler.
+    ! See README-cloud-generator-debug.md.
+    call cloud_generator_block_omp(ncol, istartcol, iendcol, ng, nlev, &
+         &  iseed, 997, cloud_fraction_threshold, frac, overlap_param, &
+         &  cloud_inhom_decorr_scaling, frac_std, ncdf, nfsd, fsd1, &
+         &  inv_fsd_interval, sample_val, od_scaling, cloud_cover_lw, &
+         &  ibegin, iend, cum_cloud_cover, pair_cloud_cover, 256)
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
     !$OMP& THREAD_LIMIT(256)
     do jcol = istartcol,iendcol
@@ -427,12 +460,18 @@ contains
                &  pair_cloud_cover=pair_cloud_cover(:,jcol))
        enddo
     enddo
+#endif
 
     ! Split the former combined kernel so the always-on clear-sky path is not
     ! compiled together with cloudy two-stream/adding (high VGPR/scratch).
     ! Revert: restore radiation_mcica_omp_lw.F90.pre_split_l435
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) &
+#ifdef __NVCOMPILER
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
     !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Clear-sky calculation
@@ -455,7 +494,12 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total, scat_od, &
+#ifdef __NVCOMPILER
+    !$OMP& jcol, jg, jlev, i_cloud_top) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
     !$OMP& jcol, jg, jlev, i_cloud_top) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Do cloudy-sky calculation; add a prime number to the seed in
@@ -556,7 +600,11 @@ contains
     !
     if (do_lw_derivatives) then
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(jcol, jg, sum_up, sum_up_clr) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16)
+#endif
       do jcol = istartcol,iendcol
         if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
           sum_up = 0.0_jprb
@@ -575,7 +623,12 @@ contains
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg, jlev, sum_up) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
       do jcol = istartcol,iendcol
         do jg = 1, ng
           if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
@@ -596,7 +649,11 @@ contains
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jlev, jg, sum_up) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(32)
+#endif
       do jcol = istartcol,iendcol
         do jlev = 1, nlev+1
           if (jlev == nlev+1) then
@@ -613,7 +670,11 @@ contains
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(jcol, jg, sum_up_clr) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16)
+#endif
       do jcol = istartcol,iendcol
         if (cloud_cover_lw(jcol) >= cloud_fraction_threshold .and. &
              &  cloud_cover_lw(jcol) < 1.0_jprb - cloud_fraction_threshold) then
@@ -627,7 +688,12 @@ contains
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg, jlev, sum_up) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
+      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(1024)
+#endif
       do jcol = istartcol,iendcol
         do jg = 1, ng
           if (cloud_cover_lw(jcol) >= cloud_fraction_threshold .and. &
@@ -643,7 +709,11 @@ contains
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jlev, jg, sum_up, weight) &
+#ifdef __NVCOMPILER
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+#else
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(32)
+#endif
       do jcol = istartcol,iendcol
         do jlev = 1, nlev
           if (cloud_cover_lw(jcol) >= cloud_fraction_threshold .and. &
@@ -663,7 +733,11 @@ contains
 
     ! Loop through columns
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+#ifdef __NVCOMPILER
+    !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(128)
+#else
     !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(32)
+#endif
     do jcol = istartcol,iendcol
        do jlev = 1,nlev+1
 
