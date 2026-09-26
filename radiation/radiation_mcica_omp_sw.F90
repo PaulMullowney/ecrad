@@ -489,23 +489,22 @@ contains
                 end do
              end if
 
-             ! Use adding method to compute fluxes
+             ! Use adding method to compute fluxes, accumulating straight into
+             ! the clear-sky arrays. The total-sky kernel below overwrites
+             ! flux_up/flux_dn_* for every cloudy column and nothing reads them
+             ! for a clear one, so computing into the total-sky arrays and
+             ! copying afterwards moved six spectral profiles through HBM for
+             ! nothing. The longwave equivalent already writes direct.
              call adding_ica_sw_omp(jg, ng, nlev, incoming_sw(:,jcol), &
                   &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
                   &  ref_clear(:,:,jcol), trans_clear(:,:,jcol), ref_dir_clear(:,:,jcol), trans_dir_diff(:,:,jcol), &
-                  &  trans_dir_dir(:,:,jcol), flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), flux_dn_direct(:,:,jcol), &
-                  &  flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), source=tmp_work_source(:,:,jcol))
+                  &  trans_dir_dir(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
+                  &  flux_dn_direct_clear(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
+                  &  source=tmp_work_source(:,:,jcol))
 
-             ! save temporarily clear-sky broadband fluxes
-             do jlev = 1,nlev+1
-                flux_up_clear(jg,jlev,jcol) = flux_up(jg,jlev,jcol)
-                flux_dn_direct_clear(jg,jlev,jcol) = flux_dn_direct(jg,jlev,jcol)
-                flux_dn_diffuse_clear(jg,jlev,jcol) = flux_dn_diffuse(jg,jlev,jcol)
-             end do
-             
              ! Store spectral downwelling fluxes at surface
-             sw_dn_diffuse_surf_clear_g(jg,jcol) = flux_dn_diffuse(jg,nlev+1,jcol)
-             sw_dn_direct_surf_clear_g(jg,jcol)  = flux_dn_direct(jg,nlev+1,jcol)
+             sw_dn_diffuse_surf_clear_g(jg,jcol) = flux_dn_diffuse_clear(jg,nlev+1,jcol)
+             sw_dn_direct_surf_clear_g(jg,jcol)  = flux_dn_direct_clear(jg,nlev+1,jcol)
           else
              sw_dn_diffuse_surf_g(jg,jcol) = 0.0_jprb
              sw_dn_direct_surf_g(jg,jcol)  = 0.0_jprb
@@ -611,6 +610,13 @@ contains
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
     ! Loop through columns
+    ! The small THREAD_LIMIT on the AMD path is a cache-blocking parameter, not
+    ! an oversight: the g-point sum below is serial within a thread, so each
+    ! thread streams a contiguous ng*8-byte run while neighbouring lanes are
+    ! that same distance apart. The workgroup's footprint must stay inside the
+    ! 32 kB vL1d for the run to be fetched once and reused. Raising this to 256
+    ! measured a vL1d miss ratio of 0.99 (from 0.06) and 14x the HBM traffic,
+    ! making the kernel 5.6x slower despite the fuller wavefronts.
 #ifdef __NVCOMPILER
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(128)
 #else
