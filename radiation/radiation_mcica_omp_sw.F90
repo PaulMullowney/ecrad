@@ -141,7 +141,8 @@ contains
          &                               calc_reflectance_transmittance_sw_single_band_omp, &
          &                               calc_ref_trans_sw_omp, calc_ref_trans_sw_single_level_omp, &
          &                               calc_ref_trans_sw_scalar_omp
-    use radiation_adding_ica_sw, only  : adding_ica_sw_omp, adding_ica_sw_recompute_omp
+    use radiation_adding_ica_sw, only  : adding_ica_sw_omp, adding_ica_sw_recompute_omp, &
+         &                               adding_ica_sw_recompute_total_omp
     use radiation_cloud_cover, only    : beta2alpha, MaxCloudFrac
 #ifdef __NVCOMPILER
     use radiation_cloud_generator_acc, only : cloud_generator_block_omp
@@ -534,6 +535,20 @@ contains
 
              if (cloud_cover_sw(jcol) >= cloud_fraction_threshold) then
                 ! Total-sky calculation
+                if (.not. do_sw_delta_scaling_with_gases) then
+                ! The adding method below combines the optical properties and
+                ! solves the two-stream equations at the point of use, so no
+                ! layer properties need to be staged in memory here.
+                call adding_ica_sw_recompute_total_omp(jg, ng, nlev, &
+                     &  i_band_from_reordered_g_sw(jg), n_bands, n_bands, &
+                     &  incoming_sw(:,jcol), albedo_diffuse(:,jcol), &
+                     &  albedo_direct(:,jcol), cos_sza, &
+                     &  od(:,:,jcol), ssa(:,:,jcol), g(:,:,jcol), od_scaling(:,:,jcol), &
+                     &  od_cloud(:,:,jcol), ssa_cloud(:,:,jcol), g_cloud(:,:,jcol), &
+                     &  frac(:,jcol), cloud_fraction_threshold, &
+                     &  flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), flux_dn_direct(:,:,jcol), &
+                     &  flux_up(:,:,jcol), source=tmp_work_source(:,:,jcol))
+                else
                 do jlev = 1,nlev
                    ! Compute combined gas+aerosol+cloud optical properties
                    if (frac(jlev,jcol) >= cloud_fraction_threshold) then
@@ -599,6 +614,7 @@ contains
                      &  reflectance(:,:,jcol), transmittance(:,:,jcol), ref_dir(:,:,jcol), trans_dir_diff(:,:,jcol), &
                      &  trans_dir_dir(:,:,jcol), flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), flux_dn_direct(:,:,jcol), &
                      &  flux_up(:,:,jcol), flux_dn_diffuse(:,:,jcol), source=tmp_work_source(:,:,jcol))
+                end if
                 
                 ! Likewise for surface spectral fluxes
                 sw_dn_diffuse_surf_g(jg,jcol) = flux_dn_diffuse(jg,nlev+1,jcol)
