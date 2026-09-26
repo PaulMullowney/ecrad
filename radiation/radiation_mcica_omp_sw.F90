@@ -139,8 +139,9 @@ contains
     use parkind1, only           : jprb
     use radiation_two_stream, only     : calc_two_stream_gammas_sw_single_band_omp, &
          &                               calc_reflectance_transmittance_sw_single_band_omp, &
-         &                               calc_ref_trans_sw_omp, calc_ref_trans_sw_single_level_omp
-    use radiation_adding_ica_sw, only  : adding_ica_sw_omp
+         &                               calc_ref_trans_sw_omp, calc_ref_trans_sw_single_level_omp, &
+         &                               calc_ref_trans_sw_scalar_omp
+    use radiation_adding_ica_sw, only  : adding_ica_sw_omp, adding_ica_sw_recompute_omp
     use radiation_cloud_cover, only    : beta2alpha, MaxCloudFrac
 #ifdef __NVCOMPILER
     use radiation_cloud_generator_acc, only : cloud_generator_block_omp
@@ -463,12 +464,15 @@ contains
              ! transmittance etc at each model level
              if (.not. do_sw_delta_scaling_with_gases) then
                 ! Delta-Eddington scaling has already been performed to the
-                ! aerosol part of od, ssa and g
-                call calc_ref_trans_sw_omp(jg, ng, nlev, &
-                     &  cos_sza, od(:,:,jcol), ssa(:,:,jcol), g(:,:,jcol), &
-                     &  ref_clear(:,:,jcol), trans_clear(:,:,jcol), &
-                     &  ref_dir_clear(:,:,jcol), trans_dir_diff(:,:,jcol), &
-                     &  trans_dir_dir(:,:,jcol))
+                ! aerosol part of od, ssa and g. The two-stream properties are
+                ! recomputed inside the adding method's sweeps rather than
+                ! stored, so no spectral profile of them ever reaches memory.
+                call adding_ica_sw_recompute_omp(jg, ng, nlev, incoming_sw(:,jcol), &
+                     &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
+                     &  od(:,:,jcol), ssa(:,:,jcol), g(:,:,jcol), &
+                     &  flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
+                     &  flux_dn_direct_clear(:,:,jcol), flux_up_clear(:,:,jcol), &
+                     &  flux_dn_diffuse_clear(:,:,jcol), source=tmp_work_source(:,:,jcol))
              else
                 ! Apply delta-Eddington scaling to the aerosol-gas mixture
                 do jlev = 1,nlev
@@ -487,20 +491,21 @@ contains
                         &  ref_dir_clear(:,jlev,jcol), trans_dir_diff(:,jlev,jcol), &
                         &  trans_dir_dir(:,jlev,jcol) )
                 end do
-             end if
 
-             ! Use adding method to compute fluxes, accumulating straight into
-             ! the clear-sky arrays. The total-sky kernel below overwrites
-             ! flux_up/flux_dn_* for every cloudy column and nothing reads them
-             ! for a clear one, so computing into the total-sky arrays and
-             ! copying afterwards moved six spectral profiles through HBM for
-             ! nothing. The longwave equivalent already writes direct.
-             call adding_ica_sw_omp(jg, ng, nlev, incoming_sw(:,jcol), &
-                  &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
-                  &  ref_clear(:,:,jcol), trans_clear(:,:,jcol), ref_dir_clear(:,:,jcol), trans_dir_diff(:,:,jcol), &
-                  &  trans_dir_dir(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
-                  &  flux_dn_direct_clear(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
-                  &  source=tmp_work_source(:,:,jcol))
+                ! Use adding method to compute fluxes, accumulating straight
+                ! into the clear-sky arrays. The total-sky kernel below
+                ! overwrites flux_up/flux_dn_* for every cloudy column and
+                ! nothing reads them for a clear one, so computing into the
+                ! total-sky arrays and copying afterwards moved six spectral
+                ! profiles through HBM for nothing. The longwave equivalent
+                ! already writes direct.
+                call adding_ica_sw_omp(jg, ng, nlev, incoming_sw(:,jcol), &
+                     &  albedo_diffuse(:,jcol), albedo_direct(:,jcol), cos_sza, &
+                     &  ref_clear(:,:,jcol), trans_clear(:,:,jcol), ref_dir_clear(:,:,jcol), trans_dir_diff(:,:,jcol), &
+                     &  trans_dir_dir(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
+                     &  flux_dn_direct_clear(:,:,jcol), flux_up_clear(:,:,jcol), flux_dn_diffuse_clear(:,:,jcol), &
+                     &  source=tmp_work_source(:,:,jcol))
+             end if
 
              ! Store spectral downwelling fluxes at surface
              sw_dn_diffuse_surf_clear_g(jg,jcol) = flux_dn_diffuse_clear(jg,nlev+1,jcol)
@@ -567,13 +572,24 @@ contains
                            &  reflectance(:,jlev,jcol), transmittance(:,jlev,jcol), &
                            &  ref_dir(:,jlev,jcol), trans_dir_diff(:,jlev,jcol), &
                            &  trans_dir_dir(:,jlev,jcol))
-                   else
+                   else if (do_sw_delta_scaling_with_gases) then
                       ! Clear-sky layer: copy over clear-sky values
                       reflectance(jg,jlev,jcol) = ref_clear(jg,jlev,jcol)
                       transmittance(jg,jlev,jcol) = trans_clear(jg,jlev,jcol)
                       ref_dir(jg,jlev,jcol) = ref_dir_clear(jg,jlev,jcol)
                       !trans_dir_diff(jg,jlev,jcol) = trans_dir_diff_clear(jg,jlev,jcol)
                       !trans_dir_dir(jg,jlev,jcol) = trans_dir_dir_clear(jg,jlev,jcol)
+                   else
+                      ! Clear-sky layer: recompute rather than read back the
+                      ! clear-sky profile, which the clear-sky kernel above no
+                      ! longer stores. This also makes explicit a dependency
+                      ! that was previously implicit in trans_dir_diff and
+                      ! trans_dir_dir being left behind by that kernel.
+                      call calc_ref_trans_sw_scalar_omp(cos_sza, od(jg,jlev,jcol), &
+                           &  ssa(jg,jlev,jcol), g(jg,jlev,jcol), &
+                           &  reflectance(jg,jlev,jcol), transmittance(jg,jlev,jcol), &
+                           &  ref_dir(jg,jlev,jcol), trans_dir_diff(jg,jlev,jcol), &
+                           &  trans_dir_dir(jg,jlev,jcol))
                    end if
                 end do
 
