@@ -50,6 +50,7 @@ module radiation_two_stream
   !$omp declare target(calc_ref_trans_sw_single_level_omp)
 
   !$omp declare target(calc_ref_trans_lw_single_level_omp)
+  !$omp declare target(calc_ref_trans_lw_scalar_omp)
   !$omp declare target(calc_no_scattering_transmittance_lw_omp)
   !$omp declare target(calc_no_scattering_transmittance_lw_single_cell_omp)
 
@@ -1204,6 +1205,79 @@ contains
 #endif
 
   end subroutine calc_ref_trans_lw_single_level_omp
+
+  !---------------------------------------------------------------------
+  ! As calc_ref_trans_lw_single_level_omp but operating on scalars and
+  ! keeping its results in registers, for callers that recompute layer
+  ! properties on the fly rather than staging them in memory. Every
+  ! expression is written exactly as in that routine so the results are
+  ! bit-identical to it.
+  subroutine calc_ref_trans_lw_scalar_omp(od, ssa, asymmetry, &
+       &    planck_top, planck_bot, reflectance, transmittance, source_up, source_dn)
+
+    ! Optical depth, single scattering albedo and asymmetry factor
+    real(jprb), intent(in) :: od, ssa, asymmetry
+
+    ! The Planck terms at the top and bottom of the layer
+    real(jprb), intent(in) :: planck_top, planck_bot
+
+    ! The diffuse reflectance and transmittance of the layer
+    real(jprb), intent(out) :: reflectance, transmittance
+
+    ! The upward emission at the top of the layer and the downward
+    ! emission at its base, due to emission from within the layer
+    real(jprb), intent(out) :: source_up, source_dn
+
+    real(jprb) :: gamma1, gamma2
+    real(jprb) :: k_exponent, exponential, exponential2
+    real(jprb) :: reftrans_factor
+    real(jprb) :: coeff, coeff_up_top, coeff_up_bot, coeff_dn_top, coeff_dn_bot, factor
+
+    factor = (LwDiffusivityWP * 0.5_jprb) * ssa
+    gamma1 = LwDiffusivityWP - factor*(1.0_jprb + asymmetry)
+    gamma2 = factor * (1.0_jprb - asymmetry)
+    k_exponent = sqrt(max((gamma1 - gamma2) * (gamma1 + gamma2), &
+         1.0e-12_jprb)) ! Eq 18 of Meador & Weaver (1980)
+
+    exponential = exp(-k_exponent*od)
+
+    if (od > 1.0e-3_jprb) then
+       exponential2 = exponential*exponential
+       reftrans_factor = 1.0 / (k_exponent + gamma1 + (k_exponent - gamma1)*exponential2)
+       ! Meador & Weaver (1980) Eq. 25
+       reflectance = gamma2 * (1.0_jprb - exponential2) * reftrans_factor
+       ! Meador & Weaver (1980) Eq. 26
+       transmittance = 2.0_jprb * k_exponent * exponential * reftrans_factor
+       ! Compute upward and downward emission assuming the Planck
+       ! function to vary linearly with optical depth within the layer
+       ! (e.g. Wiscombe , JQSRT 1976).
+
+       ! Stackhouse and Stephens (JAS 1991) Eqs 5 & 12
+       coeff = (planck_bot-planck_top) / (od*(gamma1+gamma2))
+       coeff_up_top  =  coeff + planck_top
+       coeff_up_bot  =  coeff + planck_bot
+       coeff_dn_top  = -coeff + planck_top
+       coeff_dn_bot  = -coeff + planck_bot
+       source_up =  coeff_up_top - reflectance * coeff_dn_top - transmittance * coeff_up_bot
+       source_dn =  coeff_dn_bot - reflectance * coeff_up_bot - transmittance * coeff_dn_top
+    else if (od < 1.0e-8_jprb) then
+       ! The array version of this routine leaves reflectance untouched
+       ! here, so it retains whatever the caller's scratch array held.
+       ! With the properties in registers there is nothing to retain, and
+       ! zero is the physically correct value at negligible optical depth.
+       reflectance = 0.0_jprb
+       transmittance = exponential
+       source_up = 0.0_jprb
+       source_dn = 0.0_jprb
+    else
+       reflectance = gamma2 * od
+       transmittance = (1.0_jprb - k_exponent*od) / (1.0_jprb + od*(gamma1-k_exponent))
+       source_up = (1.0_jprb - reflectance - transmittance) &
+            &       * 0.5 * (planck_top + planck_bot)
+       source_dn = source_up
+    end if
+
+  end subroutine calc_ref_trans_lw_scalar_omp
 
   !---------------------------------------------------------------------
   ! Compute the longwave transmittance to diffuse radiation in the
