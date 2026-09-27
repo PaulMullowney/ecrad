@@ -281,9 +281,10 @@ contains
     if (lhook) call dr_hook('radiation_single_level:get_albedos',0,hook_handle)
 
     !$ACC DATA CREATE(sw_albedo_band, lw_albedo_band) ASYNC(1)
-#if defined(OMPGPU)
-    !$OMP TARGET ENTER DATA MAP(ALLOC: sw_albedo_band, lw_albedo_band)
-#endif
+    ! Under OMPGPU neither band array is touched from a target region:
+    ! get_albedo_bands_omp accumulates in a scalar instead, the longwave
+    ! equivalent is get_lw_albedo_omp, and the branches that do use them are
+    ! host-only or compiled out. So they need no device allocation here.
 
     if (config%do_sw) then
       ! Albedos/emissivities are stored in single_level in their own
@@ -312,13 +313,13 @@ contains
         call get_albedo_bands_omp(istartcol, iendcol, config%n_g_sw, &
              &  config%n_bands_sw, nalbedoband, size(this%sw_albedo,1), &
              &  config%sw_albedo_weights, config%i_band_from_reordered_g_sw, &
-             &  this%sw_albedo, sw_albedo_band, sw_albedo_diffuse)
+             &  this%sw_albedo, sw_albedo_diffuse)
 
         if (allocated(this%sw_albedo_direct)) then
           call get_albedo_bands_omp(istartcol, iendcol, config%n_g_sw, &
                &  config%n_bands_sw, nalbedoband, size(this%sw_albedo_direct,1), &
                &  config%sw_albedo_weights, config%i_band_from_reordered_g_sw, &
-               &  this%sw_albedo_direct, sw_albedo_band, sw_albedo_direct)
+               &  this%sw_albedo_direct, sw_albedo_direct)
         else
           !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
           do jcol = istartcol,iendcol
@@ -572,9 +573,6 @@ contains
 
     !$ACC WAIT
     !$ACC END DATA
-#if defined(OMPGPU)
-    !$OMP TARGET EXIT DATA MAP(DELETE: sw_albedo_band, lw_albedo_band)
-#endif
 
     if (lhook) call dr_hook('radiation_single_level:get_albedos',1,hook_handle)
     class default
@@ -591,7 +589,7 @@ contains
   ! body and nothing is implicitly mapped per kernel launch; see
   ! solver_mcica_omp_sw_impl for the same pattern.
   subroutine get_albedo_bands_omp(istartcol, iendcol, ng, nband, nalbedoband, ncol, &
-       &  albedo_weights, i_band_from_reordered_g, albedo_in, albedo_band, albedo_out)
+       &  albedo_weights, i_band_from_reordered_g, albedo_in, albedo_out)
 
     use parkind1, only : jprb
 
@@ -601,40 +599,32 @@ contains
     real(jprb), intent(in)    :: albedo_weights(nalbedoband, nband)
     integer,    intent(in)    :: i_band_from_reordered_g(ng)
     real(jprb), intent(in)    :: albedo_in(ncol, nalbedoband)
-    real(jprb), intent(inout) :: albedo_band(istartcol:iendcol, nband)
     real(jprb), intent(out)   :: albedo_out(ng, istartcol:iendcol)
 
     integer :: jband, jalbedoband, jg, jcol
+    real(jprb) :: albedo
 
 #if defined(__amdflang__)
     !$OMP TARGET DATA MAP(PRESENT, ALLOC: albedo_weights, i_band_from_reordered_g, &
-    !$OMP             albedo_in, albedo_band, albedo_out)
+    !$OMP             albedo_in, albedo_out)
 #endif
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
-    do jband = 1,nband
-      do jcol = istartcol,iendcol
-        albedo_band(jcol,jband) = 0.0_jprb
-      end do
-    end do
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
-    do jalbedoband = 1,nalbedoband
-      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
-      do jband = 1,nband
-        do jcol = istartcol,iendcol
-          albedo_band(jcol,jband) &
-               &  = albedo_band(jcol,jband) &
-               &  + albedo_weights(jalbedoband,jband) * albedo_in(jcol,jalbedoband)
-        end do
-      end do
-      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-    end do
-
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    ! The band-averaged albedo is accumulated in a scalar rather than in a
+    ! scratch array. The array had to be mapped to the device on every call,
+    ! and passing the partial sum between kernels cost two launches plus one
+    ! per albedo band. The sum over jalbedoband still runs in the same order
+    ! from the same zero, so the result is unchanged bit for bit; the only
+    ! extra work is repeating a sum of nalbedoband terms per g-point rather
+    ! than per band.
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jband, jalbedoband, albedo)
     do jcol = istartcol,iendcol
       do jg = 1,ng
-        albedo_out(jg,jcol) = albedo_band(jcol, i_band_from_reordered_g(jg))
+        jband = i_band_from_reordered_g(jg)
+        albedo = 0.0_jprb
+        do jalbedoband = 1,nalbedoband
+          albedo = albedo + albedo_weights(jalbedoband,jband) * albedo_in(jcol,jalbedoband)
+        end do
+        albedo_out(jg,jcol) = albedo
       end do
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
