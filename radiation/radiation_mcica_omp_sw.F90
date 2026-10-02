@@ -320,7 +320,8 @@ contains
     !totalmem = totalMem*(iendcol-istartcol)*SIZEOF((real(jprb)))/1.e9
     !write(nulout,'(a,a,i0,a,g0.5)') __FILE__, " : LINE = ", __LINE__, " total_memory=",totalMem
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(ncdf, nfsd)
     do jlev = 1,nfsd
       do jcol = 1,ncdf
         sample_val(jcol,jlev) = pdf_val(jcol,jlev)
@@ -328,7 +329,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev
         frac(jlev, jcol) = cloud_fraction(jcol,jlev)
@@ -337,7 +339,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev-1
         overlap_param(jlev, jcol) = cloud_overlap_param(jcol,jlev)
@@ -345,7 +348,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(overlap_alpha)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(overlap_alpha) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, use_beta_overlap)
     do jcol = istartcol,iendcol
       !Only perform calculation if sun above the horizon
       !---------------------------------------------------------------------
@@ -370,7 +374,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, cloud_fraction_threshold)
     do jcol = istartcol,iendcol
       !Only perform calculation if sun above the horizon
       if (cos_sza_col(jcol) > 0.0_jprb ) then
@@ -403,7 +408,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, cloud_fraction_threshold)
     do jcol = istartcol,iendcol
       !Only perform calculation if sun above the horizon
       if (cos_sza_col(jcol) > 0.0_jprb .and. cloud_cover_sw(jcol) >= cloud_fraction_threshold) then
@@ -444,7 +450,9 @@ contains
          &  ibegin, iend, cum_cloud_cover, pair_cloud_cover, 512)
 #else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-    !$OMP& THREAD_LIMIT(512)
+    !$OMP& THREAD_LIMIT(512) &
+    !$OMP& FIRSTPRIVATE(cloud_fraction_threshold, cloud_inhom_decorr_scaling, &
+    !$OMP&              do_sw_delta_scaling_with_gases, fsd1, inv_fsd_interval, ncdf, nfsd)
     do jcol = istartcol,iendcol
        do jg = 1, ng
           ! Do cloudy-sky calculation
@@ -543,9 +551,13 @@ contains
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, od_cloud_new, od_total, &
 #ifdef __NVCOMPILER
     !$OMP& ssa_total, g_total, scat_od, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024) &
+    !$OMP& FIRSTPRIVATE(cloud_fraction_threshold, do_sw_delta_scaling_with_gases, n_bands)
 #else
-    !$OMP& ssa_total, g_total, scat_od, jcol, jg, jlev) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_SW_CLOUDY)
+    !$OMP& ssa_total, g_total, scat_od, jcol, jg, jlev) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold, &
+    !$OMP&              do_sw_delta_scaling_with_gases, n_bands) &
+    !$OMP& THREAD_LIMIT(ECRAD_TL_SW_CLOUDY)
 #endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
@@ -669,9 +681,15 @@ contains
     ! measured a vL1d miss ratio of 0.99 (from 0.06) and 14x the HBM traffic,
     ! making the kernel 5.6x slower despite the fuller wavefronts.
 #ifdef __NVCOMPILER
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(128)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold) &
+    !$OMP& THREAD_LIMIT(128)
 #else
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) THREAD_LIMIT(16)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& PRIVATE(cos_sza, sum_dn_diffuse, sum_dn_direct, sum_up) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold) &
+    !$OMP& THREAD_LIMIT(16)
 #endif
     do jcol = istartcol,iendcol
        do jlev = 1, nlev+1

@@ -355,7 +355,8 @@ contains
     !$OMP TARGET ENTER DATA MAP(ALLOC: trans_clear, od_scaling, &
     !$OMP   reflectance, transmittance, source_up, source_dn, tmp_work_source)
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(ncdf, nfsd)
     do jlev = 1,nfsd
       do jcol = 1,ncdf
         sample_val(jcol,jlev) = pdf_val(jcol,jlev)
@@ -363,7 +364,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev
         frac(jlev, jcol) = cloud_fraction(jcol,jlev)
@@ -373,7 +375,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev-1
         overlap_param(jlev, jcol) = cloud_overlap_param(jcol,jlev)
@@ -381,7 +384,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(overlap_alpha)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(overlap_alpha) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, use_beta_overlap)
     do jcol = istartcol,iendcol
       !---------------------------------------------------------------------
       ! manual inline from cum_cloud_cover_exp_ran >>>>>>>>>>>>>>>>>>>>>>>>
@@ -404,7 +408,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, cloud_fraction_threshold)
     do jcol = istartcol,iendcol
       cum_cloud_cover(1, jcol) = frac(1,jcol)
       cum_product(jcol) = 1.0_jprb - frac(1,jcol)
@@ -424,7 +429,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, nlev, cloud_fraction_threshold)
     do jcol = istartcol,iendcol
       if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
         ! Cloud is present: need to calculate od_scaling
@@ -446,7 +452,8 @@ contains
     end do
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev)
     do jcol = istartcol,iendcol
       do jlev = 1, nlev+1
          do jg = 1, ng
@@ -480,7 +487,9 @@ contains
          &  ibegin, iend, cum_cloud_cover, pair_cloud_cover, 256)
 #else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-    !$OMP& THREAD_LIMIT(256)
+    !$OMP& THREAD_LIMIT(256) &
+    !$OMP& FIRSTPRIVATE(cloud_fraction_threshold, cloud_inhom_decorr_scaling, fsd1, &
+    !$OMP&              inv_fsd_interval, ncdf, nfsd)
     do jcol = istartcol,iendcol
        do jg = 1, ng
           call cloud_generator_omp(jg, ng, nlev, &
@@ -533,9 +542,14 @@ contains
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(od_cloud_new, od_total, ssa_total, g_total, scat_od, &
 #ifdef __NVCOMPILER
     !$OMP& jcol, jg, jlev, i_cloud_top) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+    !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024) &
+    !$OMP& FIRSTPRIVATE(cloud_fraction_threshold, do_lw_cloud_scattering, n_bands, &
+    !$OMP&              n_bands_if_scattering)
 #else
-    !$OMP& jcol, jg, jlev, i_cloud_top) FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_LW_CLOUDY)
+    !$OMP& jcol, jg, jlev, i_cloud_top) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold, &
+    !$OMP&              do_lw_cloud_scattering, n_bands, n_bands_if_scattering) &
+    !$OMP& THREAD_LIMIT(ECRAD_TL_LW_CLOUDY)
 #endif
     do jcol = istartcol,iendcol
        do jg = 1, ng
@@ -663,9 +677,11 @@ contains
     if (do_lw_derivatives) then
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(jcol, jg, sum_up, sum_up_clr) &
 #ifdef __NVCOMPILER
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #else
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #endif
       do jcol = istartcol,iendcol
         if (cloud_cover_lw(jcol) >= cloud_fraction_threshold) then
@@ -687,9 +703,11 @@ contains
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg, jlev, sum_up) &
 #ifdef __NVCOMPILER
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #else
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_LW_FLUXSUM)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_LW_FLUXSUM) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #endif
       do jcol = istartcol,iendcol
         do jg = 1, ng
@@ -733,9 +751,11 @@ contains
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(jcol, jg, sum_up_clr) &
 #ifdef __NVCOMPILER
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #else
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(16) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #endif
       do jcol = istartcol,iendcol
         if (cloud_cover_lw(jcol) >= cloud_fraction_threshold .and. &
@@ -752,9 +772,11 @@ contains
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jg, jlev, sum_up) &
 #ifdef __NVCOMPILER
       !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) &
-      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024)
+      !$OMP& NUM_TEAMS(nteams) THREAD_LIMIT(1024) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #else
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_LW_FLUXSUM)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(ECRAD_TL_LW_FLUXSUM) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #endif
       do jcol = istartcol,iendcol
         do jg = 1, ng
@@ -772,9 +794,11 @@ contains
 
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jcol, jlev, jg, sum_up, weight) &
 #ifdef __NVCOMPILER
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(128) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #else
-      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(32)
+      !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev) THREAD_LIMIT(32) &
+      !$OMP& FIRSTPRIVATE(cloud_fraction_threshold)
 #endif
       do jcol = istartcol,iendcol
         do jlev = 1, nlev
@@ -796,9 +820,11 @@ contains
     ! Loop through columns
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) &
 #ifdef __NVCOMPILER
-    !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(128)
+    !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(128) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold)
 #else
-    !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(32)
+    !$OMP& PRIVATE(total_cloud_cover, sum_up, sum_dn, sum_up_clr, sum_dn_clr) THREAD_LIMIT(32) &
+    !$OMP& FIRSTPRIVATE(istartcol, iendcol, ng, nlev, cloud_fraction_threshold)
 #endif
     do jcol = istartcol,iendcol
        do jlev = 1,nlev+1
