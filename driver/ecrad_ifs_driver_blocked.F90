@@ -159,6 +159,28 @@ program ecrad_ifs_driver
   integer :: next_il
 #endif
 
+  ! Execution tile (OMPGPU only, enabled by ECRAD_FULL_BATCH_SIZE=K > 0):
+  ! zrgp stays resident on the device with its (nproma,field,block) layout,
+  ! and K consecutive blocks are gathered on the device into one contiguous
+  ! (K*nproma,field) array so that each radiation_scheme call processes
+  ! K*nproma columns. Each column keeps the seed of its original block.
+  integer :: full_batch_size, full_width, full_active
+  integer :: jblock, jcolumn, jfield, icol, iblk
+  integer :: iinend, ioutbeg, ioutend, ifldstot, iaprs
+  real(kind=jprb), allocatable :: full_fields(:,:)
+  integer, allocatable :: full_seed(:)
+
+  ! Multi-process partitioning (ECRAD_NPARTS=N, ECRAD_PART=r with 0 <= r < N):
+  ! blocks are dealt round-robin in chunks of ECRAD_PART_CHUNK consecutive
+  ! blocks, chunk c going to part mod(c,N), and this process computes only its
+  ! own blocks. Run one process per GPU; driver/merge_parts.py must use the same
+  ! N and chunk to recombine the outputs.
+  integer :: nparts, ipart, part_chunk, nblocks, nown, il_last
+  integer :: jtile, ntile_blocks
+  integer, allocatable :: own_blocks(:)
+  logical :: tile_overlap
+  logical, allocatable :: is_own_block(:)
+
   ! Are any variables out of bounds?
   logical :: is_out_of_bounds
 
@@ -403,6 +425,62 @@ program ecrad_ifs_driver
     write(nulout,'(a)')  'Performing radiative transfer calculations'
   end if
 
+  full_batch_size = env_int('ECRAD_FULL_BATCH_SIZE', 0)
+  if (full_batch_size < 0) stop 'ECRAD_FULL_BATCH_SIZE must be non-negative'
+  tile_overlap = env_int('ECRAD_TILE_OVERLAP', 0) /= 0
+#if !defined(OMPGPU) || defined(COPY_ASYNC)
+  if (full_batch_size > 0) stop 'ECRAD_FULL_BATCH_SIZE requires an OMPGPU build without COPY_ASYNC'
+#endif
+
+  nparts     = env_int('ECRAD_NPARTS', 1)
+  ipart      = env_int('ECRAD_PART', 0)
+  part_chunk = env_int('ECRAD_PART_CHUNK', 8)
+  if (nparts < 1 .or. ipart < 0 .or. ipart >= nparts .or. part_chunk < 1) then
+    stop 'Need ECRAD_NPARTS >= 1, 0 <= ECRAD_PART < ECRAD_NPARTS and ECRAD_PART_CHUNK >= 1'
+  end if
+  nblocks = (ncol+nproma-1)/nproma
+  il_last = ncol - (nblocks-1)*nproma
+  allocate(is_own_block(nblocks), own_blocks(nblocks))
+  nown = 0
+  do ib = 1, nblocks
+    is_own_block(ib) = mod((ib-1)/part_chunk, nparts) == ipart
+    if (is_own_block(ib)) then
+      nown = nown + 1
+      own_blocks(nown) = ib
+    end if
+  end do
+  if (nparts > 1) then
+    write(nulout,'(a,i0,a,i0,a,i0,a,i0,a)') 'Part ', ipart, ' of ', nparts, ': ', &
+         &  nown, ' of ', nblocks, ' blocks'
+  end if
+
+  if (nown == 0) full_batch_size = 0
+
+  if (full_batch_size > 0) then
+    full_width = min(full_batch_size, nown)*nproma
+    iinend   = ifs_config%iinend
+    ioutbeg  = ifs_config%ioutbeg
+    ioutend  = ifs_config%ioutend
+    ifldstot = ifs_config%ifldstot
+    iaprs    = ifs_config%iaprs
+    if (driver_config%iverbose >= 2) then
+      write(nulout,'(a,i0,a,i0,a)') 'Execution tile: ', full_width/nproma, &
+           &  ' blocks of ', nproma, ' columns per radiation_scheme call'
+    end if
+    allocate(full_fields(full_width,ifldstot))
+    allocate(full_seed(full_width))
+    full_fields = 0._jprb
+    ! Partial last block: keep the padding rows defined, as the per-block path does
+    if (il_last < nproma) then
+      zrgp(il_last+1:nproma, :, nblocks) = 0._jprb
+    end if
+    !$OMP TARGET ENTER DATA MAP(ALLOC: zrgp, full_fields, full_seed)
+    !$OMP TARGET ENTER DATA MAP(TO: own_blocks)
+#ifdef BITIDENTITY_TESTING
+    !$OMP TARGET ENTER DATA MAP(TO: iseed)
+#endif
+  end if
+
   ! Option of repeating calculation multiple time for more accurate
   ! profiling
   do jrepeat = 1,driver_config%nrepeat
@@ -442,11 +520,104 @@ program ecrad_ifs_driver
 !    if (driver_config%do_parallel) then
       ! Run radiation scheme over blocks of columns in parallel
 
+#if defined(OMPGPU) && !defined(COPY_ASYNC)
+    if (full_batch_size > 0) then
+      call system_clock(count=t(1))
+      ! Each tile moves only its own blocks in and its own outputs out. With
+      ! overlap, tile k+1's blocks are copied in while tile k runs.
+      if (tile_overlap) call update_tile(1, min(full_batch_size, nown), .false.)
+
+      do jtile = 1, nown, full_batch_size
+        ntile_blocks = min(full_batch_size, nown-jtile+1)
+        if (.not. tile_overlap) then
+          call update_tile(jtile, ntile_blocks, .false.)
+        else if (jtile+full_batch_size <= nown) then
+          call update_tile(jtile+full_batch_size, &
+               &           min(full_batch_size, nown-jtile-full_batch_size+1), .true.)
+        end if
+        full_active = (ntile_blocks-1)*nproma
+        if (own_blocks(jtile+ntile_blocks-1) == nblocks) then
+          full_active = full_active + il_last
+        else
+          full_active = full_active + nproma
+        end if
+
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(jblock, jcolumn, iblk)
+        do jfield = 1, ifldstot
+          do icol = 1, full_width
+            if (icol <= full_active .and. (jfield <= iinend .or. jfield > ioutend)) then
+              jblock  = (icol-1)/nproma
+              jcolumn = icol - jblock*nproma
+              iblk    = own_blocks(jtile+jblock)
+              full_fields(icol,jfield) = zrgp(jcolumn,jfield,iblk)
+            else
+              full_fields(icol,jfield) = 0._jprb
+            end if
+          end do
+        end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+        !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(jblock, jcolumn, iblk)
+        do icol = 1, full_width
+          jblock  = (icol-1)/nproma
+          jcolumn = icol - jblock*nproma
+#ifdef BITIDENTITY_TESTING
+          if (icol <= full_active) then
+            iblk = own_blocks(jtile+jblock)
+            full_seed(icol) = iseed(jcolumn,iblk)
+          else
+            full_seed(icol) = 0
+          end if
+#else
+          ! Matches init_seed_simple applied to each original block
+          full_seed(icol) = jcolumn
+#endif
+        end do
+        !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+        ! radiation_scheme reads the top two half-level pressures on the host
+        do jfield = iaprs, iaprs+1
+          do icol = 1, full_active
+            jblock  = (icol-1)/nproma
+            jcolumn = icol - jblock*nproma
+            full_fields(icol,jfield) = zrgp(jcolumn,jfield,own_blocks(jtile+jblock))
+          end do
+        end do
+
+        call system_clock(count=t(3))
+        call run_radiation_tile(full_width, full_active, full_fields, full_seed)
+        call system_clock(count=t(4))
+        kernel_dt = kernel_dt + (t(4)-t(3))/dble(count_rate)
+
+        ! The tile's outputs are contiguous on the device: copy them back in one
+        ! transfer and scatter them into the blocked host array
+        !$OMP TARGET UPDATE FROM(full_fields(:,ioutbeg:ioutend))
+        !$OMP PARALLEL DO COLLAPSE(2) PRIVATE(jblock, iblk, il)
+        do jfield = ioutbeg, ioutend
+          do jblock = 0, ntile_blocks-1
+            iblk = own_blocks(jtile+jblock)
+            il   = min(nproma, full_active - jblock*nproma)
+            zrgp(1:il,jfield,iblk) = full_fields(jblock*nproma+1:jblock*nproma+il,jfield)
+          end do
+        end do
+        !$OMP END PARALLEL DO
+
+        if (tile_overlap) then
+          ! Next tile's inputs
+          !$OMP TASKWAIT
+        end if
+      end do
+      call system_clock(count=t(2))
+      total_dt = total_dt + (t(2)-t(1))/dble(count_rate)
+    else
+#endif
+
 #ifndef OMPGPU
       !$OMP PARALLEL DO SCHEDULE(DYNAMIC,1) REDUCTION(+:total_dt,kernel_dt)&
       !$OMP&PRIVATE(JRL,IBEG,IEND,IL,IB,t)
 #endif
       do jrl=1,ncol,nproma
+        if (.not. is_own_block((jrl-1)/nproma+1)) cycle
         call system_clock(count=t(1))
         ibeg=jrl
         iend=min(ibeg+nproma-1,ncol)
@@ -586,6 +757,9 @@ program ecrad_ifs_driver
 #ifndef OMPGPU
       !$OMP END PARALLEL DO
 #endif
+#if defined(OMPGPU) && !defined(COPY_ASYNC)
+    end if
+#endif
 !    else
       ! Run radiation scheme serially
 !      if (driver_config%iverbose >= 3) then
@@ -618,6 +792,14 @@ program ecrad_ifs_driver
 #if defined(_OPENACC)
 !$acc wait
 #endif
+
+  if (full_batch_size > 0) then
+    !$OMP TARGET EXIT DATA MAP(DELETE: zrgp, full_fields, full_seed, own_blocks)
+#ifdef BITIDENTITY_TESTING
+    !$OMP TARGET EXIT DATA MAP(DELETE: iseed)
+#endif
+    deallocate(full_fields, full_seed)
+  end if
 
   ! --------------------------------------------------------
   ! Section 4c: Copy fluxes from blocked memory data
@@ -671,5 +853,84 @@ program ecrad_ifs_driver
 #ifdef HAVE_FIAT
   call mpl_end(ldmeminfo=.false.)
 #endif
+
+contains
+
+  integer function env_int(name, default)
+    character(len=*), intent(in) :: name
+    integer, intent(in)          :: default
+    character(len=32) :: value
+    integer :: status
+
+    env_int = default
+    call get_environment_variable(name, value, status=status)
+    if (status == 0 .and. len_trim(value) > 0) read(value,*) env_int
+  end function env_int
+
+  ! Copy the blocks own_blocks(jfirst:jfirst+nblk-1) to the device, one
+  ! contiguous run of blocks at a time. Sections strided across blocks are
+  ! mishandled by this runtime, so each run is copied whole.
+  subroutine update_tile(jfirst, nblk, async)
+    integer, intent(in) :: jfirst, nblk
+    logical, intent(in) :: async
+    integer :: jpos, jbeg, ib1, ib2
+
+    jbeg = jfirst
+    do jpos = jfirst, jfirst+nblk-1
+      if (jpos == jfirst+nblk-1 .or. own_blocks(min(jpos+1,nown)) /= own_blocks(jpos)+1) then
+        ib1 = own_blocks(jbeg)
+        ib2 = own_blocks(jpos)
+        if (async) then
+          !$OMP TARGET UPDATE TO(zrgp(:,:,ib1:ib2)) NOWAIT
+        else
+          !$OMP TARGET UPDATE TO(zrgp(:,:,ib1:ib2))
+        end if
+        jbeg = jpos + 1
+      end if
+    end do
+  end subroutine update_tile
+
+  subroutine run_radiation_tile(kcol, kend, pfields, kseed)
+    integer, intent(in)            :: kcol, kend
+    real(kind=jprb), intent(inout) :: pfields(kcol, ifs_config%ifldstot)
+    integer, intent(in)            :: kseed(kcol)
+
+    call radiation_scheme &
+         & (yradiation, 1, kend, kcol, nlev, size(aerosol%mixing_ratio,3), &
+         &  single_level%solar_irradiance, &
+         &  pfields(:,ifs_config%iamu0), pfields(:,ifs_config%its), &
+         &  pfields(:,ifs_config%iald),  pfields(:,ifs_config%ialp), &
+         &  pfields(:,ifs_config%iemiss), &
+         &  pfields(:,ifs_config%iccnl), pfields(:,ifs_config%iccno), &
+         &  pfields(:,ifs_config%igelam),pfields(:,ifs_config%igemu), &
+         &  pfields(:,ifs_config%islm), &
+         &  pfields(:,ifs_config%ipr),   pfields(:,ifs_config%iti), &
+         &  pfields(:,ifs_config%iaprs), pfields(:,ifs_config%ihti), &
+         &  pfields(:,ifs_config%iwv),   pfields(:,ifs_config%iico2), &
+         &  pfields(:,ifs_config%iich4), pfields(:,ifs_config%iin2o), &
+         &  pfields(:,ifs_config%ino2),  pfields(:,ifs_config%ic11), &
+         &  pfields(:,ifs_config%ic12),  pfields(:,ifs_config%ic22), &
+         &  pfields(:,ifs_config%icl4),  pfields(:,ifs_config%ioz), &
+         &  pfields(:,ifs_config%iclc),  pfields(:,ifs_config%ilwa), &
+         &  pfields(:,ifs_config%iiwa),  pfields(:,ifs_config%irwa), &
+         &  pfields(:,ifs_config%iswa), &
+         &  pfields(:,ifs_config%iaer),  pfields(:,ifs_config%iaero), &
+         &  pfields(:,ifs_config%ifrso), pfields(:,ifs_config%ifrth), &
+         &  pfields(:,ifs_config%iswfc), pfields(:,ifs_config%ilwfc), &
+         &  pfields(:,ifs_config%ifrsod),pfields(:,ifs_config%ifrted), &
+         &  pfields(:,ifs_config%ifrsodc),pfields(:,ifs_config%ifrtedc), &
+         &  pfields(:,ifs_config%ifdir), pfields(:,ifs_config%icdir), &
+         &  pfields(:,ifs_config%isudu), &
+         &  pfields(:,ifs_config%iuvdf), pfields(:,ifs_config%iparf), &
+         &  pfields(:,ifs_config%iparcf),pfields(:,ifs_config%itincf), &
+         &  pfields(:,ifs_config%iemit), pfields(:,ifs_config%ilwderivative), &
+         &  pfields(:,ifs_config%iswdiffuseband), pfields(:,ifs_config%iswdirectband) &
+#ifdef BITIDENTITY_TESTING
+         &  ,pre_liq=pfields(:,ifs_config%ire_liq), &
+         &  pre_ice=pfields(:,ifs_config%ire_ice), &
+         &  pcloud_overlap=pfields(:,ifs_config%ioverlap) &
+#endif
+         &  ,iseed=kseed)
+  end subroutine run_radiation_tile
 
 end program ecrad_ifs_driver
