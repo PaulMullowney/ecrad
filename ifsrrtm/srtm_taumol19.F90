@@ -89,70 +89,88 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
     i_nlayers = klev
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
-    !$ACC WAIT
-    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
-    !$ACC LOOP GANG(STATIC:1) VECTOR
-    DO iplon = KIDIA, KFDIA
-      i_laysolfr(iplon) = k_laytrop(iplon)
-    ENDDO
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
 #if defined(OMPGPU)
+    ! One kernel finds each column's solar reference layer over its whole
+    ! troposphere, and one covers every layer, choosing the lower- or
+    ! upper-atmosphere formula per column, in place of separate lower, upper
+    ! and one-launch-per-layer middle loops
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     DO iplon = KIDIA, KFDIA
-       DO i_lay = 1, laytrop_min
+       i_laysolfr(iplon) = k_laytrop(iplon)
+       DO i_lay = 1, k_laytrop(iplon)
          IF (k_jp(iplon,i_lay) < layreffr                         &
               & .AND. k_jp(iplon,i_lay+1) >= layreffr)            &
               & i_laysolfr(iplon) = MIN(i_lay+1,k_laytrop(iplon))
        ENDDO
     ENDDO
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, js, z_fs, z_speccomb, z_specmult, z_specparm, &
-      !$OMP   z_tauray)
-    DO i_lay = 1, laytrop_min
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, js, z_fs, &
+    !$OMP   z_speccomb, z_specmult, z_specparm, z_tauray)
+    DO i_lay = 1, i_nlayers
       DO iplon = KIDIA, KFDIA
-         z_speccomb = p_colh2o(iplon,i_lay) + strrat*p_colco2(iplon,i_lay)
-         z_specparm = p_colh2o(iplon,i_lay)/z_speccomb
-         z_specparm = MIN(p_oneminus(iplon),z_specparm)
-         z_specmult = 8._JPRB*(z_specparm)
-         js = 1 + INT(z_specmult)
-         z_fs = z_specmult - AINT(z_specmult)
-         ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(19) + js
-         ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(19) + js
-         inds = k_indself(iplon,i_lay)
-         indf = k_indfor(iplon,i_lay)
-         z_tauray = p_colmol(iplon,i_lay) * rayl
+        IF (i_lay <= k_laytrop(iplon)) THEN
+           z_speccomb = p_colh2o(iplon,i_lay) + strrat*p_colco2(iplon,i_lay)
+           z_specparm = p_colh2o(iplon,i_lay)/z_speccomb
+           z_specparm = MIN(p_oneminus(iplon),z_specparm)
+           z_specmult = 8._JPRB*(z_specparm)
+           js = 1 + INT(z_specmult)
+           z_fs = z_specmult - AINT(z_specmult)
+           ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(19) + js
+           ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(19) + js
+           inds = k_indself(iplon,i_lay)
+           indf = k_indfor(iplon,i_lay)
+           z_tauray = p_colmol(iplon,i_lay) * rayl
 
 !$NEC unroll(NG19)
-         DO ig = 1 , ng19
-           p_taug(iplon,i_lay,ig) = z_speccomb *                            &
-                & (                                                         &
-                & (1._JPRB- z_fs) * ( absa(ind0,ig) * p_fac00(iplon,i_lay) +    &
-                &                 absa(ind0+9,ig) * p_fac10(iplon,i_lay) +  &
-                &                 absa(ind1,ig) * p_fac01(iplon,i_lay) +    &
-                &                 absa(ind1+9,ig) * p_fac11(iplon,i_lay) )+ &
-                & z_fs        * ( absa(ind0+1,ig) * p_fac00(iplon,i_lay) +  &
-                &                 absa(ind0+10,ig) * p_fac10(iplon,i_lay) + &
-                &                 absa(ind1+1,ig) * p_fac01(iplon,i_lay) +  &
-                &                 absa(ind1+10,ig) * p_fac11(iplon,i_lay) ) &
-                & ) +                                                       &
-                & p_colh2o(iplon,i_lay) *                                   &
-                & (p_selffac(iplon,i_lay) * (selfrefc(inds,ig) +            &
-                & p_selffrac(iplon,i_lay) *                                 &
-                & (selfrefc(inds+1,ig) - selfrefc(inds,ig))) +              &
-                & p_forfac(iplon,i_lay) * (forrefc(indf,ig) +               &
-                & p_forfrac(iplon,i_lay) *                                  &
-                & (forrefc(indf+1,ig) - forrefc(indf,ig))))
-           IF (i_lay == i_laysolfr(iplon))                           &
-                &    p_sfluxzen(iplon,ig) = sfluxrefc(ig,js)         &
-                &    + z_fs * (sfluxrefc(ig,js+1) - sfluxrefc(ig,js))
-           p_taur(iplon,i_lay,ig) = z_tauray
-         ENDDO
+           DO ig = 1 , ng19
+             p_taug(iplon,i_lay,ig) = z_speccomb *                            &
+                  & (                                                         &
+                  & (1._JPRB- z_fs) * ( absa(ind0,ig) * p_fac00(iplon,i_lay) +    &
+                  &                 absa(ind0+9,ig) * p_fac10(iplon,i_lay) +  &
+                  &                 absa(ind1,ig) * p_fac01(iplon,i_lay) +    &
+                  &                 absa(ind1+9,ig) * p_fac11(iplon,i_lay) )+ &
+                  & z_fs        * ( absa(ind0+1,ig) * p_fac00(iplon,i_lay) +  &
+                  &                 absa(ind0+10,ig) * p_fac10(iplon,i_lay) + &
+                  &                 absa(ind1+1,ig) * p_fac01(iplon,i_lay) +  &
+                  &                 absa(ind1+10,ig) * p_fac11(iplon,i_lay) ) &
+                  & ) +                                                       &
+                  & p_colh2o(iplon,i_lay) *                                   &
+                  & (p_selffac(iplon,i_lay) * (selfrefc(inds,ig) +            &
+                  & p_selffrac(iplon,i_lay) *                                 &
+                  & (selfrefc(inds+1,ig) - selfrefc(inds,ig))) +              &
+                  & p_forfac(iplon,i_lay) * (forrefc(indf,ig) +               &
+                  & p_forfrac(iplon,i_lay) *                                  &
+                  & (forrefc(indf+1,ig) - forrefc(indf,ig))))
+             IF (i_lay == i_laysolfr(iplon))                           &
+                  &    p_sfluxzen(iplon,ig) = sfluxrefc(ig,js)         &
+                  &    + z_fs * (sfluxrefc(ig,js+1) - sfluxrefc(ig,js))
+             p_taur(iplon,i_lay,ig) = z_tauray
+           ENDDO
+        ELSE
+          ind0 = ((k_jp(iplon,i_lay)-13)*5+(k_jt(iplon,i_lay)-1))*nspb(19) + 1
+          ind1 = ((k_jp(iplon,i_lay)-12)*5+(k_jt1(iplon,i_lay)-1))*nspb(19)+ 1
+          z_tauray = p_colmol(iplon,i_lay) * rayl
+
+!$NEC unroll(NG19)
+          DO ig = 1 , ng19
+            p_taug(iplon,i_lay,ig) = p_colco2(iplon,i_lay) * &
+                 & (p_fac00(iplon,i_lay) * absb(ind0,ig) +   &
+                 & p_fac10(iplon,i_lay) * absb(ind0+1,ig) +  &
+                 & p_fac01(iplon,i_lay) * absb(ind1,ig) +    &
+                 & p_fac11(iplon,i_lay) * absb(ind1+1,ig))
+            p_taur(iplon,i_lay,ig) = z_tauray
+          ENDDO
+        ENDIF
       ENDDO
     ENDDO
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 #else
+    !$ACC WAIT
+    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+    !$ACC LOOP GANG(STATIC:1) VECTOR
+    DO iplon = KIDIA, KFDIA
+      i_laysolfr(iplon) = k_laytrop(iplon)
+    ENDDO
     !$ACC LOOP SEQ
     DO i_lay = 1, llaytrop_min
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(ind0, ind1, inds, indf, js, z_fs, z_speccomb, z_specmult, z_specparm, &
@@ -204,7 +222,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       ENDDO
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDDO
-#endif
 
     !$ACC LOOP SEQ
     DO i_lay = llaytrop_min+1, llaytrop_max
@@ -298,6 +315,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
   !$ACC WAIT
   !$ACC END DATA

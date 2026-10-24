@@ -104,6 +104,12 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     else
        CALL COMPUTE_LAYTROP_MIN_MAX(KIDIA, KFDIA, LAYTROP, llaytrop_min, llaytrop_max)
     endif
+#if defined(OMPGPU)
+    ! A single kernel over every layer, choosing the lower- or upper-atmosphere
+    ! formula per column, replaces the separate lower and upper kernels
+    llaytrop_min = 0
+    llaytrop_max = KLEV
+#endif
 
     !$ACC DATA PRESENT(taug, P_TAUAERL, fac00, fac01, fac10, fac11, jp, jt, jt1, &
     !$ACC             colh2o, colco2, laytrop, selffac, selffrac, indself, fracs, &
@@ -146,6 +152,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       ! vapor self-continuum adn foreign continuum is interpolated
       ! (in temperature) separately.
 
+#if !defined(OMPGPU)
       ! Lower atmosphere loop
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, speccomb1, speccomb_planck, ind0,ind1,inds,indf, js, js1, &
       !$OMP   jpl, fs, specmult, specparm, fs1, specmult1, specparm1, fpl, specmult_PLANCK, specparm_PLANCK, fac000, &
@@ -405,6 +412,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       enddo
       !$ACC END PARALLEL
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
       IF (llaytrop_max /= llaytrop_min) THEN
         ! Mixed loop
@@ -412,7 +420,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
         !$OMP   specmult1, js1, fs1, speccomb_planck, specparm_planck, specmult_planck, jpl, fpl, ind0, ind1, inds, &
         !$OMP   indf, p, p4, fk0, fk1, fk2, fac000, fac100, fac200, fac010, fac110, fac210, fac001, fac101, fac201, &
-        !$OMP   fac011, fac111, fac211, tau_major, tau_major1, tauself, taufor)
+        !$OMP   fac011, fac111, fac211, tau_major, tau_major1, tauself, taufor) THREAD_LIMIT(128)
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, &
         !$ACC   specmult1, js1, fs1, speccomb_planck, specparm_planck, specmult_planck, jpl, fpl, ind0, ind1, inds, &

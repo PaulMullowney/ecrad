@@ -61,6 +61,21 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
     i_nlayers = klev
+#if defined(OMPGPU)
+    ! The solar reference layer is each column's tropopause layer, so a single
+    ! kernel covers every layer
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+    DO ig = 1 , ng26
+      DO i_lay = 1, i_nlayers
+        DO iplon = KIDIA, KFDIA
+          IF (i_lay == k_laytrop(iplon)) p_sfluxzen(iplon,ig)=sfluxrefc(ig)
+          p_taug(iplon,i_lay,ig) = 0.0_JPRB
+          p_taur(iplon,i_lay,ig) = p_colmol(iplon,i_lay) * raylc(ig)
+        ENDDO
+      ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG VECTOR
@@ -126,6 +141,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
     !$ACC WAIT
     !$ACC END DATA

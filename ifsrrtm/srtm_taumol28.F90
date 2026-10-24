@@ -79,6 +79,82 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
     i_nlayers = klev
+#if defined(OMPGPU)
+    ! One kernel finds each column's solar reference layer above its
+    ! troposphere before any layer reads it, and one covers every layer,
+    ! choosing the lower- or upper-atmosphere formula per column
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    DO iplon = KIDIA, KFDIA
+       i_laysolfr(iplon) = i_nlayers
+       DO i_lay = k_laytrop(iplon)+1, i_nlayers
+          IF (k_jp(iplon,i_lay-1) < layreffr &
+               &    .AND. k_jp(iplon,i_lay) >= layreffr) i_laysolfr(iplon) = i_lay
+       ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, js, z_fs, z_speccomb, &
+    !$OMP   z_specmult, z_specparm, z_tauray)
+    DO i_lay = 1, i_nlayers
+      DO iplon = KIDIA, KFDIA
+        IF (i_lay <= k_laytrop(iplon)) THEN
+           z_speccomb = p_colo3(iplon,i_lay) + strrat*p_colo2(iplon,i_lay)
+           z_specparm = p_colo3(iplon,i_lay)/z_speccomb
+           z_specparm = MIN(p_oneminus(iplon),z_specparm)
+           z_specmult = 8._JPRB*(z_specparm)
+           js = 1 + INT(z_specmult)
+           z_fs = z_specmult - AINT(z_specmult)
+           ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(28) + js
+           ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(28) + js
+           z_tauray = p_colmol(iplon,i_lay) * rayl
+
+!$NEC unroll(NG28)
+           DO ig = 1 , ng28
+             p_taug(iplon,i_lay,ig) = z_speccomb * &
+                  & (&
+                  & (1._JPRB- z_fs) * ( absa(ind0,ig) * p_fac00(iplon,i_lay) +    &
+                  &                 absa(ind0+9,ig) * p_fac10(iplon,i_lay) +  &
+                  &                 absa(ind1,ig) * p_fac01(iplon,i_lay) +    &
+                  &                 absa(ind1+9,ig) * p_fac11(iplon,i_lay) )+ &
+                  & z_fs        * ( absa(ind0+1,ig) * p_fac00(iplon,i_lay) +  &
+                  &                 absa(ind0+10,ig) * p_fac10(iplon,i_lay) + &
+                  &                 absa(ind1+1,ig) * p_fac01(iplon,i_lay) +  &
+                  &                 absa(ind1+10,ig) * p_fac11(iplon,i_lay) ) &
+                  & )
+             p_taur(iplon,i_lay,ig) = z_tauray
+           ENDDO
+        ELSE
+          z_speccomb = p_colo3(iplon,i_lay) + strrat*p_colo2(iplon,i_lay)
+          z_specparm = p_colo3(iplon,i_lay)/z_speccomb
+          z_specparm = MIN(p_oneminus(iplon),z_specparm)
+          z_specmult = 4._JPRB*(z_specparm)
+          js = 1 + INT(z_specmult)
+          z_fs = z_specmult - AINT(z_specmult)
+          ind0 = ((k_jp(iplon,i_lay)-13)*5+(k_jt(iplon,i_lay)-1))*nspb(28)+ js
+          ind1 = ((k_jp(iplon,i_lay)-12)*5+(k_jt1(iplon,i_lay)-1))*nspb(28)+js
+          z_tauray = p_colmol(iplon,i_lay) * rayl
+
+!$NEC unroll(NG28)
+          DO ig = 1 , ng28
+            p_taug(iplon,i_lay,ig) = z_speccomb * &
+                 & (&
+                 & (1._JPRB- z_fs) * ( absb(ind0,ig) * p_fac00(iplon,i_lay) +    &
+                 &                 absb(ind0+5,ig) * p_fac10(iplon,i_lay) +  &
+                 &                 absb(ind1,ig) * p_fac01(iplon,i_lay) +    &
+                 &                 absb(ind1+5,ig) * p_fac11(iplon,i_lay) )+ &
+                 & z_fs        * ( absb(ind0+1,ig) * p_fac00(iplon,i_lay) +  &
+                 &                 absb(ind0+6,ig) * p_fac10(iplon,i_lay) +  &
+                 &                 absb(ind1+1,ig) * p_fac01(iplon,i_lay) +  &
+                 &                 absb(ind1+6,ig) * p_fac11(iplon,i_lay) )  &
+                 & )
+            IF (i_lay == i_laysolfr(iplon)) p_sfluxzen(iplon,ig) = sfluxrefc(ig,js) &
+                 & + z_fs * (sfluxrefc(ig,js+1) - sfluxrefc(ig,js))
+            p_taur(iplon,i_lay,ig) = z_tauray
+          ENDDO
+        ENDIF
+      ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -233,6 +309,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
     !$ACC WAIT
     !$ACC END DATA

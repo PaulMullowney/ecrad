@@ -196,6 +196,12 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     else
        CALL COMPUTE_LAYTROP_MIN_MAX(KIDIA, KFDIA, LAYTROP, llaytrop_min, llaytrop_max)
     endif
+#if defined(OMPGPU)
+    ! A single kernel over every layer, choosing the lower- or upper-atmosphere
+    ! formula per column, replaces the separate lower and upper kernels
+    llaytrop_min = 0
+    llaytrop_max = KLEV
+#endif
 
     !$ACC DATA PRESENT(PAVEL, taug, P_TAUAERL, FAC00, FAC01, FAC10, FAC11, &
     !$ACC             FORFAC, FORFRAC, JP, JT, jt1, COLH2O, LAYTROP, SELFFAC, &
@@ -239,6 +245,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 !     temperature.  Below LAYTROP, the water vapor self-continuum and
 !     foreign continuum is interpolated (in temperature) separately.
 
+#if !defined(OMPGPU)
       ! Lower atmosphere loop
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, inds, indf, indm, pp, corradj)
       !$ACC WAIT
@@ -315,6 +322,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       enddo
       !$ACC END PARALLEL
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
       IF (llaytrop_max /= llaytrop_min) THEN
         ! Mixed loop

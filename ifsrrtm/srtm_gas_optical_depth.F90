@@ -324,22 +324,13 @@ IF (ICOUNT/=0) THEN
     ! offset. Tracking that offset in a host scalar removes the sequential
     ! dependency that forced JG to stay on the host, which was costing one
     ! kernel launch per g-point, 112 of them per call.
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
-    DO JG=1,IGT
-      DO JL = KIDIA, KFDIA
-        IF (PRMU0(JL) > 0.0_JPRB) THEN
-          ! Incoming solar flux into plane perp to incoming radiation
-          PINCSOL(JL,IWOFFSET+JG) = ZSFLXZEN(JL,JG)
-        ENDIF
-      ENDDO
-    ENDDO
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
     DO JG=1,IGT
       DO JK=1,KLEV
         DO JL = KIDIA, KFDIA
           IF (PRMU0(JL) > 0.0_JPRB) THEN
+            ! Incoming solar flux into plane perp to incoming radiation
+            IF (JK == 1) PINCSOL(JL,IWOFFSET+JG) = ZSFLXZEN(JL,JG)
             POD (JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) + ZTAUG(JL,JK,JG)
             PSSA(JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) / POD(JL,JK,IWOFFSET+JG)
           ENDIF

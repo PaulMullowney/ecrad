@@ -81,19 +81,15 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
     i_nlayers = klev
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
-    !$ACC WAIT
-    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
-    !$ACC LOOP GANG(STATIC:1) VECTOR
-    DO iplon = KIDIA, KFDIA
-      i_laysolfr(iplon) = k_laytrop(iplon)
-    ENDDO
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
 #if defined(OMPGPU)
+    ! One kernel finds each column's solar reference layer over its whole
+    ! troposphere, and one covers every layer, choosing the lower- or
+    ! upper-atmosphere formula per column, in place of separate lower, upper
+    ! and one-launch-per-layer middle loops
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     DO iplon = KIDIA, KFDIA
-       DO i_lay = 1, laytrop_min
+       i_laysolfr(iplon) = k_laytrop(iplon)
+       DO i_lay = 1, k_laytrop(iplon)
          IF (k_jp(iplon,i_lay) < layreffr .AND.   &
               &    k_jp(iplon,i_lay+1) >= layreffr) &
               &    i_laysolfr(iplon) = MIN(i_lay+1,k_laytrop(iplon))
@@ -101,26 +97,40 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
-    DO i_lay = 1, laytrop_min
+    DO i_lay = 1, i_nlayers
       DO iplon = KIDIA, KFDIA
-         ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(25) + 1
-         ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(25) + 1
+        IF (i_lay <= k_laytrop(iplon)) THEN
+           ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(25) + 1
+           ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(25) + 1
 !$NEC unroll(NG25)
-         DO ig = 1 , ng25
-           z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
-           p_taug(iplon,i_lay,ig) = p_colh2o(iplon,i_lay) * &
-                & (p_fac00(iplon,i_lay) * absa(ind0,ig)   + &
-                & p_fac10(iplon,i_lay) * absa(ind0+1,ig)  + &
-                & p_fac01(iplon,i_lay) * absa(ind1,ig)    + &
-                & p_fac11(iplon,i_lay) * absa(ind1+1,ig)) + &
-                & p_colo3(iplon,i_lay) * abso3ac(ig)
-           IF(i_lay == i_laysolfr(iplon)) p_sfluxzen(iplon,ig)=sfluxrefc(ig)
-           p_taur(iplon,i_lay,ig) = z_tauray
-         ENDDO
+           DO ig = 1 , ng25
+             z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
+             p_taug(iplon,i_lay,ig) = p_colh2o(iplon,i_lay) * &
+                  & (p_fac00(iplon,i_lay) * absa(ind0,ig)   + &
+                  & p_fac10(iplon,i_lay) * absa(ind0+1,ig)  + &
+                  & p_fac01(iplon,i_lay) * absa(ind1,ig)    + &
+                  & p_fac11(iplon,i_lay) * absa(ind1+1,ig)) + &
+                  & p_colo3(iplon,i_lay) * abso3ac(ig)
+             IF(i_lay == i_laysolfr(iplon)) p_sfluxzen(iplon,ig)=sfluxrefc(ig)
+             p_taur(iplon,i_lay,ig) = z_tauray
+           ENDDO
+        ELSE
+          DO ig = 1 , ng25
+            z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
+            p_taug(iplon,i_lay,ig) = p_colo3(iplon,i_lay) * abso3bc(ig)
+            p_taur(iplon,i_lay,ig) = z_tauray
+          ENDDO
+        ENDIF
       ENDDO
     ENDDO
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 #else
+    !$ACC WAIT
+    !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
+    !$ACC LOOP GANG(STATIC:1) VECTOR
+    DO iplon = KIDIA, KFDIA
+      i_laysolfr(iplon) = k_laytrop(iplon)
+    ENDDO
     !$ACC LOOP SEQ
     DO i_lay = 1, llaytrop_min
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(ind0, ind1, z_tauray)
@@ -147,7 +157,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       ENDDO
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
     ENDDO
-#endif
 
     !$ACC LOOP SEQ
     DO i_lay = llaytrop_min+1, llaytrop_max
@@ -201,6 +210,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
     !$ACC WAIT
     !$ACC END DATA

@@ -76,6 +76,55 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
     i_nlayers = klev
+#if defined(OMPGPU)
+    ! One kernel finds each column's solar reference layer above its
+    ! troposphere before any layer reads it, and one covers every layer,
+    ! choosing the lower- or upper-atmosphere formula per column
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
+    DO iplon = KIDIA, KFDIA
+       i_laysolfr(iplon) = i_nlayers
+       DO i_lay = k_laytrop(iplon)+1, i_nlayers
+          IF (k_jp(iplon,i_lay-1) < layreffr &
+               &    .AND. k_jp(iplon,i_lay) >= layreffr) i_laysolfr(iplon) = i_lay
+       ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ind0, ind1, z_tauray)
+    DO i_lay = 1, i_nlayers
+      DO iplon = KIDIA, KFDIA
+        IF (i_lay <= k_laytrop(iplon)) THEN
+           ind0 = ((k_jp(iplon,i_lay)-1)*5+(k_jt(iplon,i_lay)-1))*nspa(27) + 1
+           ind1 = (k_jp(iplon,i_lay)*5+(k_jt1(iplon,i_lay)-1))*nspa(27) + 1
+!$NEC unroll(NG27)
+           DO ig = 1 , ng27
+             z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
+             p_taug(iplon,i_lay,ig) = p_colo3(iplon,i_lay) * &
+                  & (p_fac00(iplon,i_lay) * absa(ind0,ig)  + &
+                  & p_fac10(iplon,i_lay) * absa(ind0+1,ig) + &
+                  & p_fac01(iplon,i_lay) * absa(ind1,ig) +   &
+                  & p_fac11(iplon,i_lay) * absa(ind1+1,ig))
+             p_taur(iplon,i_lay,ig) = z_tauray
+           ENDDO
+        ELSE
+          ind0 = ((k_jp(iplon,i_lay)-13)*5+(k_jt(iplon,i_lay)-1))*nspb(27) + 1
+          ind1 = ((k_jp(iplon,i_lay)-12)*5+(k_jt1(iplon,i_lay)-1))*nspb(27)+ 1
+!$NEC unroll(NG27)
+          DO ig = 1 , ng27
+            z_tauray = p_colmol(iplon,i_lay) * raylc(ig)
+            p_taug(iplon,i_lay,ig) = p_colo3(iplon,i_lay) * &
+                 & (p_fac00(iplon,i_lay) * absb(ind0,ig)  + &
+                 & p_fac10(iplon,i_lay) * absb(ind0+1,ig) + &
+                 & p_fac01(iplon,i_lay) * absb(ind1,ig) +   &
+                 & p_fac11(iplon,i_lay) * absb(ind1+1,ig))
+            IF (i_lay == i_laysolfr(iplon)) &
+                 & p_sfluxzen(iplon,ig) = scalekur * sfluxrefc(ig)
+            p_taur(iplon,i_lay,ig) = z_tauray
+          ENDDO
+        ENDIF
+      ENDDO
+    ENDDO
+    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#else
     !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
     !$ACC LOOP GANG(STATIC:1) VECTOR
@@ -178,6 +227,7 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
     ENDDO
     !$ACC END PARALLEL
     !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+#endif
 
     !$ACC WAIT
     !$ACC END DATA
