@@ -81,6 +81,27 @@ REAL(KIND=JPHOOK) :: ZHOOK_HANDLE
 
 IF (LHOOK) CALL DR_HOOK('RRTM_SETCOEF_140GP',0,ZHOOK_HANDLE)
 
+#if defined(OMPGPU)
+! The only dependence between levels is the count of layers below about
+! 100 hPa, so it gets its own per-column kernel and the rest runs in
+! parallel over levels as well as columns
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO PRIVATE(JLAY)
+DO JLON = KIDIA, KFDIA
+  K_LAYTROP(JLON)  = 0
+  K_LAYSWTCH(JLON) = 0
+  K_LAYLOW(JLON)   = 1
+  DO JLAY = 1, KLEV
+    IF (LOG(PAVEL(JLON,JLAY))  >  4.56_JPRB) K_LAYTROP(JLON) = K_LAYTROP(JLON) + 1
+  ENDDO
+ENDDO
+!$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+
+!$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(JP1, Z_CO2REG, Z_COMPFP, Z_FACTOR, &
+!$OMP   Z_FP, Z_FT, Z_FT1, Z_PLOG, Z_SCALEFAC, Z_STPFAC, Z_WATER)
+DO JLAY = 1, KLEV
+DO JLON = KIDIA, KFDIA
+  Z_STPFAC = 296._JPRB/1013._JPRB
+#else
 !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO
 !$ACC PARALLEL DEFAULT(NONE) PRESENT(P_COLDRY, P_WBROAD, P_COLBRD, P_WKL, P_FAC00, P_FAC01, P_FAC10, P_FAC11, &
 !$ACC   P_FORFAC, P_FORFRAC, K_JP, K_JT, K_JT1, P_COLH2O, P_COLCO2, P_COLO3, P_COLN2O, P_COLCH4, P_COLO2, P_CO2MULT, &
@@ -96,6 +117,7 @@ DO JLON = KIDIA, KFDIA
   K_LAYLOW(JLON)   = 0
   !$ACC LOOP SEQ
   DO JLAY = 1, KLEV
+#endif
 !        Find the two reference pressures on either side of the
 !        layer pressure.  Store them in JP and JP1.  Store in FP the
 !        fraction of the difference (in ln(pressure)) between these
@@ -143,7 +165,9 @@ DO JLON = KIDIA, KFDIA
 !         IF (PLOG .LE. 4.56) GO TO 5300
 !--------------------------------------         
     IF (Z_PLOG  >  4.56_JPRB) THEN
+#if !defined(OMPGPU)
       K_LAYTROP(JLON) =  K_LAYTROP(JLON) + 1
+#endif
 !        For one band, the "switch" occurs at ~300 mb. 
 !      IF (Z_PLOG  >=  5.76_JPRB) K_LAYSWTCH(JLON) = K_LAYSWTCH(JLON) + 1
 !      IF (Z_PLOG  >=  6.62_JPRB) K_LAYLOW(JLON) = K_LAYLOW(JLON) + 1
@@ -278,9 +302,11 @@ DO JLON = KIDIA, KFDIA
 
   ENDDO
 
+#if !defined(OMPGPU)
 ! MT 981104 
 !-- Set LAYLOW for profiles with surface pressure less than 750 hPa. 
   IF (K_LAYLOW(JLON) == 0) K_LAYLOW(JLON)=1
+#endif
 ENDDO
 !$ACC END PARALLEL
 !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
