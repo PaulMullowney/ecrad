@@ -10,7 +10,9 @@ SUBROUTINE SRTM_GAS_OPTICAL_DEPTH &
  &   PFAC00  , PFAC01   , PFAC10  , PFAC11 ,&
  &   KJP     , KJT      , KJT1 ,&
  !-- output arrays
- &   POD, PSSA, PINCSOL)
+ &   POD, PSSA, PINCSOL, &
+ !-- optional outputs in the ecRad solver layout
+ &   POD_SOLVER, PSSA_SOLVER, PMIN_OD)
 
 
 !**** *SRTM_GAS_OPTICAL_DEPTH* - SPECTRAL LOOP TO COMPUTE THE SHORTWAVE RADIATION FLUXES.
@@ -95,12 +97,22 @@ REAL(KIND=JPRB)   ,INTENT(INOUT) :: POD(KIDIA:KFDIA,KLEV,JPGPT) ! Optical depth
 REAL(KIND=JPRB)   ,INTENT(INOUT) :: PSSA(KIDIA:KFDIA,KLEV,JPGPT) ! Single scattering albedo
 REAL(KIND=JPRB)   ,INTENT(INOUT) :: PINCSOL(KIDIA:KFDIA,JPGPT) ! Incoming solar flux
 
+! If present (OMPGPU only), the optical depth, floored at PMIN_OD, and the
+! single scattering albedo are written directly in the solver layout
+! (g-point, level from the top, column) instead of to POD and PSSA, which
+! are then left untouched
+REAL(KIND=JPRB)   ,INTENT(INOUT), OPTIONAL :: POD_SOLVER(JPGPT,KLEV,KIDIA:KFDIA)
+REAL(KIND=JPRB)   ,INTENT(INOUT), OPTIONAL :: PSSA_SOLVER(JPGPT,KLEV,KIDIA:KFDIA)
+REAL(KIND=JPRB)   ,INTENT(IN), OPTIONAL :: PMIN_OD
+
 
 !     ------------------------------------------------------------------
 
 INTEGER(KIND=JPIM) :: IB1, IB2, IBM, IGT, IW(KIDIA:KFDIA), JB, JG, JK, JL, ICOUNT
 INTEGER(KIND=JPIM) :: IWOFFSET
 INTEGER(KIND=JPIM) :: laytrop_min, laytrop_max, iplon
+LOGICAL :: LSOLVER
+REAL(KIND=JPRB) :: ZMIN_OD, ZOD
 
 !-- Output of SRTM_TAUMOLn routines
 REAL(KIND=JPRB) :: ZTAUG(KIDIA:KFDIA,KLEV,16) ! Absorption optical depth
@@ -146,6 +158,13 @@ IF (LHOOK) CALL DR_HOOK('SRTM_GAS_OPTICAL_DEPTH',0,ZHOOK_HANDLE)
 
 IB1=JPB1
 IB2=JPB2
+
+LSOLVER = .FALSE.
+#if defined(OMPGPU)
+LSOLVER = PRESENT(POD_SOLVER) .AND. PRESENT(PSSA_SOLVER) .AND. PRESENT(PMIN_OD)
+#endif
+ZMIN_OD = 0.0_JPRB
+IF (LSOLVER) ZMIN_OD = PMIN_OD
 
 ICOUNT=0
 
@@ -324,20 +343,41 @@ IF (ICOUNT/=0) THEN
     ! offset. Tracking that offset in a host scalar removes the sequential
     ! dependency that forced JG to stay on the host, which was costing one
     ! kernel launch per g-point, 112 of them per call.
-    !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
-    DO JG=1,IGT
+    IF (LSOLVER) THEN
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(ZOD)
       DO JK=1,KLEV
         DO JL = KIDIA, KFDIA
-          IF (PRMU0(JL) > 0.0_JPRB) THEN
-            ! Incoming solar flux into plane perp to incoming radiation
-            IF (JK == 1) PINCSOL(JL,IWOFFSET+JG) = ZSFLXZEN(JL,JG)
-            POD (JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) + ZTAUG(JL,JK,JG)
-            PSSA(JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) / POD(JL,JK,IWOFFSET+JG)
-          ENDIF
+          DO JG=1,IGT
+            IF (PRMU0(JL) > 0.0_JPRB) THEN
+              ! Incoming solar flux into plane perp to incoming radiation
+              IF (JK == 1) PINCSOL(JL,IWOFFSET+JG) = ZSFLXZEN(JL,JG)
+              ZOD = ZTAUR(JL,JK,JG) + ZTAUG(JL,JK,JG)
+              POD_SOLVER (IWOFFSET+JG,KLEV+1-JK,JL) = MAX(ZMIN_OD, ZOD)
+              PSSA_SOLVER(IWOFFSET+JG,KLEV+1-JK,JL) = ZTAUR(JL,JK,JG) / ZOD
+            ELSE
+              POD_SOLVER (IWOFFSET+JG,KLEV+1-JK,JL) = MAX(ZMIN_OD, 0.0_JPRB)
+              PSSA_SOLVER(IWOFFSET+JG,KLEV+1-JK,JL) = 0.0_JPRB
+            ENDIF
+          ENDDO
         ENDDO
       ENDDO
-    ENDDO
-    !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    ELSE
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      DO JG=1,IGT
+        DO JK=1,KLEV
+          DO JL = KIDIA, KFDIA
+            IF (PRMU0(JL) > 0.0_JPRB) THEN
+              ! Incoming solar flux into plane perp to incoming radiation
+              IF (JK == 1) PINCSOL(JL,IWOFFSET+JG) = ZSFLXZEN(JL,JG)
+              POD (JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) + ZTAUG(JL,JK,JG)
+              PSSA(JL,JK,IWOFFSET+JG) = ZTAUR(JL,JK,JG) / POD(JL,JK,IWOFFSET+JG)
+            ENDIF
+          ENDDO
+        ENDDO
+      ENDDO
+      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+    ENDIF
     IWOFFSET = IWOFFSET + IGT
 #else
     !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
@@ -371,6 +411,21 @@ IF (ICOUNT/=0) THEN
   ENDDO     !-- end loop on JB (band)
 
 ENDIF
+
+#if defined(OMPGPU)
+IF (LSOLVER .AND. ICOUNT == 0) THEN
+  !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+  DO JL = KIDIA, KFDIA
+    DO JK=1,KLEV
+      DO JG=1,JPGPT
+        POD_SOLVER (JG,JK,JL) = MAX(ZMIN_OD, 0.0_JPRB)
+        PSSA_SOLVER(JG,JK,JL) = 0.0_JPRB
+      ENDDO
+    ENDDO
+  ENDDO
+  !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+ENDIF
+#endif
 
 !$ACC WAIT
 !$ACC END DATA

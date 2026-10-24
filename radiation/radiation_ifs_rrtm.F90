@@ -369,7 +369,7 @@ contains
     ! layer are provided, useful for canopy radiative transfer.
     integer :: istartlev, iendlev
 
-    logical :: do_sw, do_lw
+    logical :: do_sw, do_lw, sw_solver_layout
 
     integer :: jlev, jgreorder, jg, ig, iband, jcol
 
@@ -730,8 +730,18 @@ contains
       call roctxEndRange
 #endif
 
+#if defined(OMPGPU)
+      ! Without g-point reordering, SRTM_GAS_OPTICAL_DEPTH writes od_sw and
+      ! ssa_sw directly, including night-time columns, so ZOD_SW and ZSSA_SW
+      ! are neither initialized nor transposed
+      sw_solver_layout = (config%i_solver_sw /= ISolverSpartacus .and. ng_sw == JPGPT_SW)
+#else
+      sw_solver_layout = .false.
+#endif
+
       ! SRTM_GAS_OPTICAL_DEPTH will not initialize profiles when the sun
       ! is below the horizon, so we do it here
+      if (.not. sw_solver_layout) then
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(3)
@@ -745,6 +755,7 @@ contains
       end do
       !$ACC END PARALLEL
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+      end if
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2)
       !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
       !$ACC LOOP GANG VECTOR COLLAPSE(2)
@@ -763,6 +774,17 @@ contains
       call roctxStartRange("radiation::srtm_gas_optical_depth"//c_null_char)
 #endif
 
+      if (sw_solver_layout) then
+        CALL SRTM_GAS_OPTICAL_DEPTH &
+             &( istartcol, iendcol , nlev  , ZONEMINUS_ARRAY,&
+             & single_level%cos_sza(istartcol:iendcol), ILAYTROP,&
+             & ZCOLCH4 , ZCOLCO2  , ZCOLH2O, ZCOLMOL , ZCOLO2   , ZCOLO3,&
+             & ZFORFAC , ZFORFRAC , INDFOR , ZSELFFAC, ZSELFFRAC, INDSELF,&
+             & ZFAC00  , ZFAC01   , ZFAC10 , ZFAC11  ,&
+             & JP      , JT       , JT1    ,&
+             & ZOD_SW  , ZSSA_SW  , ZINCSOL, &
+             & od_sw   , ssa_sw   , min_gas_od_sw )
+      else
       CALL SRTM_GAS_OPTICAL_DEPTH &
            &( istartcol, iendcol , nlev  , ZONEMINUS_ARRAY,&
            & single_level%cos_sza(istartcol:iendcol), ILAYTROP,&
@@ -771,6 +793,7 @@ contains
            & ZFAC00  , ZFAC01   , ZFAC10 , ZFAC11  ,&
            & JP      , JT       , JT1    ,&
            & ZOD_SW  , ZSSA_SW  , ZINCSOL )
+      end if
 #ifdef HAVE_NVTX
       call nvtxEndRange
 #endif
@@ -834,6 +857,7 @@ contains
       else
         ! G points have not been reordered
 #if defined(OMPGPU)
+        if (.not. sw_solver_layout) then
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
 #if defined(__amdflang__)
         !$OMP TILE SIZES(1,1,64)
@@ -851,6 +875,7 @@ contains
         !$OMP END TILE
 #endif
         !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
+        end if
 #else
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
 #if defined(__amdflang__)
