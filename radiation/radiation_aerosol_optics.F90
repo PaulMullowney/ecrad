@@ -550,6 +550,7 @@ contains
     integer, intent(inout) :: irhs(nlev,istartcol:iendcol)
 
     real(jprb) :: local_od_sw, local_od_lw, rh, mixing_ratio, local_od, local_scat
+    real(jprb) :: od_acc, scat_acc, scat_g_acc
     integer :: jcol, jlev, jg, jtype, jband, iband, irh, itype
 
 #if defined(__amdflang__)
@@ -560,16 +561,8 @@ contains
     !$OMP   od_lw, ssa_lw, g_lw, od_sw, ssa_sw, g_sw, od_sw_aerosol, scat_sw_aerosol, scat_g_sw_aerosol, &
     !$OMP   od_lw_aerosol, scat_lw_aerosol, scat_g_lw_aerosol, factor, irhs)
 #endif
-      ! Set variables to zero that may not have been previously
-      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
-      do jcol = istartcol,iendcol
-         do jlev = 1,nlev
-            do jg = 1,n_g_sw
-               g_sw(jg,jlev,jcol) = 0.0_jprb
-            end do
-         end do
-      end do
-
+      ! Set variables to zero that may not have been previously. g_sw is
+      ! set at every point by the shortwave combination kernels below.
       if (do_lw_aerosol_scattering) then
          !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
          do jcol = istartcol,iendcol
@@ -671,24 +664,14 @@ contains
       enddo
       !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 
-      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
+      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) PRIVATE(itype, mixing_ratio, irh, local_od_lw, &
+      !$OMP   od_acc, scat_acc, scat_g_acc)
       do jcol = istartcol,iendcol
          do jlev = istartlev,iendlev
             do jband = 1,n_bands_lw
-               od_lw_aerosol(jband,jlev,jcol)     = 0.0_jprb
-               if (do_lw_aerosol_scattering) then
-                  scat_lw_aerosol(jband,jlev,jcol)   = 0.0_jprb
-                  scat_g_lw_aerosol(jband,jlev,jcol) = 0.0_jprb
-               end if
-            enddo
-         enddo
-      enddo
-      !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
-
-      !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3) PRIVATE(itype, mixing_ratio, irh, local_od_lw)
-      do jcol = istartcol,iendcol
-         do jlev = istartlev,iendlev
-            do jband = 1,n_bands_lw
+               od_acc     = 0.0_jprb
+               scat_acc   = 0.0_jprb
+               scat_g_acc = 0.0_jprb
                do jtype = 1,n_aerosol_types
                   itype = ao_itype(jtype)
                   mixing_ratio = mixrat(jcol,jlev,jtype)
@@ -696,14 +679,14 @@ contains
                      if (do_lw_aerosol_scattering) then
                         local_od_lw = factor(jlev,jcol) * mixing_ratio &
                              &  * mass_ext_lw_phobic(jband,itype)
-                        od_lw_aerosol(jband,jlev,jcol) = od_lw_aerosol(jband,jlev,jcol) + local_od_lw
-                        scat_lw_aerosol(jband,jlev,jcol) = scat_lw_aerosol(jband,jlev,jcol) &
+                        od_acc = od_acc + local_od_lw
+                        scat_acc = scat_acc &
                              &  + local_od_lw * ssa_lw_phobic(jband,itype)
-                        scat_g_lw_aerosol(jband,jlev,jcol) = scat_g_lw_aerosol(jband,jlev,jcol) &
+                        scat_g_acc = scat_g_acc &
                              &  + local_od_lw * ssa_lw_phobic(jband,itype) &
                              &  * g_lw_phobic(jband,itype)
                      else
-                        od_lw_aerosol(jband,jlev,jcol) = od_lw_aerosol(jband,jlev,jcol) &
+                        od_acc = od_acc &
                              &  + factor(jlev,jcol) * mixing_ratio &
                              &  * mass_ext_lw_phobic(jband,itype) &
                              &  * (1.0_jprb - ssa_lw_phobic(jband,itype))
@@ -715,14 +698,14 @@ contains
                      if (do_lw_aerosol_scattering) then
                         local_od_lw = factor(jlev,jcol) * mixing_ratio &
                              &  * mass_ext_lw_philic(jband,irh,itype)
-                        od_lw_aerosol(jband,jlev,jcol) = od_lw_aerosol(jband,jlev,jcol) + local_od_lw
-                        scat_lw_aerosol(jband,jlev,jcol) = scat_lw_aerosol(jband,jlev,jcol) &
+                        od_acc = od_acc + local_od_lw
+                        scat_acc = scat_acc &
                              &  + local_od_lw * ssa_lw_philic(jband,irh,itype)
-                        scat_g_lw_aerosol(jband,jlev,jcol) = scat_g_lw_aerosol(jband,jlev,jcol) &
+                        scat_g_acc = scat_g_acc &
                              &  + local_od_lw * ssa_lw_philic(jband,irh,itype) &
                              &  * g_lw_philic(jband,irh,itype)
                      else
-                        od_lw_aerosol(jband,jlev,jcol) = od_lw_aerosol(jband,jlev,jcol) &
+                        od_acc = od_acc &
                              &  + factor(jlev,jcol) * mixing_ratio &
                              &  * mass_ext_lw_philic(jband,irh,itype) &
                              &  * (1.0_jprb - ssa_lw_philic(jband,irh,itype))
@@ -732,9 +715,12 @@ contains
                   ! no aerosol scattering properties are added
                enddo
                if (do_lw_aerosol_scattering) then
-                  call delta_eddington_extensive(od_lw_aerosol(jband,jlev,jcol), &
-                    scat_lw_aerosol(jband,jlev,jcol), &
-                    scat_g_lw_aerosol(jband,jlev,jcol))
+                  call delta_eddington_extensive(od_acc, scat_acc, scat_g_acc)
+               endif
+               od_lw_aerosol(jband,jlev,jcol) = od_acc
+               if (do_lw_aerosol_scattering) then
+                  scat_lw_aerosol(jband,jlev,jcol)   = scat_acc
+                  scat_g_lw_aerosol(jband,jlev,jcol) = scat_g_acc
                endif
             enddo
          enddo
@@ -774,9 +760,13 @@ contains
                      ! optical depth
                      if (local_scat > 0.0_jprb) then
                         g_sw(jg,jlev,jcol) = scat_g_sw_aerosol(iband,jlev,jcol) / local_scat
+                     else
+                        g_sw(jg,jlev,jcol) = 0.0_jprb
                      end if
                      ssa_sw(jg,jlev,jcol) = local_scat / local_od
                      od_sw (jg,jlev,jcol) = local_od
+                  else
+                     g_sw(jg,jlev,jcol) = 0.0_jprb
                   end if
                end do
             end do
