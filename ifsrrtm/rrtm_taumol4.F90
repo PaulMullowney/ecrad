@@ -30,7 +30,7 @@ USE YOERRTA4 , ONLY : ABSA   ,ABSB   ,FRACREFA, FRACREFB,SELFREF,FORREF
 #if defined(_OPENACC) || defined(OMPGPU)
 USE YOERRTA4, ONLY : TAU_MAJOR, TAU_MAJOR1
 #endif
-USE YOERRTRF, ONLY : CHI_MLS
+USE YOERRTRF, ONLY : refrat_planck_a => refrat4_planck_a, refrat_planck_b => refrat4_planck_b
 
 IMPLICIT NONE
 
@@ -77,7 +77,6 @@ INTEGER(KIND=JPIM) :: ind0,ind1,inds,indf
 INTEGER(KIND=JPIM) :: IG, JS, lay, JS1, JPL
 
 
-REAL(KIND=JPRB) :: refrat_planck_a, refrat_planck_b
  REAL(KIND=JPRB) ::  fac000, fac100, fac200,&
  & fac010, fac110, fac210, &
  & fac001, fac101, fac201, &
@@ -147,12 +146,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 !     Compute the optical depth by interpolating in ln(pressure),
 !     temperature, and appropriate species.  Below LAYTROP, the water
 !     vapor self-continuum is interpolated (in temperature) separately.
-
-      ! P =   142.5940 mb
-      refrat_planck_a = chi_mls(1,11)/chi_mls(2,11)
-
-      ! P = 95.58350 mb
-      refrat_planck_b = chi_mls(3,13)/chi_mls(2,13)
 
       ! Compute the optical depth by interpolating in ln(pressure) and
       ! temperature, and appropriate species.  Below laytrop, the water

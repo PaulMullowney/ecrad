@@ -32,7 +32,7 @@ USE YOERRTA15, ONLY : ABSA   ,KA_MN2,FRACREFA,SELFREF,FORREF
 #if defined(_OPENACC) || defined(OMPGPU)
 USE YOERRTA15, ONLY : TAU_MAJOR, TAU_MAJOR1
 #endif
-USE YOERRTRF, ONLY : CHI_MLS
+USE YOERRTRF, ONLY : refrat_planck_a => refrat15_planck_a, refrat_m_a => refrat15_m_a
 
 IMPLICIT NONE
 
@@ -76,7 +76,6 @@ INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
 ! ---------------------------------------------------------------------------
 
 INTEGER(KIND=JPIM) :: IG, IND0, IND1, INDS,INDF,INDM, JS,JS1,JPL,JMN2, lay
-REAL(KIND=JPRB) :: refrat_planck_a, refrat_m_a
 REAL(KIND=JPRB) :: taufor,tauself, n2m1, n2m2, taun2,scalen2
 REAL(KIND=JPRB) ::  fac000, fac100, fac200,&
  & fac010, fac110, fac210, &
@@ -145,14 +144,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 
       ! Minor gas mapping level :
       !     Lower - Nitrogen Continuum, P = 1053., T = 294.
-
-      ! Calculate reference ratio to be used in calculation of Planck
-      ! fraction in lower atmosphere.
-      ! P = 1053. mb (Level 1)
-      refrat_planck_a = chi_mls(4,1)/chi_mls(2,1)
-
-      ! P = 1053.
-      refrat_m_a = chi_mls(4,1)/chi_mls(2,1)
 
       ! Compute the optical depth by interpolating in ln(pressure),
       ! temperature, and appropriate species.  Below laytrop, the water

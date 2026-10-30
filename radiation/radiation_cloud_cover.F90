@@ -216,8 +216,10 @@ contains
         ! Cloud cover has reached one
         cum_product = 0.0_jprb
       else
+        ! The max keeps the division safe when the compiler evaluates
+        ! it ahead of the guard, and is exact for frac < MaxCloudFrac
         cum_product = cum_product * (1.0_jprb - pair_cloud_cover(jcol,jlev)) &
-             &  / (1.0_jprb - frac(jcol,jlev))
+             &  / max(1.0_jprb - frac(jcol,jlev), 1.0_jprb - MaxCloudFrac)
       end if
       cum_cloud_cover(jcol,jlev+1) = 1.0_jprb - cum_product
     end do
@@ -316,7 +318,7 @@ contains
         cum_product = 0.0_jprb
       else
         cum_product = cum_product * (1.0_jprb - pair_cloud_cover(jcol, jlev)) &
-             &  / (1.0_jprb - frac(jcol, jlev))
+             &  / max(1.0_jprb - frac(jcol,jlev), 1.0_jprb - MaxCloudFrac)
       end if
       cum_cloud_cover(jcol,jlev+1) = 1.0_jprb - cum_product
     end do
@@ -540,7 +542,7 @@ contains
             cum_cloud_cover(jcol,jlev+1) = 1.0_jprb &
                  &  - (1.0_jprb - cum_cloud_cover(jcol,jlev)) &
                  &  * (1.0_jprb - pair_cloud_cover(jcol,jlev))  &
-                 &  / (1.0_jprb - frac(jcol,jlev))
+                 &  / max(1.0_jprb - frac(jcol,jlev), 1.0_jprb - MaxCloudFrac)
           end if
         end do
         cc_obj(jobj) = cum_cloud_cover(jcol,i_base_obj(jobj))
