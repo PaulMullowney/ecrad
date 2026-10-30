@@ -30,7 +30,7 @@ USE YOERRTA12, ONLY : ABSA   ,FRACREFA,SELFREF,FORREF
 #if defined(_OPENACC) || defined(OMPGPU)
 USE YOERRTA12, ONLY : TAU_MAJOR, TAU_MAJOR1
 #endif
-USE YOERRTRF, ONLY : CHI_MLS
+USE YOERRTRF, ONLY : refrat_planck_a => refrat12_planck_a
 
 IMPLICIT NONE
 
@@ -87,7 +87,6 @@ REAL(KIND=JPRB) ::  fac000, fac100, fac200,&
  & fac011, fac111, fac211
 REAL(KIND=JPRB) :: p, p4, fk0, fk1, fk2
 REAL(KIND=JPRB) :: taufor,tauself
-REAL(KIND=JPRB) :: refrat_planck_a
 
     !     local integer arrays
     integer(KIND=JPIM) :: ixc(KLEV), ixlow(KFDIA,KLEV), ixhigh(KFDIA,KLEV)
@@ -137,9 +136,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 #endif
 
 !  ----------------------------------------------------------
-
-      ! P =   174.164 mb
-      refrat_planck_a = chi_mls(1,10)/chi_mls(2,10)
 
       ! Compute the optical depth by interpolating in ln(pressure),
       ! temperature, and appropriate species.  Below laytrop, the water

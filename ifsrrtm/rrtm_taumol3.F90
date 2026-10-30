@@ -33,7 +33,8 @@ USE YOERRTA3 , ONLY : ABSA   ,ABSB   ,FRACREFA, FRACREFB,&
 #if defined(_OPENACC) || defined(OMPGPU)
 USE YOERRTA3, ONLY : TAU_MAJOR, TAU_MAJOR1
 #endif
-USE YOERRTRF, ONLY : CHI_MLS
+USE YOERRTRF, ONLY : CHI_MLS, REFRAT_PLANCK_A => REFRAT3_PLANCK_A, &
+ & REFRAT_PLANCK_B => REFRAT3_PLANCK_B, REFRAT_M_A => REFRAT3_M_A, REFRAT_M_B => REFRAT3_M_B
 
 IMPLICIT NONE
 
@@ -77,7 +78,6 @@ INTEGER(KIND=JPIM), OPTIONAL, INTENT(INOUT) :: laytrop_min, laytrop_max
 
 REAL(KIND=JPRB) :: SPECCOMB,SPECCOMB1,SPECCOMB_MN2O, &
 & SPECCOMB_PLANCK
-REAL(KIND=JPRB) :: REFRAT_PLANCK_A, REFRAT_PLANCK_B, REFRAT_M_A, REFRAT_M_B
 
 INTEGER(KIND=JPIM) :: IND0,IND1,INDS,INDF,INDM
 INTEGER(KIND=JPIM) :: IG, JS, LAY, JS1,JMN2O,JPL
@@ -153,18 +153,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
 ! Minor gas mapping levels:
 !     lower - n2o, p = 706.272 mbar, t = 278.94 k
 !     upper - n2o, p = 95.58 mbar, t = 215.7 k
-
-!  P = 212.725 mb
-      REFRAT_PLANCK_A = CHI_MLS(1,9)/CHI_MLS(2,9)
-
-!  P = 95.58 mb
-      REFRAT_PLANCK_B = CHI_MLS(1,13)/CHI_MLS(2,13)
-
-!  P = 706.270mb
-      REFRAT_M_A = CHI_MLS(1,3)/CHI_MLS(2,3)
-
-!  P = 95.58 mb
-      REFRAT_M_B = CHI_MLS(1,13)/CHI_MLS(2,13)
 
       ! Lower atmosphere loop
       !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(2) PRIVATE(speccomb, specparm, specmult, js, fs, speccomb1, specparm1, specmult1, &

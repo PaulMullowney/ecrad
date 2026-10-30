@@ -31,7 +31,8 @@ USE YOERRTA13, ONLY : ABSA   ,FRACREFA,FRACREFB,SELFREF,FORREF,KA_MCO2, KA_MCO, 
 #if defined(_OPENACC) || defined(OMPGPU)
 USE YOERRTA13, ONLY : TAU_MAJOR, TAU_MAJOR1
 #endif
-USE YOERRTRF, ONLY : CHI_MLS
+USE YOERRTRF, ONLY : refrat_planck_a => refrat13_planck_a, refrat_m_a => refrat13_m_a, &
+ & refrat_m_a3 => refrat13_m_a3
 
 IMPLICIT NONE
 
@@ -81,7 +82,6 @@ REAL(KIND=JPRB) :: speccomb,speccomb1, speccomb_planck, &
 INTEGER(KIND=JPIM) :: ind0,ind1,inds,indf,indm
 INTEGER(KIND=JPIM) :: IG, JS, lay, JS1, JPL, JMCO2, JMCO
 
-REAL(KIND=JPRB) :: refrat_planck_a, refrat_m_a, refrat_m_a3
 REAL(KIND=JPRB) ::  fac000, fac100, fac200,&
  & fac010, fac110, fac210, &
  & fac001, fac101, fac201, &
@@ -161,15 +161,6 @@ INTEGER(KIND=JPIM) :: llaytrop_min, llaytrop_max
       ixc(lay) = icl
     enddo
 #endif
-
-      ! P = 473.420 mb (Level 5)
-      refrat_planck_a = chi_mls(1,5)/chi_mls(4,5)
-
-      ! P = 1053. (Level 1)
-      refrat_m_a = chi_mls(1,1)/chi_mls(4,1)
-
-      ! P = 706. (Level 3)
-      refrat_m_a3 = chi_mls(1,3)/chi_mls(4,3)
 
       ! Compute the optical depth by interpolating in ln(pressure),
       ! temperature, and appropriate species.  Below laytrop, the water
