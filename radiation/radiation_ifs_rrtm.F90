@@ -853,9 +853,6 @@ contains
         !$OMP END TARGET TEAMS DISTRIBUTE PARALLEL DO
 #else
         !$OMP TARGET TEAMS DISTRIBUTE PARALLEL DO COLLAPSE(3)
-#if defined(__amdflang__)
-        !$OMP INTERCHANGE PERMUTATION(2,1,3)
-#endif
         !$ACC PARALLEL DEFAULT(NONE) ASYNC(1)
         !$ACC LOOP GANG VECTOR TILE(4,1,32)
         do jcol = istartcol,iendcol
